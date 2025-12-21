@@ -1,7 +1,7 @@
 # iwcore
 
 [![Crates.io](https://img.shields.io/crates/v/iwcore.svg)](https://crates.io/crates/iwcore)
-[![Documentation](https://docs.rs/iwcore/badge.svg)](https://docs.rs/iwcore)
+[![Documentation](https://img.shields.io/docsrs/iwcore)](https://docs.rs/iwcore/latest/iwcore/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![CI](https://github.com/intellisoftalpin/iwcore/actions/workflows/ci.yml/badge.svg)](https://github.com/intellisoftalpin/iwcore/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/intellisoftalpin/iwcore/branch/main/graph/badge.svg)](https://codecov.io/gh/intellisoftalpin/iwcore)
