@@ -1,0 +1,95 @@
+//! Backup creation
+//!
+//! Creates ZIP backup files containing the database.
+
+use std::path::{Path, PathBuf};
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use chrono::Utc;
+use zip::write::SimpleFileOptions;
+use zip::ZipWriter;
+use crate::error::{Result, WalletError};
+use crate::DATABASE_FILENAME;
+use super::{BACKUP_PREFIX, BACKUP_AUTO, BACKUP_MANUAL, BACKUP_DATE_FORMAT};
+
+/// Create a backup of the database
+pub fn create_backup(backup_folder: &Path, db_path: &Path, manual: bool) -> Result<PathBuf> {
+    // Ensure backup folder exists
+    fs::create_dir_all(backup_folder)?;
+
+    // Generate backup filename
+    let now = Utc::now();
+    let type_str = if manual { BACKUP_MANUAL } else { BACKUP_AUTO };
+    let filename = format!(
+        "{}-{}-{}.zip",
+        BACKUP_PREFIX,
+        now.format(BACKUP_DATE_FORMAT),
+        type_str
+    );
+    let backup_path = backup_folder.join(&filename);
+
+    // Read database file
+    let mut db_file = File::open(db_path)
+        .map_err(|e| WalletError::BackupError(format!("Failed to open database: {}", e)))?;
+    let mut db_data = Vec::new();
+    db_file.read_to_end(&mut db_data)
+        .map_err(|e| WalletError::BackupError(format!("Failed to read database: {}", e)))?;
+
+    // Create ZIP file
+    let zip_file = File::create(&backup_path)
+        .map_err(|e| WalletError::BackupError(format!("Failed to create backup file: {}", e)))?;
+    let mut zip = ZipWriter::new(zip_file);
+
+    // Add database to ZIP
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+
+    zip.start_file(DATABASE_FILENAME, options)
+        .map_err(|e| WalletError::BackupError(format!("Failed to add file to zip: {}", e)))?;
+    zip.write_all(&db_data)
+        .map_err(|e| WalletError::BackupError(format!("Failed to write to zip: {}", e)))?;
+
+    zip.finish()
+        .map_err(|e| WalletError::BackupError(format!("Failed to finalize zip: {}", e)))?;
+
+    Ok(backup_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_create_backup() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_dir = temp_dir.path().join("backups");
+        let db_path = temp_dir.path().join("nswallet.dat");
+
+        // Create a dummy database file
+        fs::write(&db_path, b"test database content").unwrap();
+
+        // Create backup
+        let backup_path = create_backup(&backup_dir, &db_path, true).unwrap();
+
+        assert!(backup_path.exists());
+        assert!(backup_path.file_name().unwrap().to_str().unwrap().contains("manual"));
+    }
+
+    #[test]
+    fn test_create_auto_backup() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_dir = temp_dir.path().join("backups");
+        let db_path = temp_dir.path().join("nswallet.dat");
+
+        // Create a dummy database file
+        fs::write(&db_path, b"test database content").unwrap();
+
+        // Create backup
+        let backup_path = create_backup(&backup_dir, &db_path, false).unwrap();
+
+        assert!(backup_path.exists());
+        assert!(backup_path.file_name().unwrap().to_str().unwrap().contains("auto"));
+    }
+}

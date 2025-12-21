@@ -1,0 +1,357 @@
+//! Backup and restore functionality
+//!
+//! Handles creation and restoration of ZIP backup files.
+
+mod create;
+mod restore;
+
+// Re-export version checking functions
+pub use restore::{
+    get_backup_db_version,
+    is_backup_compatible,
+    get_db_version,
+    check_db_version,
+};
+
+use std::path::{Path, PathBuf};
+use std::fs;
+use chrono::{DateTime, Utc, TimeZone, NaiveDateTime};
+use crate::error::Result;
+
+/// Backup file prefix
+pub const BACKUP_PREFIX: &str = "nswb";
+
+/// Auto backup suffix
+pub const BACKUP_AUTO: &str = "auto";
+
+/// Manual backup suffix
+pub const BACKUP_MANUAL: &str = "manual";
+
+/// Backup date format
+pub const BACKUP_DATE_FORMAT: &str = "%Y%m%d-%H%M%S";
+
+/// Backup manager
+pub struct BackupManager {
+    /// Backup folder path
+    folder: PathBuf,
+}
+
+impl BackupManager {
+    /// Create a new backup manager
+    pub fn new(folder: &Path) -> Self {
+        Self {
+            folder: folder.to_path_buf(),
+        }
+    }
+
+    /// Get the backup folder path
+    pub fn folder(&self) -> &Path {
+        &self.folder
+    }
+
+    /// Create a backup
+    pub fn create_backup(&self, db_path: &Path, manual: bool) -> Result<PathBuf> {
+        create::create_backup(&self.folder, db_path, manual)
+    }
+
+    /// Restore from a backup
+    pub fn restore_backup(&self, backup_path: &Path, db_path: &Path) -> Result<()> {
+        restore::restore_backup(backup_path, db_path)
+    }
+
+    /// Extract a backup to a folder (for inspection)
+    pub fn extract_backup(&self, backup_path: &Path, target_folder: &Path) -> Result<PathBuf> {
+        restore::extract_backup(backup_path, target_folder)
+    }
+
+    /// List available backups
+    pub fn list_backups(&self) -> Result<Vec<BackupInfo>> {
+        let mut backups = Vec::new();
+
+        if !self.folder.exists() {
+            return Ok(backups);
+        }
+
+        for entry in fs::read_dir(&self.folder)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.is_file() {
+                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                    if filename.starts_with(BACKUP_PREFIX) && filename.ends_with(".zip") {
+                        if let Some(info) = parse_backup_filename(filename, &path) {
+                            backups.push(info);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by timestamp, newest first
+        backups.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+        Ok(backups)
+    }
+
+    /// Verify a backup file
+    pub fn verify_backup(&self, backup_path: &Path) -> Result<bool> {
+        restore::verify_backup(backup_path)
+    }
+
+    /// Clean up old backups, keeping only the specified number
+    pub fn cleanup_old_backups(&self, keep_count: usize) -> Result<usize> {
+        let backups = self.list_backups()?;
+
+        if backups.len() <= keep_count {
+            return Ok(0);
+        }
+
+        let mut deleted = 0;
+        for backup in backups.iter().skip(keep_count) {
+            fs::remove_file(&backup.path)?;
+            deleted += 1;
+        }
+
+        Ok(deleted)
+    }
+
+    /// Get the latest backup
+    pub fn get_latest_backup(&self) -> Result<Option<BackupInfo>> {
+        let backups = self.list_backups()?;
+        Ok(backups.into_iter().next())
+    }
+}
+
+/// Information about a backup file
+#[derive(Debug, Clone)]
+pub struct BackupInfo {
+    /// Path to the backup file
+    pub path: PathBuf,
+    /// Backup timestamp
+    pub timestamp: DateTime<Utc>,
+    /// Whether this is a manual backup
+    pub manual: bool,
+    /// File size in bytes
+    pub size: u64,
+}
+
+/// Parse backup filename to extract information
+fn parse_backup_filename(filename: &str, path: &Path) -> Option<BackupInfo> {
+    // Format: nswb-YYYYMMDD-HHMMSS-{auto|manual}.zip
+    let parts: Vec<&str> = filename.split('-').collect();
+
+    if parts.len() != 4 {
+        return None;
+    }
+
+    if parts[0] != BACKUP_PREFIX {
+        return None;
+    }
+
+    // Parse date and time
+    let date_str = parts[1];
+    let time_str = parts[2];
+
+    if date_str.len() != 8 || time_str.len() != 6 {
+        return None;
+    }
+
+    let datetime_str = format!("{}-{}", date_str, time_str);
+    let ndt = NaiveDateTime::parse_from_str(&datetime_str, BACKUP_DATE_FORMAT).ok()?;
+    let timestamp = Utc.from_utc_datetime(&ndt);
+
+    // Parse type
+    let type_str = parts[3].trim_end_matches(".zip");
+    let manual = type_str == BACKUP_MANUAL;
+
+    // Get file size
+    let size = path.metadata().ok()?.len();
+
+    Some(BackupInfo {
+        path: path.to_path_buf(),
+        timestamp,
+        manual,
+        size,
+    })
+}
+
+/// Parse date from backup filename (for compatibility)
+pub fn get_date_from_backup_filename(filename: &str) -> Option<DateTime<Utc>> {
+    let name = Path::new(filename)
+        .file_name()
+        .and_then(|n| n.to_str())?;
+
+    let parts: Vec<&str> = name.split('-').collect();
+
+    if parts.len() < 3 {
+        return None;
+    }
+
+    let date_str = parts[1];
+    let time_str = parts[2];
+
+    if date_str.len() != 8 || time_str.len() != 6 {
+        return None;
+    }
+
+    let datetime_str = format!("{}-{}", date_str, time_str);
+    let ndt = NaiveDateTime::parse_from_str(&datetime_str, BACKUP_DATE_FORMAT).ok()?;
+    Some(Utc.from_utc_datetime(&ndt))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Datelike, Timelike};
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_parse_backup_filename() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("nswb-20171203-113108-auto.zip");
+
+        // Create a dummy file so metadata works
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"test").unwrap();
+
+        let info = parse_backup_filename("nswb-20171203-113108-auto.zip", &path).unwrap();
+
+        assert!(!info.manual);
+        assert_eq!(info.timestamp.year(), 2017);
+        assert_eq!(info.timestamp.month(), 12);
+        assert_eq!(info.timestamp.day(), 3);
+    }
+
+    #[test]
+    fn test_get_date_from_backup_filename() {
+        let date = get_date_from_backup_filename("nswb-20171203-113108-auto.zip").unwrap();
+        assert_eq!(date.year(), 2017);
+        assert_eq!(date.month(), 12);
+        assert_eq!(date.day(), 3);
+        assert_eq!(date.hour(), 11);
+        assert_eq!(date.minute(), 31);
+        assert_eq!(date.second(), 8);
+    }
+
+    #[test]
+    fn test_invalid_filename() {
+        assert!(get_date_from_backup_filename("some text").is_none());
+        // A path with full path should still work because we extract just the filename
+        assert!(get_date_from_backup_filename("path/a/b/nswb-20171203-113108-auto.zip").is_some());
+        // But invalid format should fail
+        assert!(get_date_from_backup_filename("invalid-format.zip").is_none());
+    }
+
+    #[test]
+    fn test_backup_manager_folder() {
+        let temp_dir = TempDir::new().unwrap();
+        let mgr = BackupManager::new(temp_dir.path());
+        assert_eq!(mgr.folder(), temp_dir.path());
+    }
+
+    #[test]
+    fn test_list_backups_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let mgr = BackupManager::new(temp_dir.path());
+        let backups = mgr.list_backups().unwrap();
+        assert!(backups.is_empty());
+    }
+
+    #[test]
+    fn test_list_backups_nonexistent_folder() {
+        let mgr = BackupManager::new(Path::new("/nonexistent/path/12345"));
+        let backups = mgr.list_backups().unwrap();
+        assert!(backups.is_empty());
+    }
+
+    #[test]
+    fn test_list_backups_with_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create some backup files
+        let file1 = temp_dir.path().join("nswb-20231201-100000-auto.zip");
+        let file2 = temp_dir.path().join("nswb-20231202-120000-manual.zip");
+        let file3 = temp_dir.path().join("other-file.txt");
+
+        std::fs::File::create(&file1).unwrap().write_all(b"test1").unwrap();
+        std::fs::File::create(&file2).unwrap().write_all(b"test2").unwrap();
+        std::fs::File::create(&file3).unwrap().write_all(b"test3").unwrap();
+
+        let mgr = BackupManager::new(temp_dir.path());
+        let backups = mgr.list_backups().unwrap();
+
+        assert_eq!(backups.len(), 2);
+        // Should be sorted newest first
+        assert!(backups[0].manual); // Dec 2 is newer
+        assert!(!backups[1].manual); // Dec 1 is older
+    }
+
+    #[test]
+    fn test_get_latest_backup() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Empty folder
+        let mgr = BackupManager::new(temp_dir.path());
+        assert!(mgr.get_latest_backup().unwrap().is_none());
+
+        // Create backup files
+        let file1 = temp_dir.path().join("nswb-20231201-100000-auto.zip");
+        let file2 = temp_dir.path().join("nswb-20231202-120000-manual.zip");
+        std::fs::File::create(&file1).unwrap().write_all(b"test1").unwrap();
+        std::fs::File::create(&file2).unwrap().write_all(b"test2").unwrap();
+
+        let latest = mgr.get_latest_backup().unwrap().unwrap();
+        assert!(latest.manual); // Dec 2 is newest
+    }
+
+    #[test]
+    fn test_cleanup_old_backups() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create 5 backup files
+        for i in 1..=5 {
+            let file = temp_dir.path().join(format!("nswb-2023120{}-100000-auto.zip", i));
+            std::fs::File::create(&file).unwrap().write_all(b"test").unwrap();
+        }
+
+        let mgr = BackupManager::new(temp_dir.path());
+        assert_eq!(mgr.list_backups().unwrap().len(), 5);
+
+        // Keep only 2
+        let deleted = mgr.cleanup_old_backups(2).unwrap();
+        assert_eq!(deleted, 3);
+        assert_eq!(mgr.list_backups().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_cleanup_nothing_to_delete() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create 2 backup files
+        let file1 = temp_dir.path().join("nswb-20231201-100000-auto.zip");
+        let file2 = temp_dir.path().join("nswb-20231202-100000-auto.zip");
+        std::fs::File::create(&file1).unwrap().write_all(b"test").unwrap();
+        std::fs::File::create(&file2).unwrap().write_all(b"test").unwrap();
+
+        let mgr = BackupManager::new(temp_dir.path());
+
+        // Keep 5 but only have 2
+        let deleted = mgr.cleanup_old_backups(5).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(mgr.list_backups().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_parse_manual_backup() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("nswb-20231215-143022-manual.zip");
+        std::fs::File::create(&path).unwrap().write_all(b"test").unwrap();
+
+        let info = parse_backup_filename("nswb-20231215-143022-manual.zip", &path).unwrap();
+        assert!(info.manual);
+        assert_eq!(info.timestamp.year(), 2023);
+        assert_eq!(info.timestamp.month(), 12);
+        assert_eq!(info.timestamp.day(), 15);
+    }
+}

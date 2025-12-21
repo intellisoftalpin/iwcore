@@ -1,0 +1,28 @@
+# Build artifacts
+/target/
+
+# Cargo.lock is not committed for libraries (allows users to get latest compatible deps)
+Cargo.lock
+
+# Editor files
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Test/coverage artifacts
+tarpaulin-report.html
+*.profraw
+lcov.info
+
+# Backup files
+*.orig
+*.bak
