@@ -840,6 +840,11 @@ impl Wallet {
     pub fn database_path(&self) -> PathBuf {
         self.folder.join(DATABASE_FILENAME)
     }
+
+    /// Get a reference to the database for backup operations
+    pub fn database(&self) -> Result<&Database> {
+        self.db.as_ref().ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))
+    }
 }
 
 impl Drop for Wallet {

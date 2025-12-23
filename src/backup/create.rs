@@ -9,11 +9,18 @@ use chrono::Utc;
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 use crate::error::{Result, WalletError};
+use crate::database::Database;
 use crate::DATABASE_FILENAME;
 use super::{BACKUP_PREFIX, BACKUP_AUTO, BACKUP_MANUAL, BACKUP_DATE_FORMAT};
 
 /// Create a backup of the database
-pub fn create_backup(backup_folder: &Path, db_path: &Path, manual: bool) -> Result<PathBuf> {
+///
+/// Performs a WAL checkpoint before creating the backup to ensure all data
+/// is written to the main database file.
+pub fn create_backup(backup_folder: &Path, db: &Database, manual: bool) -> Result<PathBuf> {
+    // Checkpoint WAL to ensure all data is in main file
+    db.checkpoint()?;
+
     // Ensure backup folder exists
     fs::create_dir_all(backup_folder)?;
 
@@ -29,6 +36,7 @@ pub fn create_backup(backup_folder: &Path, db_path: &Path, manual: bool) -> Resu
     let backup_path = backup_folder.join(&filename);
 
     // Read database file
+    let db_path = db.path();
     let mut db_file = File::open(db_path)
         .map_err(|e| WalletError::BackupError(format!("Failed to open database: {}", e)))?;
     let mut db_data = Vec::new();
@@ -67,11 +75,11 @@ mod tests {
         let backup_dir = temp_dir.path().join("backups");
         let db_path = temp_dir.path().join("nswallet.dat");
 
-        // Create a dummy database file
-        fs::write(&db_path, b"test database content").unwrap();
+        // Create a real database
+        let db = Database::create(&db_path).unwrap();
 
         // Create backup
-        let backup_path = create_backup(&backup_dir, &db_path, true).unwrap();
+        let backup_path = create_backup(&backup_dir, &db, true).unwrap();
 
         assert!(backup_path.exists());
         assert!(backup_path.file_name().unwrap().to_str().unwrap().contains("manual"));
@@ -83,11 +91,11 @@ mod tests {
         let backup_dir = temp_dir.path().join("backups");
         let db_path = temp_dir.path().join("nswallet.dat");
 
-        // Create a dummy database file
-        fs::write(&db_path, b"test database content").unwrap();
+        // Create a real database
+        let db = Database::create(&db_path).unwrap();
 
         // Create backup
-        let backup_path = create_backup(&backup_dir, &db_path, false).unwrap();
+        let backup_path = create_backup(&backup_dir, &db, false).unwrap();
 
         assert!(backup_path.exists());
         assert!(backup_path.file_name().unwrap().to_str().unwrap().contains("auto"));

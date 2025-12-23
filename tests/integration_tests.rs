@@ -198,7 +198,7 @@ fn test_full_backup_restore_cycle() {
 
     // Create backup
     let backup_mgr = BackupManager::new(&backup_dir);
-    let backup_path = backup_mgr.create_backup(&wallet.database_path(), true).unwrap();
+    let backup_path = backup_mgr.create_backup(wallet.database().unwrap(), true).unwrap();
 
     // Close wallet
     wallet.close();

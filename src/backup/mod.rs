@@ -16,6 +16,7 @@ pub use restore::{
 use std::path::{Path, PathBuf};
 use std::fs;
 use chrono::{DateTime, Utc, TimeZone, NaiveDateTime};
+use crate::database::Database;
 use crate::error::Result;
 
 /// Backup file prefix
@@ -50,8 +51,10 @@ impl BackupManager {
     }
 
     /// Create a backup
-    pub fn create_backup(&self, db_path: &Path, manual: bool) -> Result<PathBuf> {
-        create::create_backup(&self.folder, db_path, manual)
+    ///
+    /// Requires a database reference to perform WAL checkpoint before backup.
+    pub fn create_backup(&self, db: &Database, manual: bool) -> Result<PathBuf> {
+        create::create_backup(&self.folder, db, manual)
     }
 
     /// Restore from a backup

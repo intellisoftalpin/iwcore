@@ -105,9 +105,9 @@ use std::path::Path;
 
 let wallet = Wallet::open(Path::new("./my_wallet"))?;
 
-// Create backup
+// Create backup (automatically checkpoints WAL for data consistency)
 let backup_mgr = BackupManager::new(Path::new("./backups"));
-let backup_path = backup_mgr.create_backup(&wallet.database_path(), true)?;
+let backup_path = backup_mgr.create_backup(wallet.database()?, true)?;
 
 // List backups
 let backups = backup_mgr.list_backups()?;
