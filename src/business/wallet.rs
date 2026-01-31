@@ -178,7 +178,13 @@ impl Wallet {
             return Err(WalletError::DatabaseError("Root item not found".to_string()));
         };
 
-        match crypto::decrypt(&encrypted_name, password, self.encryption_count, None) {
+        let encryption_count = if let Some(props) = queries::get_properties(conn)? {
+            props.email.parse().unwrap_or(ENCRYPTION_COUNT_DEFAULT)
+        } else {
+            self.encryption_count
+        };
+
+        match crypto::decrypt(&encrypted_name, password, encryption_count, None) {
             Ok(_) => Ok(true),
             Err(_) => Ok(false)
         }
@@ -363,6 +369,70 @@ pub(crate) mod tests {
     fn test_check_password() {
         let (mut wallet, _temp) = create_test_wallet();
         wallet.lock();
+        assert!(wallet.check_password("TestPassword123").unwrap());
+        assert!(!wallet.check_password("WrongPassword").unwrap());
+    }
+
+    /// Creates a wallet encrypted with the given encryption_count.
+    /// Re-encrypts root item and updates DB properties accordingly.
+    fn create_wallet_with_encryption_count(encryption_count: u32) -> (TempDir, std::path::PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_path_buf();
+        let password = "TestPassword123";
+
+        // Create wallet (encryption_count=0 by default)
+        let wallet = Wallet::create(&path, password, "en").unwrap();
+        let db = wallet.db.as_ref().unwrap();
+        let conn = db.connection().unwrap();
+
+        // Re-encrypt root item with the target encryption_count
+        let root_raw = queries::get_root_item_raw(conn).unwrap().unwrap();
+        let plaintext = crypto::decrypt(&root_raw, password, 0, None).unwrap();
+        let new_encrypted = crypto::encrypt(&plaintext, password, encryption_count, None).unwrap();
+        conn.execute(
+            "UPDATE nswallet_items SET name = ? WHERE item_id = '__ROOT__'",
+            rusqlite::params![new_encrypted],
+        ).unwrap();
+
+        // Update stored encryption_count in properties
+        conn.execute(
+            "UPDATE nswallet_properties SET email = ?",
+            rusqlite::params![encryption_count.to_string()],
+        ).unwrap();
+
+        assert_eq!(wallet.get_properties().unwrap().encryption_count, encryption_count);
+        drop(wallet);
+        (temp_dir, path)
+    }
+
+    #[test]
+    fn test_check_password_after_reopen_enc0() {
+        let (_temp, path) = create_wallet_with_encryption_count(0);
+        let wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.check_password("TestPassword123").unwrap());
+        assert!(!wallet.check_password("WrongPassword").unwrap());
+    }
+
+    #[test]
+    fn test_check_password_after_reopen_enc33() {
+        let (_temp, path) = create_wallet_with_encryption_count(33);
+        let wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.check_password("TestPassword123").unwrap());
+        assert!(!wallet.check_password("WrongPassword").unwrap());
+    }
+
+    #[test]
+    fn test_check_password_after_reopen_enc200() {
+        let (_temp, path) = create_wallet_with_encryption_count(200);
+        let wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.check_password("TestPassword123").unwrap());
+        assert!(!wallet.check_password("WrongPassword").unwrap());
+    }
+
+    #[test]
+    fn test_check_password_after_reopen_enc500() {
+        let (_temp, path) = create_wallet_with_encryption_count(500);
+        let wallet = Wallet::open(&path).unwrap();
         assert!(wallet.check_password("TestPassword123").unwrap());
         assert!(!wallet.check_password("WrongPassword").unwrap());
     }

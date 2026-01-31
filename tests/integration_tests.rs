@@ -589,7 +589,6 @@ fn test_reopen_after_modifications() {
     wallet.close();
 
     // Reopen same database
-    let dest_db = temp_dir.path().join("nswallet.dat");
     let mut wallet2 = iwcore::Wallet::open(temp_dir.path()).unwrap();
     wallet2.unlock(TEST_PASSWORD).unwrap();
 
@@ -894,7 +893,7 @@ fn test_search_minimum_length() {
     assert!(results.is_empty(), "Search with <3 chars should return empty");
 
     // Search with exactly 3 chars should work
-    let results2 = wallet.search("ABC").unwrap();
+    let _results2 = wallet.search("ABC").unwrap();
     // May be empty if no match, but search executed
 
     wallet.close();
