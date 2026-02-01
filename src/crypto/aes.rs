@@ -10,7 +10,7 @@
 
 use aes::Aes256;
 use cbc::{Encryptor, Decryptor};
-use cbc::cipher::{BlockEncryptMut, BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{BlockModeEncrypt, BlockModeDecrypt, KeyIvInit};
 use block_padding::Pkcs7;
 
 use super::key::{prepare_key, KEY_LENGTH};
@@ -67,7 +67,7 @@ pub fn encrypt(
     let encryptor = Aes256CbcEnc::new(&key.into(), &ZERO_IV.into());
 
     let encrypted = encryptor
-        .encrypt_padded_mut::<Pkcs7>(&mut buffer, data.len())
+        .encrypt_padded::<Pkcs7>(&mut buffer, data.len())
         .map_err(|e| format!("Encryption failed: {:?}", e))?;
 
     Ok(encrypted.to_vec())
@@ -122,7 +122,7 @@ fn decrypt_with_key(ciphertext: &[u8], key: &[u8; KEY_LENGTH]) -> Result<String,
     let decryptor = Aes256CbcDec::new(key.into(), &ZERO_IV.into());
 
     let decrypted = decryptor
-        .decrypt_padded_mut::<Pkcs7>(&mut buffer)
+        .decrypt_padded::<Pkcs7>(&mut buffer)
         .map_err(|e| format!("Decryption failed: {:?}", e))?;
 
     // Convert to UTF-8 string

@@ -39,7 +39,7 @@ pub mod export;
 pub use error::{WalletError, Result};
 pub use database::models::{IWItem, IWField, IWLabel, IWProperties, SearchResult, SearchMatchType};
 pub use business::Wallet;
-pub use backup::BackupManager;
+pub use backup::{BackupManager, BackupType};
 pub use localization::Translations;
 pub use crypto::{generate_password, generate_clever_password, PasswordOptions};
 pub use export::{ExportItemType, PDFItemModel};

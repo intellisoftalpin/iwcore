@@ -20,7 +20,10 @@ use crate::database::Database;
 use crate::error::Result;
 
 /// Backup file prefix
-pub const BACKUP_PREFIX: &str = "nswb";
+pub const BACKUP_PREFIX: &str = "iwb";
+
+/// Legacy backup file prefix (for parsing old files)
+pub const BACKUP_PREFIX_LEGACY: &str = "nswb";
 
 /// Auto backup suffix
 pub const BACKUP_AUTO: &str = "auto";
@@ -28,8 +31,19 @@ pub const BACKUP_AUTO: &str = "auto";
 /// Manual backup suffix
 pub const BACKUP_MANUAL: &str = "manual";
 
+/// Imported backup suffix
+pub const BACKUP_IMPORTED: &str = "imported";
+
 /// Backup date format
 pub const BACKUP_DATE_FORMAT: &str = "%Y%m%d-%H%M%S";
+
+/// Backup type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupType {
+    Auto,
+    Manual,
+    Imported,
+}
 
 /// Backup manager
 pub struct BackupManager {
@@ -89,7 +103,9 @@ impl BackupManager {
 
             if path.is_file() {
                 if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                    if filename.starts_with(BACKUP_PREFIX) && filename.ends_with(".zip") {
+                    if (filename.starts_with(BACKUP_PREFIX) || filename.starts_with(BACKUP_PREFIX_LEGACY))
+                        && filename.ends_with(".zip")
+                    {
                         if let Some(info) = parse_backup_filename(filename, &path) {
                             backups.push(info);
                         }
@@ -134,7 +150,7 @@ impl BackupManager {
 
     /// Clean up old automatic backups based on age
     ///
-    /// Only deletes automatic backups. Manual backups are never touched.
+    /// Only deletes automatic backups. Manual and imported backups are never touched.
     /// Keeps at least `min_keep` auto backups regardless of age.
     /// Deletes auto backups older than `max_age_days` only if enough newer ones exist.
     /// Returns the number of deleted backups.
@@ -142,7 +158,7 @@ impl BackupManager {
         let backups = self.list_backups()?;
 
         // Filter to auto backups only (already sorted newest first)
-        let auto_backups: Vec<&BackupInfo> = backups.iter().filter(|b| !b.manual).collect();
+        let auto_backups: Vec<&BackupInfo> = backups.iter().filter(|b| b.backup_type == BackupType::Auto).collect();
 
         if auto_backups.len() <= min_keep {
             return Ok(0);
@@ -169,22 +185,22 @@ pub struct BackupInfo {
     pub path: PathBuf,
     /// Backup timestamp
     pub timestamp: DateTime<Utc>,
-    /// Whether this is a manual backup
-    pub manual: bool,
+    /// Backup type (auto, manual, or imported)
+    pub backup_type: BackupType,
     /// File size in bytes
     pub size: u64,
 }
 
 /// Parse backup filename to extract information
 fn parse_backup_filename(filename: &str, path: &Path) -> Option<BackupInfo> {
-    // Format: nswb-YYYYMMDD-HHMMSS-{auto|manual}.zip
+    // Format: {iwb|nswb}-YYYYMMDD-HHMMSS-{auto|manual|imported}.zip
     let parts: Vec<&str> = filename.split('-').collect();
 
     if parts.len() != 4 {
         return None;
     }
 
-    if parts[0] != BACKUP_PREFIX {
+    if parts[0] != BACKUP_PREFIX && parts[0] != BACKUP_PREFIX_LEGACY {
         return None;
     }
 
@@ -202,7 +218,11 @@ fn parse_backup_filename(filename: &str, path: &Path) -> Option<BackupInfo> {
 
     // Parse type
     let type_str = parts[3].trim_end_matches(".zip");
-    let manual = type_str == BACKUP_MANUAL;
+    let backup_type = match type_str {
+        BACKUP_MANUAL => BackupType::Manual,
+        BACKUP_IMPORTED => BackupType::Imported,
+        _ => BackupType::Auto,
+    };
 
     // Get file size
     let size = path.metadata().ok()?.len();
@@ -210,7 +230,7 @@ fn parse_backup_filename(filename: &str, path: &Path) -> Option<BackupInfo> {
     Some(BackupInfo {
         path: path.to_path_buf(),
         timestamp,
-        manual,
+        backup_type,
         size,
     })
 }
@@ -249,22 +269,65 @@ mod tests {
     #[test]
     fn test_parse_backup_filename() {
         let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().join("nswb-20171203-113108-auto.zip");
+        let path = temp_dir.path().join("iwb-20171203-113108-auto.zip");
 
         // Create a dummy file so metadata works
         let mut file = std::fs::File::create(&path).unwrap();
         file.write_all(b"test").unwrap();
 
-        let info = parse_backup_filename("nswb-20171203-113108-auto.zip", &path).unwrap();
+        let info = parse_backup_filename("iwb-20171203-113108-auto.zip", &path).unwrap();
 
-        assert!(!info.manual);
+        assert_eq!(info.backup_type, BackupType::Auto);
         assert_eq!(info.timestamp.year(), 2017);
         assert_eq!(info.timestamp.month(), 12);
         assert_eq!(info.timestamp.day(), 3);
     }
 
     #[test]
+    fn test_parse_legacy_backup_filename() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("nswb-20171203-113108-auto.zip");
+
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"test").unwrap();
+
+        let info = parse_backup_filename("nswb-20171203-113108-auto.zip", &path).unwrap();
+
+        assert_eq!(info.backup_type, BackupType::Auto);
+        assert_eq!(info.timestamp.year(), 2017);
+        assert_eq!(info.timestamp.month(), 12);
+        assert_eq!(info.timestamp.day(), 3);
+    }
+
+    #[test]
+    fn test_parse_imported_backup_filename() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("iwb-20231215-143022-imported.zip");
+
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"test").unwrap();
+
+        let info = parse_backup_filename("iwb-20231215-143022-imported.zip", &path).unwrap();
+
+        assert_eq!(info.backup_type, BackupType::Imported);
+        assert_eq!(info.timestamp.year(), 2023);
+        assert_eq!(info.timestamp.month(), 12);
+        assert_eq!(info.timestamp.day(), 15);
+    }
+
+    #[test]
     fn test_get_date_from_backup_filename() {
+        let date = get_date_from_backup_filename("iwb-20171203-113108-auto.zip").unwrap();
+        assert_eq!(date.year(), 2017);
+        assert_eq!(date.month(), 12);
+        assert_eq!(date.day(), 3);
+        assert_eq!(date.hour(), 11);
+        assert_eq!(date.minute(), 31);
+        assert_eq!(date.second(), 8);
+    }
+
+    #[test]
+    fn test_get_date_from_legacy_backup_filename() {
         let date = get_date_from_backup_filename("nswb-20171203-113108-auto.zip").unwrap();
         assert_eq!(date.year(), 2017);
         assert_eq!(date.month(), 12);
@@ -275,9 +338,22 @@ mod tests {
     }
 
     #[test]
+    fn test_get_date_from_full_path_iwb_prefix() {
+        // Full path with new iwb- prefix should parse correctly
+        let date = get_date_from_backup_filename("/var/backups/wallet/iwb-20231215-143022-manual.zip").unwrap();
+        assert_eq!(date.year(), 2023);
+        assert_eq!(date.month(), 12);
+        assert_eq!(date.day(), 15);
+        assert_eq!(date.hour(), 14);
+        assert_eq!(date.minute(), 30);
+        assert_eq!(date.second(), 22);
+    }
+
+    #[test]
     fn test_invalid_filename() {
         assert!(get_date_from_backup_filename("some text").is_none());
         // A path with full path should still work because we extract just the filename
+        assert!(get_date_from_backup_filename("path/a/b/iwb-20171203-113108-auto.zip").is_some());
         assert!(get_date_from_backup_filename("path/a/b/nswb-20171203-113108-auto.zip").is_some());
         // But invalid format should fail
         assert!(get_date_from_backup_filename("invalid-format.zip").is_none());
@@ -309,9 +385,9 @@ mod tests {
     fn test_list_backups_with_files() {
         let temp_dir = TempDir::new().unwrap();
 
-        // Create some backup files
-        let file1 = temp_dir.path().join("nswb-20231201-100000-auto.zip");
-        let file2 = temp_dir.path().join("nswb-20231202-120000-manual.zip");
+        // Create some backup files (mix of new and legacy prefixes)
+        let file1 = temp_dir.path().join("iwb-20231201-100000-auto.zip");
+        let file2 = temp_dir.path().join("iwb-20231202-120000-manual.zip");
         let file3 = temp_dir.path().join("other-file.txt");
 
         std::fs::File::create(&file1).unwrap().write_all(b"test1").unwrap();
@@ -323,8 +399,27 @@ mod tests {
 
         assert_eq!(backups.len(), 2);
         // Should be sorted newest first
-        assert!(backups[0].manual); // Dec 2 is newer
-        assert!(!backups[1].manual); // Dec 1 is older
+        assert_eq!(backups[0].backup_type, BackupType::Manual); // Dec 2 is newer
+        assert_eq!(backups[1].backup_type, BackupType::Auto); // Dec 1 is older
+    }
+
+    #[test]
+    fn test_list_backups_with_legacy_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Legacy prefix files should also be listed
+        let file1 = temp_dir.path().join("nswb-20231201-100000-auto.zip");
+        let file2 = temp_dir.path().join("nswb-20231202-120000-manual.zip");
+
+        std::fs::File::create(&file1).unwrap().write_all(b"test1").unwrap();
+        std::fs::File::create(&file2).unwrap().write_all(b"test2").unwrap();
+
+        let mgr = BackupManager::new(temp_dir.path());
+        let backups = mgr.list_backups().unwrap();
+
+        assert_eq!(backups.len(), 2);
+        assert_eq!(backups[0].backup_type, BackupType::Manual);
+        assert_eq!(backups[1].backup_type, BackupType::Auto);
     }
 
     #[test]
@@ -336,13 +431,13 @@ mod tests {
         assert!(mgr.get_latest_backup().unwrap().is_none());
 
         // Create backup files
-        let file1 = temp_dir.path().join("nswb-20231201-100000-auto.zip");
-        let file2 = temp_dir.path().join("nswb-20231202-120000-manual.zip");
+        let file1 = temp_dir.path().join("iwb-20231201-100000-auto.zip");
+        let file2 = temp_dir.path().join("iwb-20231202-120000-manual.zip");
         std::fs::File::create(&file1).unwrap().write_all(b"test1").unwrap();
         std::fs::File::create(&file2).unwrap().write_all(b"test2").unwrap();
 
         let latest = mgr.get_latest_backup().unwrap().unwrap();
-        assert!(latest.manual); // Dec 2 is newest
+        assert_eq!(latest.backup_type, BackupType::Manual); // Dec 2 is newest
     }
 
     #[test]
@@ -351,7 +446,7 @@ mod tests {
 
         // Create 5 backup files
         for i in 1..=5 {
-            let file = temp_dir.path().join(format!("nswb-2023120{}-100000-auto.zip", i));
+            let file = temp_dir.path().join(format!("iwb-2023120{}-100000-auto.zip", i));
             std::fs::File::create(&file).unwrap().write_all(b"test").unwrap();
         }
 
@@ -369,8 +464,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         // Create 2 backup files
-        let file1 = temp_dir.path().join("nswb-20231201-100000-auto.zip");
-        let file2 = temp_dir.path().join("nswb-20231202-100000-auto.zip");
+        let file1 = temp_dir.path().join("iwb-20231201-100000-auto.zip");
+        let file2 = temp_dir.path().join("iwb-20231202-100000-auto.zip");
         std::fs::File::create(&file1).unwrap().write_all(b"test").unwrap();
         std::fs::File::create(&file2).unwrap().write_all(b"test").unwrap();
 
@@ -385,11 +480,11 @@ mod tests {
     #[test]
     fn test_parse_manual_backup() {
         let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().join("nswb-20231215-143022-manual.zip");
+        let path = temp_dir.path().join("iwb-20231215-143022-manual.zip");
         std::fs::File::create(&path).unwrap().write_all(b"test").unwrap();
 
-        let info = parse_backup_filename("nswb-20231215-143022-manual.zip", &path).unwrap();
-        assert!(info.manual);
+        let info = parse_backup_filename("iwb-20231215-143022-manual.zip", &path).unwrap();
+        assert_eq!(info.backup_type, BackupType::Manual);
         assert_eq!(info.timestamp.year(), 2023);
         assert_eq!(info.timestamp.month(), 12);
         assert_eq!(info.timestamp.day(), 15);
@@ -401,7 +496,7 @@ mod tests {
 
         // Create 5 auto backups, all old (2020)
         for i in 1..=5 {
-            let file = temp_dir.path().join(format!("nswb-2020010{}-100000-auto.zip", i));
+            let file = temp_dir.path().join(format!("iwb-2020010{}-100000-auto.zip", i));
             std::fs::File::create(&file).unwrap().write_all(b"test").unwrap();
         }
 
@@ -419,8 +514,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         // Create 2 auto backups
-        let file1 = temp_dir.path().join("nswb-20200101-100000-auto.zip");
-        let file2 = temp_dir.path().join("nswb-20200102-100000-auto.zip");
+        let file1 = temp_dir.path().join("iwb-20200101-100000-auto.zip");
+        let file2 = temp_dir.path().join("iwb-20200102-100000-auto.zip");
         std::fs::File::create(&file1).unwrap().write_all(b"test").unwrap();
         std::fs::File::create(&file2).unwrap().write_all(b"test").unwrap();
 
@@ -438,11 +533,11 @@ mod tests {
 
         // Create 5 auto + 3 manual, all old
         for i in 1..=5 {
-            let file = temp_dir.path().join(format!("nswb-2020010{}-100000-auto.zip", i));
+            let file = temp_dir.path().join(format!("iwb-2020010{}-100000-auto.zip", i));
             std::fs::File::create(&file).unwrap().write_all(b"test").unwrap();
         }
         for i in 6..=8 {
-            let file = temp_dir.path().join(format!("nswb-2020010{}-100000-manual.zip", i));
+            let file = temp_dir.path().join(format!("iwb-2020010{}-100000-manual.zip", i));
             std::fs::File::create(&file).unwrap().write_all(b"test").unwrap();
         }
 
@@ -455,8 +550,35 @@ mod tests {
 
         let remaining = mgr.list_backups().unwrap();
         assert_eq!(remaining.len(), 6); // 3 auto + 3 manual
-        let manual_count = remaining.iter().filter(|b| b.manual).count();
+        let manual_count = remaining.iter().filter(|b| b.backup_type == BackupType::Manual).count();
         assert_eq!(manual_count, 3);
+    }
+
+    #[test]
+    fn test_cleanup_auto_backups_ignores_imported() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create 5 auto + 2 imported, all old
+        for i in 1..=5 {
+            let file = temp_dir.path().join(format!("iwb-2020010{}-100000-auto.zip", i));
+            std::fs::File::create(&file).unwrap().write_all(b"test").unwrap();
+        }
+        for i in 6..=7 {
+            let file = temp_dir.path().join(format!("iwb-2020010{}-100000-imported.zip", i));
+            std::fs::File::create(&file).unwrap().write_all(b"test").unwrap();
+        }
+
+        let mgr = BackupManager::new(temp_dir.path());
+        assert_eq!(mgr.list_backups().unwrap().len(), 7);
+
+        // min_keep=3, max_age_days=30 → deletes 2 old auto, imported untouched
+        let deleted = mgr.cleanup_auto_backups(3, 30).unwrap();
+        assert_eq!(deleted, 2);
+
+        let remaining = mgr.list_backups().unwrap();
+        assert_eq!(remaining.len(), 5); // 3 auto + 2 imported
+        let imported_count = remaining.iter().filter(|b| b.backup_type == BackupType::Imported).count();
+        assert_eq!(imported_count, 2);
     }
 
     #[test]
@@ -468,14 +590,14 @@ mod tests {
         for i in 0..3 {
             let ts = now - chrono::Duration::days(i);
             let file = temp_dir.path().join(format!(
-                "nswb-{}-auto.zip",
+                "iwb-{}-auto.zip",
                 ts.format(BACKUP_DATE_FORMAT)
             ));
             std::fs::File::create(&file).unwrap().write_all(b"test").unwrap();
         }
         // 2 old auto backups
-        let file_old1 = temp_dir.path().join("nswb-20200101-100000-auto.zip");
-        let file_old2 = temp_dir.path().join("nswb-20200102-100000-auto.zip");
+        let file_old1 = temp_dir.path().join("iwb-20200101-100000-auto.zip");
+        let file_old2 = temp_dir.path().join("iwb-20200102-100000-auto.zip");
         std::fs::File::create(&file_old1).unwrap().write_all(b"test").unwrap();
         std::fs::File::create(&file_old2).unwrap().write_all(b"test").unwrap();
 
