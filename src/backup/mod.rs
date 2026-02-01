@@ -57,6 +57,14 @@ impl BackupManager {
         create::create_backup(&self.folder, db, manual)
     }
 
+    /// Create a backup from a raw database file path (DB must be closed)
+    ///
+    /// Unlike `create_backup`, this does not perform a WAL checkpoint since the
+    /// database is expected to be closed.
+    pub fn create_backup_from_path(&self, db_path: &Path, manual: bool) -> Result<PathBuf> {
+        create::create_backup_from_path(&self.folder, db_path, manual)
+    }
+
     /// Restore from a backup
     pub fn restore_backup(&self, backup_path: &Path, db_path: &Path) -> Result<()> {
         restore::restore_backup(backup_path, db_path)
@@ -122,6 +130,35 @@ impl BackupManager {
     pub fn get_latest_backup(&self) -> Result<Option<BackupInfo>> {
         let backups = self.list_backups()?;
         Ok(backups.into_iter().next())
+    }
+
+    /// Clean up old automatic backups based on age
+    ///
+    /// Only deletes automatic backups. Manual backups are never touched.
+    /// Keeps at least `min_keep` auto backups regardless of age.
+    /// Deletes auto backups older than `max_age_days` only if enough newer ones exist.
+    /// Returns the number of deleted backups.
+    pub fn cleanup_auto_backups(&self, min_keep: usize, max_age_days: u32) -> Result<usize> {
+        let backups = self.list_backups()?;
+
+        // Filter to auto backups only (already sorted newest first)
+        let auto_backups: Vec<&BackupInfo> = backups.iter().filter(|b| !b.manual).collect();
+
+        if auto_backups.len() <= min_keep {
+            return Ok(0);
+        }
+
+        let cutoff = Utc::now() - chrono::Duration::days(max_age_days as i64);
+        let mut deleted = 0;
+
+        for backup in auto_backups.iter().skip(min_keep) {
+            if backup.timestamp < cutoff {
+                fs::remove_file(&backup.path)?;
+                deleted += 1;
+            }
+        }
+
+        Ok(deleted)
     }
 }
 
@@ -356,5 +393,107 @@ mod tests {
         assert_eq!(info.timestamp.year(), 2023);
         assert_eq!(info.timestamp.month(), 12);
         assert_eq!(info.timestamp.day(), 15);
+    }
+
+    #[test]
+    fn test_cleanup_auto_backups_deletes_old() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create 5 auto backups, all old (2020)
+        for i in 1..=5 {
+            let file = temp_dir.path().join(format!("nswb-2020010{}-100000-auto.zip", i));
+            std::fs::File::create(&file).unwrap().write_all(b"test").unwrap();
+        }
+
+        let mgr = BackupManager::new(temp_dir.path());
+        assert_eq!(mgr.list_backups().unwrap().len(), 5);
+
+        // min_keep=3, max_age_days=30 → deletes 2 oldest
+        let deleted = mgr.cleanup_auto_backups(3, 30).unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(mgr.list_backups().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_cleanup_auto_backups_below_minimum() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create 2 auto backups
+        let file1 = temp_dir.path().join("nswb-20200101-100000-auto.zip");
+        let file2 = temp_dir.path().join("nswb-20200102-100000-auto.zip");
+        std::fs::File::create(&file1).unwrap().write_all(b"test").unwrap();
+        std::fs::File::create(&file2).unwrap().write_all(b"test").unwrap();
+
+        let mgr = BackupManager::new(temp_dir.path());
+
+        // min_keep=3, but only 2 exist → delete nothing
+        let deleted = mgr.cleanup_auto_backups(3, 30).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(mgr.list_backups().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_cleanup_auto_backups_ignores_manual() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create 5 auto + 3 manual, all old
+        for i in 1..=5 {
+            let file = temp_dir.path().join(format!("nswb-2020010{}-100000-auto.zip", i));
+            std::fs::File::create(&file).unwrap().write_all(b"test").unwrap();
+        }
+        for i in 6..=8 {
+            let file = temp_dir.path().join(format!("nswb-2020010{}-100000-manual.zip", i));
+            std::fs::File::create(&file).unwrap().write_all(b"test").unwrap();
+        }
+
+        let mgr = BackupManager::new(temp_dir.path());
+        assert_eq!(mgr.list_backups().unwrap().len(), 8);
+
+        // min_keep=3, max_age_days=30 → deletes 2 old auto, manual untouched
+        let deleted = mgr.cleanup_auto_backups(3, 30).unwrap();
+        assert_eq!(deleted, 2);
+
+        let remaining = mgr.list_backups().unwrap();
+        assert_eq!(remaining.len(), 6); // 3 auto + 3 manual
+        let manual_count = remaining.iter().filter(|b| b.manual).count();
+        assert_eq!(manual_count, 3);
+    }
+
+    #[test]
+    fn test_cleanup_auto_backups_mixed_ages() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // 3 recent auto backups (today-ish via current year)
+        let now = Utc::now();
+        for i in 0..3 {
+            let ts = now - chrono::Duration::days(i);
+            let file = temp_dir.path().join(format!(
+                "nswb-{}-auto.zip",
+                ts.format(BACKUP_DATE_FORMAT)
+            ));
+            std::fs::File::create(&file).unwrap().write_all(b"test").unwrap();
+        }
+        // 2 old auto backups
+        let file_old1 = temp_dir.path().join("nswb-20200101-100000-auto.zip");
+        let file_old2 = temp_dir.path().join("nswb-20200102-100000-auto.zip");
+        std::fs::File::create(&file_old1).unwrap().write_all(b"test").unwrap();
+        std::fs::File::create(&file_old2).unwrap().write_all(b"test").unwrap();
+
+        let mgr = BackupManager::new(temp_dir.path());
+        assert_eq!(mgr.list_backups().unwrap().len(), 5);
+
+        // min_keep=3, max_age_days=30 → deletes 2 old ones beyond the 3 newest
+        let deleted = mgr.cleanup_auto_backups(3, 30).unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(mgr.list_backups().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_cleanup_auto_backups_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let mgr = BackupManager::new(temp_dir.path());
+
+        let deleted = mgr.cleanup_auto_backups(3, 30).unwrap();
+        assert_eq!(deleted, 0);
     }
 }
