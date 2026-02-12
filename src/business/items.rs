@@ -154,16 +154,82 @@ impl Wallet {
         Ok(())
     }
 
-    /// Delete an item (soft delete)
+    /// Delete an item (soft delete). If the item is a folder, cascades to all descendants.
     pub fn delete_item(&mut self, item_id: &str) -> Result<()> {
+        self.ensure_unlocked()?;
+
+        // Check if item is a folder and cascade if needed
+        let is_folder = self.get_item(item_id)?
+            .map(|i| i.folder)
+            .unwrap_or(false);
+
         let conn = self.db.as_ref()
             .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
             .connection()?;
+
+        if is_folder {
+            queries::delete_item_descendants(conn, item_id)?;
+        }
 
         queries::delete_item(conn, item_id)?;
 
         self.items_cache = None;
         self.fields_cache = None;
+        Ok(())
+    }
+
+    /// Get all soft-deleted items (decrypted)
+    pub fn get_deleted_items(&mut self) -> Result<Vec<IWItem>> {
+        self.ensure_unlocked()?;
+
+        let password = self.password.as_ref()
+            .ok_or(WalletError::Locked)?
+            .clone();
+
+        let db = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
+
+        let conn = db.connection()?;
+        let raw_items = queries::get_deleted_items_raw(conn)?;
+
+        let mut items = Vec::with_capacity(raw_items.len());
+
+        for raw in raw_items {
+            let name = crypto::decrypt(&raw.name_encrypted, &password, self.encryption_count, None)
+                .map_err(|e| WalletError::DecryptionError(e))?;
+
+            items.push(IWItem {
+                item_id: raw.item_id,
+                parent_id: raw.parent_id,
+                name,
+                icon: raw.icon,
+                folder: raw.folder,
+                create_timestamp: raw.create_timestamp
+                    .as_ref()
+                    .and_then(|s| parse_timestamp(s))
+                    .unwrap_or_else(Utc::now),
+                change_timestamp: raw.change_timestamp
+                    .as_ref()
+                    .and_then(|s| parse_timestamp(s))
+                    .unwrap_or_else(Utc::now),
+                deleted: raw.deleted,
+            });
+        }
+
+        Ok(items)
+    }
+
+    /// Restore a soft-deleted item
+    pub fn undelete_item(&mut self, item_id: &str) -> Result<()> {
+        self.ensure_unlocked()?;
+
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+
+        queries::undelete_item(conn, item_id)?;
+
+        self.items_cache = None;
         Ok(())
     }
 
@@ -318,5 +384,274 @@ mod tests {
 
         let item = wallet.get_item(&item_id).unwrap().unwrap();
         assert_eq!(item.name, cyrillic_name);
+    }
+
+    #[test]
+    fn test_delete_folder_cascades() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder_id = wallet.add_item("Folder", "folder", true, None).unwrap();
+        let item1_id = wallet.add_item("Item 1", "document", false, Some(&folder_id)).unwrap();
+        let item2_id = wallet.add_item("Item 2", "document", false, Some(&folder_id)).unwrap();
+
+        wallet.delete_item(&folder_id).unwrap();
+
+        // All descendants should be gone from get_items()
+        assert!(wallet.get_item(&folder_id).unwrap().is_none());
+        assert!(wallet.get_item(&item1_id).unwrap().is_none());
+        assert!(wallet.get_item(&item2_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_folder_nested_cascades() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder_id = wallet.add_item("Top Folder", "folder", true, None).unwrap();
+        let subfolder_id = wallet.add_item("Sub Folder", "folder", true, Some(&folder_id)).unwrap();
+        let item_id = wallet.add_item("Deep Item", "document", false, Some(&subfolder_id)).unwrap();
+
+        wallet.delete_item(&folder_id).unwrap();
+
+        assert!(wallet.get_item(&folder_id).unwrap().is_none());
+        assert!(wallet.get_item(&subfolder_id).unwrap().is_none());
+        assert!(wallet.get_item(&item_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_deleted_items() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item1_id = wallet.add_item("Item A", "document", false, None).unwrap();
+        let item2_id = wallet.add_item("Item B", "document", false, None).unwrap();
+        wallet.add_item("Item C", "document", false, None).unwrap();
+
+        wallet.delete_item(&item1_id).unwrap();
+        wallet.delete_item(&item2_id).unwrap();
+
+        let deleted = wallet.get_deleted_items().unwrap();
+        assert_eq!(deleted.len(), 2);
+        let names: Vec<&str> = deleted.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"Item A"));
+        assert!(names.contains(&"Item B"));
+    }
+
+    #[test]
+    fn test_undelete_item() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Recoverable", "document", false, None).unwrap();
+
+        wallet.delete_item(&item_id).unwrap();
+        assert!(wallet.get_item(&item_id).unwrap().is_none());
+
+        wallet.undelete_item(&item_id).unwrap();
+        let item = wallet.get_item(&item_id).unwrap().unwrap();
+        assert_eq!(item.name, "Recoverable");
+    }
+
+    #[test]
+    fn test_undelete_item_not_found() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let result = wallet.undelete_item("NONEXIST");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_deleted_items_empty() {
+        let (mut wallet, _temp) = create_test_wallet();
+        wallet.add_item("Alive Item", "document", false, None).unwrap();
+        let deleted = wallet.get_deleted_items().unwrap();
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn test_get_deleted_items_excludes_active() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("To Delete", "document", false, None).unwrap();
+        wallet.add_item("Keep Alive", "document", false, None).unwrap();
+        wallet.delete_item(&item_id).unwrap();
+
+        let deleted = wallet.get_deleted_items().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].name, "To Delete");
+
+        // Active items still accessible
+        let active = wallet.get_items().unwrap();
+        let active_names: Vec<&str> = active.iter().map(|i| i.name.as_str()).collect();
+        assert!(active_names.contains(&"Keep Alive"));
+        assert!(!active_names.contains(&"To Delete"));
+    }
+
+    #[test]
+    fn test_get_deleted_items_includes_folders() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder_id = wallet.add_item("Deleted Folder", "folder", true, None).unwrap();
+        wallet.delete_item(&folder_id).unwrap();
+
+        let deleted = wallet.get_deleted_items().unwrap();
+        assert!(deleted.iter().any(|i| i.name == "Deleted Folder" && i.folder));
+    }
+
+    #[test]
+    fn test_delete_folder_cascades_appear_in_deleted() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder_id = wallet.add_item("Folder", "folder", true, None).unwrap();
+        let child_id = wallet.add_item("Child", "document", false, Some(&folder_id)).unwrap();
+
+        wallet.delete_item(&folder_id).unwrap();
+
+        let deleted = wallet.get_deleted_items().unwrap();
+        let deleted_ids: Vec<&str> = deleted.iter().map(|i| i.item_id.as_str()).collect();
+        assert!(deleted_ids.contains(&folder_id.as_str()));
+        assert!(deleted_ids.contains(&child_id.as_str()));
+    }
+
+    #[test]
+    fn test_delete_empty_folder() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder_id = wallet.add_item("Empty Folder", "folder", true, None).unwrap();
+
+        wallet.delete_item(&folder_id).unwrap();
+
+        assert!(wallet.get_item(&folder_id).unwrap().is_none());
+        let deleted = wallet.get_deleted_items().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].name, "Empty Folder");
+    }
+
+    #[test]
+    fn test_delete_folder_deep_nesting_4_levels() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let l1 = wallet.add_item("Level 1", "folder", true, None).unwrap();
+        let l2 = wallet.add_item("Level 2", "folder", true, Some(&l1)).unwrap();
+        let l3 = wallet.add_item("Level 3", "folder", true, Some(&l2)).unwrap();
+        let l4 = wallet.add_item("Level 4 Item", "document", false, Some(&l3)).unwrap();
+
+        wallet.delete_item(&l1).unwrap();
+
+        assert!(wallet.get_item(&l1).unwrap().is_none());
+        assert!(wallet.get_item(&l2).unwrap().is_none());
+        assert!(wallet.get_item(&l3).unwrap().is_none());
+        assert!(wallet.get_item(&l4).unwrap().is_none());
+
+        let deleted = wallet.get_deleted_items().unwrap();
+        assert_eq!(deleted.len(), 4);
+    }
+
+    #[test]
+    fn test_delete_folder_mixed_content() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder_id = wallet.add_item("Mixed Folder", "folder", true, None).unwrap();
+        let sub_folder = wallet.add_item("Sub Folder", "folder", true, Some(&folder_id)).unwrap();
+        let item1 = wallet.add_item("Item in root", "document", false, Some(&folder_id)).unwrap();
+        let item2 = wallet.add_item("Item in sub", "document", false, Some(&sub_folder)).unwrap();
+
+        // Keep one item outside
+        let outside = wallet.add_item("Outside", "document", false, None).unwrap();
+
+        wallet.delete_item(&folder_id).unwrap();
+
+        // All inside items gone
+        assert!(wallet.get_item(&folder_id).unwrap().is_none());
+        assert!(wallet.get_item(&sub_folder).unwrap().is_none());
+        assert!(wallet.get_item(&item1).unwrap().is_none());
+        assert!(wallet.get_item(&item2).unwrap().is_none());
+
+        // Outside item untouched
+        assert!(wallet.get_item(&outside).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_undelete_cascade_child_individually() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder_id = wallet.add_item("Folder", "folder", true, None).unwrap();
+        let child_id = wallet.add_item("Child", "document", false, Some(&folder_id)).unwrap();
+
+        wallet.delete_item(&folder_id).unwrap();
+
+        // Undelete just the child
+        wallet.undelete_item(&child_id).unwrap();
+
+        let child = wallet.get_item(&child_id).unwrap().unwrap();
+        assert_eq!(child.name, "Child");
+        // Parent still deleted
+        assert!(wallet.get_item(&folder_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_undelete_item_preserves_parent() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder_id = wallet.add_item("Parent Folder", "folder", true, None).unwrap();
+        let item_id = wallet.add_item("Child Item", "document", false, Some(&folder_id)).unwrap();
+
+        wallet.delete_item(&item_id).unwrap();
+        wallet.undelete_item(&item_id).unwrap();
+
+        let item = wallet.get_item(&item_id).unwrap().unwrap();
+        assert_eq!(item.parent_id.as_deref(), Some(folder_id.as_str()));
+    }
+
+    #[test]
+    fn test_undelete_item_preserves_properties() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("My Item", "maestro", false, None).unwrap();
+
+        wallet.delete_item(&item_id).unwrap();
+        wallet.undelete_item(&item_id).unwrap();
+
+        let item = wallet.get_item(&item_id).unwrap().unwrap();
+        assert_eq!(item.name, "My Item");
+        assert_eq!(item.icon, "maestro");
+        assert!(!item.folder);
+        assert!(!item.deleted);
+    }
+
+    #[test]
+    fn test_undelete_already_active_item_errors() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Active", "document", false, None).unwrap();
+        // Item is not deleted, undelete should fail
+        let result = wallet.undelete_item(&item_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delete_item_fields_remain_as_orphans() {
+        // Fields are NOT auto-deleted when their parent item is deleted.
+        // They become orphans and are cleaned up by compact().
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        wallet.add_field(&item_id, "MAIL", "test@test.com", None).unwrap();
+        wallet.add_field(&item_id, "PASS", "secret", None).unwrap();
+
+        wallet.delete_item(&item_id).unwrap();
+
+        // Fields are still in DB (not soft-deleted), accessible by item_id
+        let fields = wallet.get_fields_by_item(&item_id).unwrap();
+        assert_eq!(fields.len(), 2);
+
+        // But the item itself is gone from active items
+        assert!(wallet.get_item(&item_id).unwrap().is_none());
+
+        // compact() cleans up orphans
+        wallet.compact().unwrap();
+        let fields_after = wallet.get_fields_by_item(&item_id).unwrap();
+        assert_eq!(fields_after.len(), 0);
+    }
+
+    #[test]
+    fn test_delete_folder_cascade_fields_become_orphans() {
+        // Cascade-deleted items leave orphaned fields, cleaned up by compact()
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder_id = wallet.add_item("Folder", "folder", true, None).unwrap();
+        let child_id = wallet.add_item("Child", "document", false, Some(&folder_id)).unwrap();
+        wallet.add_field(&child_id, "MAIL", "child@test.com", None).unwrap();
+
+        wallet.delete_item(&folder_id).unwrap();
+
+        // Fields still exist as orphans
+        let fields = wallet.get_fields_by_item(&child_id).unwrap();
+        assert_eq!(fields.len(), 1);
+
+        // compact() cleans them up
+        wallet.compact().unwrap();
+        let fields_after = wallet.get_fields_by_item(&child_id).unwrap();
+        assert_eq!(fields_after.len(), 0);
     }
 }

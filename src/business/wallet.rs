@@ -280,6 +280,21 @@ impl Wallet {
         self.folder.join(DATABASE_FILENAME)
     }
 
+    /// Permanently purge all soft-deleted records and orphaned fields.
+    /// Returns (purged_items_count, purged_fields_count).
+    pub fn compact(&mut self) -> Result<(u32, u32)> {
+        self.ensure_unlocked()?;
+
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+
+        let result = queries::purge_deleted(conn)?;
+
+        self.clear_caches();
+        Ok(result)
+    }
+
     /// Get a reference to the database for backup operations
     pub fn database(&self) -> Result<&Database> {
         self.db.as_ref().ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))
@@ -435,5 +450,163 @@ pub(crate) mod tests {
         let wallet = Wallet::open(&path).unwrap();
         assert!(wallet.check_password("TestPassword123").unwrap());
         assert!(!wallet.check_password("WrongPassword").unwrap());
+    }
+
+    #[test]
+    fn test_compact_items() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("To Purge", "document", false, None).unwrap();
+        wallet.delete_item(&item_id).unwrap();
+
+        wallet.compact().unwrap();
+
+        let deleted = wallet.get_deleted_items().unwrap();
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn test_compact_fields() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        let field_id = wallet.add_field(&item_id, "MAIL", "purge@test.com", None).unwrap();
+        wallet.delete_field(&item_id, &field_id).unwrap();
+
+        wallet.compact().unwrap();
+
+        let deleted = wallet.get_deleted_fields().unwrap();
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn test_compact_cascaded_fields() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        wallet.add_field(&item_id, "MAIL", "orphan@test.com", None).unwrap();
+        wallet.add_field(&item_id, "PASS", "secret", None).unwrap();
+
+        // Delete item (fields become orphaned)
+        wallet.delete_item(&item_id).unwrap();
+
+        wallet.compact().unwrap();
+
+        // Orphaned fields should also be purged
+        let deleted_fields = wallet.get_deleted_fields().unwrap();
+        assert!(deleted_fields.is_empty());
+        let deleted_items = wallet.get_deleted_items().unwrap();
+        assert!(deleted_items.is_empty());
+    }
+
+    #[test]
+    fn test_compact_returns_counts() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item1_id = wallet.add_item("Item 1", "document", false, None).unwrap();
+        let item2_id = wallet.add_item("Item 2", "document", false, None).unwrap();
+        let field_id = wallet.add_field(&item1_id, "MAIL", "test@test.com", None).unwrap();
+
+        wallet.delete_item(&item1_id).unwrap();
+        wallet.delete_item(&item2_id).unwrap();
+        wallet.delete_field(&item1_id, &field_id).unwrap();
+
+        let (items_count, fields_count) = wallet.compact().unwrap();
+        assert_eq!(items_count, 2);
+        // field_id was already counted as orphan of deleted item1
+        assert_eq!(fields_count, 1);
+    }
+
+    #[test]
+    fn test_compact_empty() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let (items, fields) = wallet.compact().unwrap();
+        assert_eq!(items, 0);
+        assert_eq!(fields, 0);
+    }
+
+    #[test]
+    fn test_compact_preserves_active_records() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item1 = wallet.add_item("Keep This", "document", false, None).unwrap();
+        wallet.add_field(&item1, "MAIL", "keep@test.com", None).unwrap();
+        let item2 = wallet.add_item("Delete This", "document", false, None).unwrap();
+        wallet.add_field(&item2, "PASS", "gone", None).unwrap();
+
+        wallet.delete_item(&item2).unwrap();
+        wallet.compact().unwrap();
+
+        // Active records untouched
+        let item = wallet.get_item(&item1).unwrap().unwrap();
+        assert_eq!(item.name, "Keep This");
+        let fields = wallet.get_fields_by_item(&item1).unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].value, "keep@test.com");
+    }
+
+    #[test]
+    fn test_compact_double_call_idempotent() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Delete Me", "document", false, None).unwrap();
+        wallet.delete_item(&item_id).unwrap();
+
+        let (i1, _f1) = wallet.compact().unwrap();
+        assert_eq!(i1, 1);
+
+        // Second compact: nothing left to purge
+        let (i2, f2) = wallet.compact().unwrap();
+        assert_eq!(i2, 0);
+        assert_eq!(f2, 0);
+    }
+
+    #[test]
+    fn test_compact_after_cascade_delete() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder = wallet.add_item("Folder", "folder", true, None).unwrap();
+        let child1 = wallet.add_item("Child 1", "document", false, Some(&folder)).unwrap();
+        let child2 = wallet.add_item("Child 2", "document", false, Some(&folder)).unwrap();
+        wallet.add_field(&child1, "MAIL", "c1@test.com", None).unwrap();
+        wallet.add_field(&child2, "PASS", "secret", None).unwrap();
+
+        wallet.delete_item(&folder).unwrap();
+
+        let (items_count, fields_count) = wallet.compact().unwrap();
+        assert_eq!(items_count, 3); // folder + 2 children
+        assert_eq!(fields_count, 2); // orphaned fields of deleted items
+
+        // Everything gone
+        assert!(wallet.get_deleted_items().unwrap().is_empty());
+        assert!(wallet.get_deleted_fields().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_compact_mixed_deleted_and_orphaned_fields() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        let f1 = wallet.add_field(&item_id, "MAIL", "test@test.com", None).unwrap();
+        wallet.add_field(&item_id, "PASS", "secret", None).unwrap();
+
+        // Explicitly delete one field, then delete the item (making the other orphaned)
+        wallet.delete_field(&item_id, &f1).unwrap();
+        wallet.delete_item(&item_id).unwrap();
+
+        let (items_count, fields_count) = wallet.compact().unwrap();
+        assert_eq!(items_count, 1);
+        // Both fields purged: f1 was soft-deleted, PASS was orphaned by item delete
+        assert_eq!(fields_count, 2);
+    }
+
+    #[test]
+    fn test_compact_with_active_and_deleted_fields_same_item() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        let f_del = wallet.add_field(&item_id, "MAIL", "delete@me.com", None).unwrap();
+        wallet.add_field(&item_id, "PASS", "keep_me", None).unwrap();
+
+        wallet.delete_field(&item_id, &f_del).unwrap();
+        wallet.compact().unwrap();
+
+        // Deleted field gone
+        assert!(wallet.get_deleted_fields().unwrap().is_empty());
+        // Active field still there
+        let active = wallet.get_fields_by_item(&item_id).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].value, "keep_me");
     }
 }

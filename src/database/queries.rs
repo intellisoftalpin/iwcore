@@ -204,6 +204,58 @@ pub fn delete_item(conn: &Connection, item_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Get all soft-deleted items from database (encrypted)
+pub fn get_deleted_items_raw(conn: &Connection) -> Result<Vec<RawItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT item_id, parent_id, name, icon, folder, create_timestamp, change_timestamp, deleted
+         FROM nswallet_items WHERE deleted = 1"
+    )?;
+
+    let items = stmt.query_map([], |row| {
+        Ok(RawItem {
+            item_id: row.get(0)?,
+            parent_id: row.get(1)?,
+            name_encrypted: row.get(2)?,
+            icon: row.get(3)?,
+            folder: row.get::<_, i32>(4)? != 0,
+            create_timestamp: row.get(5)?,
+            change_timestamp: row.get(6)?,
+            deleted: row.get::<_, i32>(7)? != 0,
+        })
+    })?;
+
+    items.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Undelete an item (set deleted = 0)
+pub fn undelete_item(conn: &Connection, item_id: &str) -> Result<()> {
+    let rows = conn.execute(
+        "UPDATE nswallet_items SET deleted = 0, change_timestamp = ? WHERE item_id = ? AND deleted = 1",
+        params![now_timestamp(), item_id],
+    )?;
+    if rows == 0 {
+        return Err(crate::error::WalletError::ItemNotFound(item_id.to_string()));
+    }
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+
+/// Soft-delete all descendants of a folder using recursive CTE
+pub fn delete_item_descendants(conn: &Connection, item_id: &str) -> Result<()> {
+    let now = now_timestamp();
+    conn.execute(
+        "WITH RECURSIVE descendants(id) AS (
+            SELECT item_id FROM nswallet_items WHERE parent_id = ?1 AND deleted = 0
+            UNION ALL
+            SELECT i.item_id FROM nswallet_items i JOIN descendants d ON i.parent_id = d.id WHERE i.deleted = 0
+        )
+        UPDATE nswallet_items SET deleted = 1, change_timestamp = ?2 WHERE item_id IN (SELECT id FROM descendants)",
+        params![item_id, now],
+    )?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+
 /// Update item name without timestamp (for password change)
 pub fn update_item_name_only(conn: &Connection, item_id: &str, name_encrypted: &[u8]) -> Result<()> {
     conn.execute(
@@ -296,6 +348,87 @@ pub fn update_field_value_only(conn: &Connection, item_id: &str, field_id: &str,
         params![value_encrypted, item_id, field_id],
     )?;
     Ok(())
+}
+
+/// Get all soft-deleted fields from database (encrypted)
+pub fn get_deleted_fields_raw(conn: &Connection) -> Result<Vec<RawField>> {
+    let mut stmt = conn.prepare(
+        "SELECT item_id, field_id, type, value, change_timestamp, deleted, sort_weight
+         FROM nswallet_fields WHERE deleted = 1"
+    )?;
+
+    let fields = stmt.query_map([], |row| {
+        Ok(RawField {
+            item_id: row.get(0)?,
+            field_id: row.get(1)?,
+            field_type: row.get(2)?,
+            value_encrypted: row.get(3)?,
+            change_timestamp: row.get(4)?,
+            deleted: row.get::<_, i32>(5)? != 0,
+            sort_weight: row.get(6)?,
+        })
+    })?;
+
+    fields.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Undelete a field (set deleted = 0)
+pub fn undelete_field(conn: &Connection, item_id: &str, field_id: &str) -> Result<()> {
+    let rows = conn.execute(
+        "UPDATE nswallet_fields SET deleted = 0, change_timestamp = ? WHERE item_id = ? AND field_id = ? AND deleted = 1",
+        params![now_timestamp(), item_id, field_id],
+    )?;
+    if rows == 0 {
+        return Err(crate::error::WalletError::FieldNotFound(field_id.to_string()));
+    }
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+
+/// Permanently purge all soft-deleted records.
+/// Returns (purged_items_count, purged_fields_count).
+pub fn purge_deleted(conn: &Connection) -> Result<(u32, u32)> {
+    // Count before deleting
+    let items_count: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM nswallet_items WHERE deleted = 1",
+        [],
+        |row| row.get(0),
+    )?;
+
+    // Count deleted fields + orphaned fields (fields belonging to deleted items)
+    let fields_count: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM nswallet_fields WHERE deleted = 1 OR item_id IN (SELECT item_id FROM nswallet_items WHERE deleted = 1)",
+        [],
+        |row| row.get(0),
+    )?;
+
+    // Delete orphaned fields first (fields belonging to deleted items)
+    conn.execute(
+        "DELETE FROM nswallet_fields WHERE item_id IN (SELECT item_id FROM nswallet_items WHERE deleted = 1)",
+        [],
+    )?;
+
+    // Delete soft-deleted fields
+    conn.execute(
+        "DELETE FROM nswallet_fields WHERE deleted = 1",
+        [],
+    )?;
+
+    // Delete soft-deleted items
+    conn.execute(
+        "DELETE FROM nswallet_items WHERE deleted = 1",
+        [],
+    )?;
+
+    // Delete soft-deleted labels
+    conn.execute(
+        "DELETE FROM nswallet_labels WHERE deleted = 1",
+        [],
+    )?;
+
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    Ok((items_count, fields_count))
 }
 
 /// Get max sort weight for an item's fields
