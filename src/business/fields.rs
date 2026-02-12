@@ -187,8 +187,10 @@ impl Wallet {
         let mut fields = Vec::with_capacity(raw_fields.len());
 
         for raw in raw_fields {
-            let value = crypto::decrypt(&raw.value_encrypted, &password, self.encryption_count, None)
-                .map_err(|e| WalletError::DecryptionError(e))?;
+            let value = match crypto::decrypt(&raw.value_encrypted, &password, self.encryption_count, None) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
 
             let label = labels.get(&raw.field_type);
             let (label_name, icon, value_type) = match label {
@@ -565,5 +567,48 @@ mod tests {
         let item_ids: Vec<&str> = deleted.iter().map(|f| f.item_id.as_str()).collect();
         assert!(item_ids.contains(&item1.as_str()));
         assert!(item_ids.contains(&item2.as_str()));
+    }
+
+    #[test]
+    fn test_get_deleted_fields_skips_undecryptable() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        let f1 = wallet.add_field(&item_id, "MAIL", "good@test.com", None).unwrap();
+        let f2 = wallet.add_field(&item_id, "PASS", "will_corrupt", None).unwrap();
+
+        wallet.delete_field(&item_id, &f1).unwrap();
+        wallet.delete_field(&item_id, &f2).unwrap();
+
+        // Corrupt f2's encrypted value directly in the database
+        let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+        conn.execute(
+            "UPDATE nswallet_fields SET value = ? WHERE field_id = ?",
+            rusqlite::params![vec![0u8; 32], f2],
+        ).unwrap();
+
+        // Should return only the decryptable field, not abort
+        let deleted = wallet.get_deleted_fields().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].value, "good@test.com");
+    }
+
+    #[test]
+    fn test_get_deleted_fields_all_undecryptable_returns_empty() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        let f1 = wallet.add_field(&item_id, "MAIL", "will_corrupt", None).unwrap();
+
+        wallet.delete_field(&item_id, &f1).unwrap();
+
+        // Corrupt the encrypted value
+        let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+        conn.execute(
+            "UPDATE nswallet_fields SET value = ? WHERE field_id = ?",
+            rusqlite::params![vec![0u8; 32], f1],
+        ).unwrap();
+
+        // Should return empty, not error
+        let deleted = wallet.get_deleted_fields().unwrap();
+        assert!(deleted.is_empty());
     }
 }

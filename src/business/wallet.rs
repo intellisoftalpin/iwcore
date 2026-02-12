@@ -233,18 +233,38 @@ impl Wallet {
         let result = (|| -> Result<()> {
             let conn = db.connection()?;
 
-            // Re-encrypt all items
+            // Re-encrypt all active items
             for item in &items {
                 let new_encrypted = crypto::encrypt(&item.name, new_password, encryption_count, None)
                     .map_err(|e| WalletError::EncryptionError(e))?;
                 queries::update_item_name_only(conn, &item.item_id, &new_encrypted)?;
             }
 
-            // Re-encrypt all fields
+            // Re-encrypt all active fields
             for field in &fields {
                 let new_encrypted = crypto::encrypt(&field.value, new_password, encryption_count, None)
                     .map_err(|e| WalletError::EncryptionError(e))?;
                 queries::update_field_value_only(conn, &field.item_id, &field.field_id, &new_encrypted)?;
+            }
+
+            // Re-encrypt deleted items
+            let deleted_items_raw = queries::get_deleted_items_raw(conn)?;
+            for raw in &deleted_items_raw {
+                if let Ok(name) = crypto::decrypt(&raw.name_encrypted, &old_password, encryption_count, None) {
+                    let new_encrypted = crypto::encrypt(&name, new_password, encryption_count, None)
+                        .map_err(|e| WalletError::EncryptionError(e))?;
+                    queries::update_item_name_only(conn, &raw.item_id, &new_encrypted)?;
+                }
+            }
+
+            // Re-encrypt deleted fields
+            let deleted_fields_raw = queries::get_deleted_fields_raw(conn)?;
+            for raw in &deleted_fields_raw {
+                if let Ok(value) = crypto::decrypt(&raw.value_encrypted, &old_password, encryption_count, None) {
+                    let new_encrypted = crypto::encrypt(&value, new_password, encryption_count, None)
+                        .map_err(|e| WalletError::EncryptionError(e))?;
+                    queries::update_field_value_only(conn, &raw.item_id, &raw.field_id, &new_encrypted)?;
+                }
             }
 
             Ok(())
@@ -608,5 +628,79 @@ pub(crate) mod tests {
         let active = wallet.get_fields_by_item(&item_id).unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].value, "keep_me");
+    }
+
+    #[test]
+    fn test_change_password_reencrypts_deleted_items() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Deleted Item", "document", false, None).unwrap();
+        wallet.delete_item(&item_id).unwrap();
+
+        // Change password
+        assert!(wallet.change_password("NewPassword456").unwrap());
+
+        // Deleted item should still be accessible after password change
+        let deleted = wallet.get_deleted_items().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].name, "Deleted Item");
+
+        // Verify new password works after reopen
+        wallet.lock();
+        assert!(wallet.unlock("NewPassword456").unwrap());
+        let deleted2 = wallet.get_deleted_items().unwrap();
+        assert_eq!(deleted2.len(), 1);
+        assert_eq!(deleted2[0].name, "Deleted Item");
+    }
+
+    #[test]
+    fn test_change_password_reencrypts_deleted_fields() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        let field_id = wallet.add_field(&item_id, "PASS", "my_secret", None).unwrap();
+        wallet.delete_field(&item_id, &field_id).unwrap();
+
+        // Change password
+        assert!(wallet.change_password("NewPassword456").unwrap());
+
+        // Deleted field should still be accessible after password change
+        let deleted = wallet.get_deleted_fields().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].value, "my_secret");
+
+        // Verify new password works after reopen
+        wallet.lock();
+        assert!(wallet.unlock("NewPassword456").unwrap());
+        let deleted2 = wallet.get_deleted_fields().unwrap();
+        assert_eq!(deleted2.len(), 1);
+        assert_eq!(deleted2[0].value, "my_secret");
+    }
+
+    #[test]
+    fn test_change_password_mixed_active_and_deleted() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let active_item = wallet.add_item("Active Item", "document", false, None).unwrap();
+        wallet.add_field(&active_item, "MAIL", "active@test.com", None).unwrap();
+
+        let del_item = wallet.add_item("Deleted Item", "document", false, None).unwrap();
+        let del_field = wallet.add_field(&del_item, "PASS", "deleted_secret", None).unwrap();
+        wallet.delete_item(&del_item).unwrap();
+        wallet.delete_field(&del_item, &del_field).unwrap();
+
+        assert!(wallet.change_password("NewPassword456").unwrap());
+
+        // Active records still work
+        let item = wallet.get_item(&active_item).unwrap().unwrap();
+        assert_eq!(item.name, "Active Item");
+        let fields = wallet.get_fields_by_item(&active_item).unwrap();
+        assert_eq!(fields[0].value, "active@test.com");
+
+        // Deleted records also still work
+        let deleted_items = wallet.get_deleted_items().unwrap();
+        assert_eq!(deleted_items.len(), 1);
+        assert_eq!(deleted_items[0].name, "Deleted Item");
+
+        let deleted_fields = wallet.get_deleted_fields().unwrap();
+        assert_eq!(deleted_fields.len(), 1);
+        assert_eq!(deleted_fields[0].value, "deleted_secret");
     }
 }

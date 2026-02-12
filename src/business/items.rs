@@ -195,8 +195,10 @@ impl Wallet {
         let mut items = Vec::with_capacity(raw_items.len());
 
         for raw in raw_items {
-            let name = crypto::decrypt(&raw.name_encrypted, &password, self.encryption_count, None)
-                .map_err(|e| WalletError::DecryptionError(e))?;
+            let name = match crypto::decrypt(&raw.name_encrypted, &password, self.encryption_count, None) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
 
             items.push(IWItem {
                 item_id: raw.item_id,
@@ -653,5 +655,46 @@ mod tests {
         wallet.compact().unwrap();
         let fields_after = wallet.get_fields_by_item(&child_id).unwrap();
         assert_eq!(fields_after.len(), 0);
+    }
+
+    #[test]
+    fn test_get_deleted_items_skips_undecryptable() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item1 = wallet.add_item("Good Item", "document", false, None).unwrap();
+        let item2 = wallet.add_item("Corrupt Item", "document", false, None).unwrap();
+
+        wallet.delete_item(&item1).unwrap();
+        wallet.delete_item(&item2).unwrap();
+
+        // Corrupt item2's encrypted name directly in the database
+        let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+        conn.execute(
+            "UPDATE nswallet_items SET name = ? WHERE item_id = ?",
+            rusqlite::params![vec![0u8; 32], item2],
+        ).unwrap();
+
+        // Should return only the decryptable item, not abort
+        let deleted = wallet.get_deleted_items().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].name, "Good Item");
+    }
+
+    #[test]
+    fn test_get_deleted_items_all_undecryptable_returns_empty() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item1 = wallet.add_item("Corrupt Item", "document", false, None).unwrap();
+
+        wallet.delete_item(&item1).unwrap();
+
+        // Corrupt the encrypted name
+        let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+        conn.execute(
+            "UPDATE nswallet_items SET name = ? WHERE item_id = ?",
+            rusqlite::params![vec![0u8; 32], item1],
+        ).unwrap();
+
+        // Should return empty, not error
+        let deleted = wallet.get_deleted_items().unwrap();
+        assert!(deleted.is_empty());
     }
 }

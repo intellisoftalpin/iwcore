@@ -40,8 +40,11 @@ pub const BACKUP_DATE_FORMAT: &str = "%Y%m%d-%H%M%S";
 /// Backup type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupType {
+    /// Automatically created backup (e.g. on app launch)
     Auto,
+    /// Manually created backup by user request
     Manual,
+    /// Backup imported from external source
     Imported,
 }
 

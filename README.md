@@ -12,11 +12,15 @@
 
 - **AES-256-CBC Encryption** - Industry-standard encryption with PKCS7 padding
 - **SQLite Storage** - Reliable database storage with full ACID compliance
-- **Hierarchical Organization** - Organize items in folders
-- **Custom Field Types** - 19 built-in field types (email, password, credit card, etc.)
-- **Backup & Restore** - ZIP-based backup with versioning
+- **Hierarchical Organization** - Organize items in folders with drag-and-drop support
+- **Custom Field Types** - 19 built-in field types (email, password, credit card, etc.) plus custom labels
+- **Delete & Restore** - Soft-delete with full undo capability for items and fields
+- **Backup & Restore** - ZIP-based backup with versioning, auto-cleanup, and integrity verification
 - **Multi-language Support** - 11 languages included
 - **Password Generator** - Random and pattern-based password generation
+- **Search** - Full-text search across item names and field values
+- **Export** - Data export with PDF item model support
+- **Database Maintenance** - Compact/optimize database by purging deleted records
 
 ## Installation
 
@@ -24,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-iwcore = "0.1"
+iwcore = "0.1.7"
 ```
 
 Or use cargo:
@@ -78,6 +82,51 @@ if wallet.unlock("my_password")? {
 wallet.close();
 ```
 
+## Item & Field Management
+
+```rust
+// Create folders and items
+let folder_id = wallet.add_item("Work", "folder", true, None)?;
+let item_id = wallet.add_item("Server Login", "document", false, Some(&folder_id))?;
+
+// Add, update, copy, move fields
+let field_id = wallet.add_field(&item_id, "USER", "admin", None)?;
+wallet.update_field(&field_id, "root", None)?;
+wallet.copy_field(&item_id, &field_id, &other_item_id)?;
+wallet.move_field(&item_id, &field_id, &other_item_id)?;
+
+// Move and copy items
+wallet.move_item(&item_id, &new_folder_id)?;
+let copy_id = wallet.copy_item(&item_id)?;
+
+// Soft-delete and restore
+wallet.delete_item(&item_id)?;
+let deleted = wallet.get_deleted_items()?;
+wallet.undelete_item(&item_id)?;
+
+wallet.delete_field(&item_id, &field_id)?;
+let deleted_fields = wallet.get_deleted_fields()?;
+wallet.undelete_field(&item_id, &field_id)?;
+
+// Purge all soft-deleted records permanently
+let (purged_items, purged_fields) = wallet.compact()?;
+```
+
+## Password Management
+
+```rust
+// Change wallet password (re-encrypts all data including deleted records)
+wallet.change_password("new_secure_password")?;
+
+// Check password without unlocking
+let valid = wallet.check_password("my_password")?;
+
+// Lock/unlock session
+wallet.lock();
+assert!(!wallet.is_unlocked());
+wallet.unlock("my_password")?;
+```
+
 ## Password Generation
 
 ```rust
@@ -109,11 +158,33 @@ let wallet = Wallet::open(Path::new("./my_wallet"))?;
 let backup_mgr = BackupManager::new(Path::new("./backups"));
 let backup_path = backup_mgr.create_backup(wallet.database()?, true)?;
 
-// List backups
+// List and manage backups
 let backups = backup_mgr.list_backups()?;
+let latest = backup_mgr.get_latest_backup()?;
+
+// Verify backup integrity
+backup_mgr.verify_backup(&backup_path)?;
 
 // Restore backup
 backup_mgr.restore_backup(&backup_path, Path::new("./restored.dat"))?;
+
+// Cleanup old backups
+backup_mgr.cleanup_old_backups(5)?;
+backup_mgr.cleanup_auto_backups(3, 30)?;
+```
+
+## Custom Labels
+
+```rust
+// Add a custom field type
+wallet.add_label("CUST", "Custom Field", "text", "tag")?;
+
+// Update label properties
+wallet.update_label_name("CUST", "My Custom Field")?;
+wallet.update_label_icon("CUST", "star")?;
+
+// Delete custom label
+wallet.delete_label("CUST")?;
 ```
 
 ## Field Types

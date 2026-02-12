@@ -920,3 +920,714 @@ fn test_search_excludes_folders_from_name_match() {
 
     wallet.close();
 }
+
+// =========================================================================
+// Gap #1: Undelete Items & Fields
+// =========================================================================
+
+#[test]
+fn test_undelete_item() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    let item_id = wallet.add_item("Recoverable Item", "document", false, None).unwrap();
+    wallet.add_field(&item_id, "MAIL", "recover@test.com", None).unwrap();
+
+    // Delete
+    wallet.delete_item(&item_id).unwrap();
+    assert!(wallet.get_item(&item_id).unwrap().is_none());
+
+    // Undelete
+    wallet.undelete_item(&item_id).unwrap();
+
+    // Verify restored with correct data
+    let item = wallet.get_item(&item_id).unwrap().unwrap();
+    assert_eq!(item.name, "Recoverable Item");
+    assert!(!item.deleted);
+
+    wallet.close();
+}
+
+#[test]
+fn test_undelete_field() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+    let field_id = wallet.add_field(&item_id, "PASS", "secret_value", None).unwrap();
+
+    // Delete field
+    wallet.delete_field(&item_id, &field_id).unwrap();
+    let fields = wallet.get_fields_by_item(&item_id).unwrap();
+    assert_eq!(fields.len(), 0);
+
+    // Undelete field
+    wallet.undelete_field(&item_id, &field_id).unwrap();
+
+    // Verify restored with correct data
+    let fields = wallet.get_fields_by_item(&item_id).unwrap();
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].value, "secret_value");
+    assert_eq!(fields[0].field_type, "PASS");
+
+    wallet.close();
+}
+
+#[test]
+fn test_undelete_item_not_found() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    let result = wallet.undelete_item("NONEXISTENT");
+    assert!(result.is_err());
+
+    wallet.close();
+}
+
+#[test]
+fn test_undelete_active_item_errors() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    let item_id = wallet.add_item("Active Item", "document", false, None).unwrap();
+
+    // Undelete an item that's not deleted should fail
+    let result = wallet.undelete_item(&item_id);
+    assert!(result.is_err());
+
+    wallet.close();
+}
+
+#[test]
+fn test_undelete_multiple_fields() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+    let f1 = wallet.add_field(&item_id, "MAIL", "a@test.com", None).unwrap();
+    let f2 = wallet.add_field(&item_id, "PASS", "pass1", None).unwrap();
+    let f3 = wallet.add_field(&item_id, "NOTE", "note1", None).unwrap();
+
+    // Delete all
+    wallet.delete_field(&item_id, &f1).unwrap();
+    wallet.delete_field(&item_id, &f2).unwrap();
+    wallet.delete_field(&item_id, &f3).unwrap();
+    assert_eq!(wallet.get_fields_by_item(&item_id).unwrap().len(), 0);
+
+    // Undelete two
+    wallet.undelete_field(&item_id, &f1).unwrap();
+    wallet.undelete_field(&item_id, &f3).unwrap();
+
+    let fields = wallet.get_fields_by_item(&item_id).unwrap();
+    assert_eq!(fields.len(), 2);
+    let values: Vec<&str> = fields.iter().map(|f| f.value.as_str()).collect();
+    assert!(values.contains(&"a@test.com"));
+    assert!(values.contains(&"note1"));
+
+    // f2 should still be in deleted list
+    let deleted = wallet.get_deleted_fields().unwrap();
+    assert!(deleted.iter().any(|f| f.field_id == f2));
+
+    wallet.close();
+}
+
+// =========================================================================
+// Gap #2: get_deleted_items() / get_deleted_fields()
+// =========================================================================
+
+#[test]
+fn test_get_deleted_items_list() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    // Create and delete items
+    let id1 = wallet.add_item("Deleted A", "document", false, None).unwrap();
+    let id2 = wallet.add_item("Deleted B", "document", false, None).unwrap();
+    wallet.add_item("Keep Active", "document", false, None).unwrap();
+
+    wallet.delete_item(&id1).unwrap();
+    wallet.delete_item(&id2).unwrap();
+
+    let deleted = wallet.get_deleted_items().unwrap();
+    let deleted_names: Vec<&str> = deleted.iter().map(|i| i.name.as_str()).collect();
+
+    // Our two deleted items should be in the list
+    assert!(deleted_names.contains(&"Deleted A"));
+    assert!(deleted_names.contains(&"Deleted B"));
+    // Active item should NOT be in deleted list
+    assert!(!deleted_names.contains(&"Keep Active"));
+
+    wallet.close();
+}
+
+#[test]
+fn test_get_deleted_fields_list() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+    let f1 = wallet.add_field(&item_id, "MAIL", "deleted@test.com", None).unwrap();
+    wallet.add_field(&item_id, "PASS", "active_secret", None).unwrap();
+
+    wallet.delete_field(&item_id, &f1).unwrap();
+
+    let deleted = wallet.get_deleted_fields().unwrap();
+    let deleted_values: Vec<&str> = deleted.iter().map(|f| f.value.as_str()).collect();
+    assert!(deleted_values.contains(&"deleted@test.com"));
+    assert!(!deleted_values.contains(&"active_secret"));
+
+    wallet.close();
+}
+
+#[test]
+fn test_get_deleted_items_empty_when_none_deleted() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    wallet.add_item("Active Only", "document", false, None).unwrap();
+
+    // Only newly created items (no deletes) — but the legacy DB may have deleted records,
+    // so we just verify it doesn't error out
+    let deleted = wallet.get_deleted_items();
+    assert!(deleted.is_ok());
+
+    wallet.close();
+}
+
+// =========================================================================
+// Gap #3: Change Password + Deleted Records
+// =========================================================================
+
+#[test]
+fn test_change_password_deleted_items_still_accessible() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut wallet = Wallet::create(temp_dir.path(), "OldPassword1", "en").unwrap();
+
+    // Create and delete an item
+    let item_id = wallet.add_item("Deleted Before PW Change", "document", false, None).unwrap();
+    wallet.delete_item(&item_id).unwrap();
+
+    // Change password
+    assert!(wallet.change_password("NewPassword2").unwrap());
+
+    // Deleted item should still be accessible
+    let deleted = wallet.get_deleted_items().unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].name, "Deleted Before PW Change");
+
+    // Verify after lock/unlock with new password
+    wallet.lock();
+    assert!(wallet.unlock("NewPassword2").unwrap());
+    let deleted2 = wallet.get_deleted_items().unwrap();
+    assert_eq!(deleted2.len(), 1);
+    assert_eq!(deleted2[0].name, "Deleted Before PW Change");
+
+    wallet.close();
+}
+
+#[test]
+fn test_change_password_deleted_fields_still_accessible() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut wallet = Wallet::create(temp_dir.path(), "OldPassword1", "en").unwrap();
+
+    let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+    let field_id = wallet.add_field(&item_id, "PASS", "secret_before_change", None).unwrap();
+    wallet.delete_field(&item_id, &field_id).unwrap();
+
+    assert!(wallet.change_password("NewPassword2").unwrap());
+
+    let deleted = wallet.get_deleted_fields().unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].value, "secret_before_change");
+
+    // Lock/unlock cycle
+    wallet.lock();
+    assert!(wallet.unlock("NewPassword2").unwrap());
+    let deleted2 = wallet.get_deleted_fields().unwrap();
+    assert_eq!(deleted2.len(), 1);
+    assert_eq!(deleted2[0].value, "secret_before_change");
+
+    wallet.close();
+}
+
+#[test]
+fn test_change_password_mixed_active_and_deleted() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut wallet = Wallet::create(temp_dir.path(), "Pass1", "en").unwrap();
+
+    // Active records
+    let active_item = wallet.add_item("Active Item", "document", false, None).unwrap();
+    wallet.add_field(&active_item, "MAIL", "active@test.com", None).unwrap();
+
+    // Deleted records
+    let del_item = wallet.add_item("Deleted Item", "document", false, None).unwrap();
+    let del_field = wallet.add_field(&active_item, "PASS", "deleted_pass", None).unwrap();
+    wallet.delete_item(&del_item).unwrap();
+    wallet.delete_field(&active_item, &del_field).unwrap();
+
+    // Change password
+    assert!(wallet.change_password("Pass2").unwrap());
+
+    // Active still works
+    let item = wallet.get_item(&active_item).unwrap().unwrap();
+    assert_eq!(item.name, "Active Item");
+    let fields = wallet.get_fields_by_item(&active_item).unwrap();
+    assert_eq!(fields[0].value, "active@test.com");
+
+    // Deleted still works
+    let del_items = wallet.get_deleted_items().unwrap();
+    assert!(del_items.iter().any(|i| i.name == "Deleted Item"));
+    let del_fields = wallet.get_deleted_fields().unwrap();
+    assert!(del_fields.iter().any(|f| f.value == "deleted_pass"));
+
+    wallet.close();
+}
+
+#[test]
+fn test_change_password_twice_deleted_survive() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut wallet = Wallet::create(temp_dir.path(), "Pass1", "en").unwrap();
+
+    let item_id = wallet.add_item("Survivor", "document", false, None).unwrap();
+    let field_id = wallet.add_field(&item_id, "NOTE", "persistent_note", None).unwrap();
+    wallet.delete_item(&item_id).unwrap();
+    wallet.delete_field(&item_id, &field_id).unwrap();
+
+    // First password change
+    assert!(wallet.change_password("Pass2").unwrap());
+    // Second password change
+    assert!(wallet.change_password("Pass3").unwrap());
+
+    wallet.lock();
+    assert!(!wallet.unlock("Pass1").unwrap());
+    assert!(!wallet.unlock("Pass2").unwrap());
+    assert!(wallet.unlock("Pass3").unwrap());
+
+    let del_items = wallet.get_deleted_items().unwrap();
+    assert!(del_items.iter().any(|i| i.name == "Survivor"));
+    let del_fields = wallet.get_deleted_fields().unwrap();
+    assert!(del_fields.iter().any(|f| f.value == "persistent_note"));
+
+    wallet.close();
+}
+
+// =========================================================================
+// Gap #4: Compact
+// =========================================================================
+
+#[test]
+fn test_compact_purges_deleted_items() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    let id1 = wallet.add_item("Purge Me 1", "document", false, None).unwrap();
+    let id2 = wallet.add_item("Purge Me 2", "document", false, None).unwrap();
+
+    wallet.delete_item(&id1).unwrap();
+    wallet.delete_item(&id2).unwrap();
+
+    let deleted_before = wallet.get_deleted_items().unwrap();
+    let our_deleted = deleted_before.iter()
+        .filter(|i| i.name == "Purge Me 1" || i.name == "Purge Me 2")
+        .count();
+    assert_eq!(our_deleted, 2);
+
+    let (items_purged, _fields_purged) = wallet.compact().unwrap();
+    assert!(items_purged >= 2);
+
+    // Our items should be gone from deleted list
+    let deleted_after = wallet.get_deleted_items().unwrap();
+    assert!(!deleted_after.iter().any(|i| i.name == "Purge Me 1"));
+    assert!(!deleted_after.iter().any(|i| i.name == "Purge Me 2"));
+
+    wallet.close();
+}
+
+#[test]
+fn test_compact_purges_deleted_fields() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    let item_id = wallet.add_item("Item With Fields", "document", false, None).unwrap();
+    let f1 = wallet.add_field(&item_id, "MAIL", "purge_this@test.com", None).unwrap();
+    wallet.add_field(&item_id, "PASS", "keep_this_active", None).unwrap();
+
+    wallet.delete_field(&item_id, &f1).unwrap();
+
+    wallet.compact().unwrap();
+
+    // Deleted field should be purged
+    let deleted = wallet.get_deleted_fields().unwrap();
+    assert!(!deleted.iter().any(|f| f.value == "purge_this@test.com"));
+
+    // Active field should survive
+    let active = wallet.get_fields_by_item(&item_id).unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].value, "keep_this_active");
+
+    wallet.close();
+}
+
+#[test]
+fn test_compact_returns_counts() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut wallet = Wallet::create(temp_dir.path(), "TestPass", "en").unwrap();
+
+    let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+    let f1 = wallet.add_field(&item_id, "MAIL", "a@a.com", None).unwrap();
+    let f2 = wallet.add_field(&item_id, "PASS", "secret", None).unwrap();
+
+    wallet.delete_field(&item_id, &f1).unwrap();
+    wallet.delete_field(&item_id, &f2).unwrap();
+    wallet.delete_item(&item_id).unwrap();
+
+    let (items_purged, fields_purged) = wallet.compact().unwrap();
+    assert_eq!(items_purged, 1);
+    assert_eq!(fields_purged, 2);
+
+    wallet.close();
+}
+
+#[test]
+fn test_compact_idempotent() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut wallet = Wallet::create(temp_dir.path(), "TestPass", "en").unwrap();
+
+    let item_id = wallet.add_item("Gone", "document", false, None).unwrap();
+    wallet.delete_item(&item_id).unwrap();
+
+    let (count1, _) = wallet.compact().unwrap();
+    assert_eq!(count1, 1);
+
+    // Second compact: nothing left
+    let (count2, count3) = wallet.compact().unwrap();
+    assert_eq!(count2, 0);
+    assert_eq!(count3, 0);
+
+    wallet.close();
+}
+
+// =========================================================================
+// Gap #5: check_password()
+// =========================================================================
+
+#[test]
+fn test_check_password_correct() {
+    let (wallet, _temp_dir) = setup_test_wallet();
+
+    // check_password doesn't require unlock
+    assert!(wallet.check_password(TEST_PASSWORD).unwrap());
+}
+
+#[test]
+fn test_check_password_wrong() {
+    let (wallet, _temp_dir) = setup_test_wallet();
+
+    assert!(!wallet.check_password("WrongPassword").unwrap());
+}
+
+#[test]
+fn test_check_password_after_change() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut wallet = Wallet::create(temp_dir.path(), "OldPass", "en").unwrap();
+
+    assert!(wallet.check_password("OldPass").unwrap());
+    assert!(!wallet.check_password("NewPass").unwrap());
+
+    wallet.change_password("NewPass").unwrap();
+
+    assert!(!wallet.check_password("OldPass").unwrap());
+    assert!(wallet.check_password("NewPass").unwrap());
+
+    wallet.close();
+}
+
+#[test]
+fn test_check_password_while_locked() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+
+    // Lock explicitly (wallet starts locked for setup_test_wallet)
+    // check_password should work regardless of lock state
+    assert!(wallet.check_password(TEST_PASSWORD).unwrap());
+
+    wallet.unlock(TEST_PASSWORD).unwrap();
+    assert!(wallet.check_password(TEST_PASSWORD).unwrap());
+
+    wallet.lock();
+    assert!(wallet.check_password(TEST_PASSWORD).unwrap());
+
+    wallet.close();
+}
+
+// =========================================================================
+// Gap #6: Cascade Delete (folder with children)
+// =========================================================================
+
+#[test]
+fn test_cascade_delete_folder_with_children() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    let folder = wallet.add_item("Parent Folder", "folder", true, None).unwrap();
+    let child1 = wallet.add_item("Child 1", "document", false, Some(&folder)).unwrap();
+    let child2 = wallet.add_item("Child 2", "document", false, Some(&folder)).unwrap();
+    wallet.add_field(&child1, "MAIL", "child1@test.com", None).unwrap();
+
+    // Delete folder — should cascade to children
+    wallet.delete_item(&folder).unwrap();
+
+    // All gone from active
+    assert!(wallet.get_item(&folder).unwrap().is_none());
+    assert!(wallet.get_item(&child1).unwrap().is_none());
+    assert!(wallet.get_item(&child2).unwrap().is_none());
+
+    // All present in deleted list
+    let deleted = wallet.get_deleted_items().unwrap();
+    let deleted_ids: Vec<&str> = deleted.iter().map(|i| i.item_id.as_str()).collect();
+    assert!(deleted_ids.contains(&folder.as_str()));
+    assert!(deleted_ids.contains(&child1.as_str()));
+    assert!(deleted_ids.contains(&child2.as_str()));
+
+    wallet.close();
+}
+
+#[test]
+fn test_cascade_delete_deep_nesting() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    let l1 = wallet.add_item("Level 1", "folder", true, None).unwrap();
+    let l2 = wallet.add_item("Level 2", "folder", true, Some(&l1)).unwrap();
+    let l3 = wallet.add_item("Level 3", "folder", true, Some(&l2)).unwrap();
+    let l4 = wallet.add_item("Deep Item", "document", false, Some(&l3)).unwrap();
+
+    wallet.delete_item(&l1).unwrap();
+
+    // All 4 levels should be deleted
+    let deleted = wallet.get_deleted_items().unwrap();
+    let deleted_ids: Vec<&str> = deleted.iter().map(|i| i.item_id.as_str()).collect();
+    assert!(deleted_ids.contains(&l1.as_str()));
+    assert!(deleted_ids.contains(&l2.as_str()));
+    assert!(deleted_ids.contains(&l3.as_str()));
+    assert!(deleted_ids.contains(&l4.as_str()));
+
+    wallet.close();
+}
+
+#[test]
+fn test_cascade_delete_then_undelete_child() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    let folder = wallet.add_item("Folder", "folder", true, None).unwrap();
+    let child = wallet.add_item("Child", "document", false, Some(&folder)).unwrap();
+
+    wallet.delete_item(&folder).unwrap();
+
+    // Undelete only the child
+    wallet.undelete_item(&child).unwrap();
+
+    let restored = wallet.get_item(&child).unwrap().unwrap();
+    assert_eq!(restored.name, "Child");
+
+    // Parent still deleted
+    assert!(wallet.get_item(&folder).unwrap().is_none());
+
+    wallet.close();
+}
+
+// =========================================================================
+// Gap #7: Backup Verify / Cleanup
+// =========================================================================
+
+#[test]
+fn test_backup_verify() {
+    let temp_dir = TempDir::new().unwrap();
+    let wallet_dir = temp_dir.path().join("wallet");
+    let backup_dir = temp_dir.path().join("backups");
+
+    let wallet = Wallet::create(&wallet_dir, "TestPass", "en").unwrap();
+    let backup_mgr = BackupManager::new(&backup_dir);
+
+    let backup_path = backup_mgr.create_backup(wallet.database().unwrap(), true).unwrap();
+
+    // Verify the backup is valid
+    let valid = backup_mgr.verify_backup(&backup_path).unwrap();
+    assert!(valid);
+}
+
+#[test]
+fn test_backup_list_and_get_latest() {
+    let temp_dir = TempDir::new().unwrap();
+    let wallet_dir = temp_dir.path().join("wallet");
+    let backup_dir = temp_dir.path().join("backups");
+
+    let wallet = Wallet::create(&wallet_dir, "TestPass", "en").unwrap();
+    let backup_mgr = BackupManager::new(&backup_dir);
+
+    // No backups yet
+    assert!(backup_mgr.list_backups().unwrap().is_empty());
+    assert!(backup_mgr.get_latest_backup().unwrap().is_none());
+
+    // Create two backups
+    let _b1 = backup_mgr.create_backup(wallet.database().unwrap(), true).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100)); // filenames use seconds
+    let b2 = backup_mgr.create_backup(wallet.database().unwrap(), true).unwrap();
+
+    let backups = backup_mgr.list_backups().unwrap();
+    assert_eq!(backups.len(), 2);
+
+    let latest = backup_mgr.get_latest_backup().unwrap().unwrap();
+    assert_eq!(latest.path, b2);
+}
+
+#[test]
+fn test_backup_cleanup_old() {
+    let temp_dir = TempDir::new().unwrap();
+    let wallet_dir = temp_dir.path().join("wallet");
+    let backup_dir = temp_dir.path().join("backups");
+
+    let wallet = Wallet::create(&wallet_dir, "TestPass", "en").unwrap();
+    let backup_mgr = BackupManager::new(&backup_dir);
+
+    // Create 4 backups
+    for _ in 0..4 {
+        backup_mgr.create_backup(wallet.database().unwrap(), true).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+
+    assert_eq!(backup_mgr.list_backups().unwrap().len(), 4);
+
+    // Keep only 2
+    let deleted = backup_mgr.cleanup_old_backups(2).unwrap();
+    assert_eq!(deleted, 2);
+    assert_eq!(backup_mgr.list_backups().unwrap().len(), 2);
+}
+
+#[test]
+fn test_backup_cleanup_auto() {
+    let temp_dir = TempDir::new().unwrap();
+    let wallet_dir = temp_dir.path().join("wallet");
+    let backup_dir = temp_dir.path().join("backups");
+
+    let wallet = Wallet::create(&wallet_dir, "TestPass", "en").unwrap();
+    let backup_mgr = BackupManager::new(&backup_dir);
+
+    // Create auto backups (manual=false)
+    for _ in 0..3 {
+        backup_mgr.create_backup(wallet.database().unwrap(), false).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+
+    assert_eq!(backup_mgr.list_backups().unwrap().len(), 3);
+
+    // Cleanup with min_keep=3 and max_age=30 days — all are fresh, none should be deleted
+    let deleted = backup_mgr.cleanup_auto_backups(3, 30).unwrap();
+    assert_eq!(deleted, 0);
+    assert_eq!(backup_mgr.list_backups().unwrap().len(), 3);
+}
+
+#[test]
+fn test_backup_cleanup_keeps_minimum() {
+    let temp_dir = TempDir::new().unwrap();
+    let wallet_dir = temp_dir.path().join("wallet");
+    let backup_dir = temp_dir.path().join("backups");
+
+    let wallet = Wallet::create(&wallet_dir, "TestPass", "en").unwrap();
+    let backup_mgr = BackupManager::new(&backup_dir);
+
+    // Create 2 backups
+    backup_mgr.create_backup(wallet.database().unwrap(), true).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    backup_mgr.create_backup(wallet.database().unwrap(), true).unwrap();
+
+    // Try to keep 5 (more than we have) — should delete nothing
+    let deleted = backup_mgr.cleanup_old_backups(5).unwrap();
+    assert_eq!(deleted, 0);
+    assert_eq!(backup_mgr.list_backups().unwrap().len(), 2);
+}
+
+// =========================================================================
+// Gap #8: Legacy Database with Deleted Records
+// =========================================================================
+
+#[test]
+fn test_legacy_db_get_deleted_items_does_not_crash() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    // The legacy test database has deleted items with potentially NULL icon fields.
+    // This should not crash — should return Ok with whatever is decryptable.
+    let result = wallet.get_deleted_items();
+    assert!(result.is_ok(), "get_deleted_items should not crash on legacy DB");
+
+    let deleted = result.unwrap();
+    println!("Legacy DB has {} deleted items (decryptable)", deleted.len());
+
+    // All returned items should have valid data
+    for item in &deleted {
+        assert!(!item.item_id.is_empty());
+        assert!(item.deleted);
+    }
+
+    wallet.close();
+}
+
+#[test]
+fn test_legacy_db_get_deleted_fields_does_not_crash() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    // Legacy DB may have deleted fields encrypted with old passwords.
+    // Should silently skip undecryptable ones, not abort.
+    let result = wallet.get_deleted_fields();
+    assert!(result.is_ok(), "get_deleted_fields should not crash on legacy DB");
+
+    let deleted = result.unwrap();
+    println!("Legacy DB has {} deleted fields (decryptable)", deleted.len());
+
+    for field in &deleted {
+        assert!(!field.field_id.is_empty());
+        assert!(field.deleted);
+    }
+
+    wallet.close();
+}
+
+#[test]
+fn test_legacy_db_change_password_with_deleted_records() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    // Count what's decryptable before
+    let items_before = wallet.get_items().unwrap().len();
+    let fields_before = wallet.get_fields().unwrap().len();
+    let deleted_items_before = wallet.get_deleted_items().unwrap().len();
+    let deleted_fields_before = wallet.get_deleted_fields().unwrap().len();
+
+    // Change password on legacy DB (which has deleted records with old encryption)
+    let new_password = "LegacyDBNewPassword!";
+    assert!(wallet.change_password(new_password).unwrap());
+
+    // Active records should match
+    let items_after = wallet.get_items().unwrap().len();
+    let fields_after = wallet.get_fields().unwrap().len();
+    assert_eq!(items_before, items_after, "Active items count should match");
+    assert_eq!(fields_before, fields_after, "Active fields count should match");
+
+    // Deleted records should be at least as many as before
+    // (change_password re-encrypts what it can decrypt)
+    let deleted_items_after = wallet.get_deleted_items().unwrap().len();
+    let deleted_fields_after = wallet.get_deleted_fields().unwrap().len();
+    assert!(deleted_items_after >= deleted_items_before,
+        "Deleted items should not decrease after password change");
+    assert!(deleted_fields_after >= deleted_fields_before,
+        "Deleted fields should not decrease after password change");
+
+    // Verify new password works after lock/unlock
+    wallet.lock();
+    assert!(wallet.unlock(new_password).unwrap());
+    assert!(!wallet.unlock(TEST_PASSWORD).unwrap_or(false));
+
+    wallet.close();
+}

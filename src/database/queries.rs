@@ -207,7 +207,7 @@ pub fn delete_item(conn: &Connection, item_id: &str) -> Result<()> {
 /// Get all soft-deleted items from database (encrypted)
 pub fn get_deleted_items_raw(conn: &Connection) -> Result<Vec<RawItem>> {
     let mut stmt = conn.prepare(
-        "SELECT item_id, parent_id, name, icon, folder, create_timestamp, change_timestamp, deleted
+        "SELECT item_id, parent_id, name, COALESCE(icon, ''), folder, create_timestamp, change_timestamp, deleted
          FROM nswallet_items WHERE deleted = 1"
     )?;
 
@@ -544,49 +544,78 @@ pub fn remove_label_for_real(conn: &Connection, field_type: &str) -> Result<bool
 /// Raw properties data from database
 #[derive(Debug, Clone)]
 pub struct RawProperties {
+    /// Unique database identifier
     pub database_id: String,
+    /// Database language code (e.g. "en", "de")
     pub lang: String,
+    /// Database schema version
     pub version: String,
-    pub email: String, // Actually stores encryption_count
+    /// Encryption iteration count (stored in the legacy `email` column)
+    pub email: String,
+    /// Last cloud sync timestamp
     pub sync_timestamp: Option<String>,
+    /// Last local update timestamp
     pub update_timestamp: Option<String>,
 }
 
 /// Raw item data from database (before decryption)
 #[derive(Debug, Clone)]
 pub struct RawItem {
+    /// Unique item identifier
     pub item_id: String,
+    /// Parent item/folder ID (`None` for root-level items)
     pub parent_id: Option<String>,
+    /// AES-256 encrypted item name
     pub name_encrypted: Vec<u8>,
+    /// Icon identifier
     pub icon: String,
+    /// Whether this item is a folder
     pub folder: bool,
+    /// Creation timestamp
     pub create_timestamp: Option<String>,
+    /// Last modification timestamp
     pub change_timestamp: Option<String>,
+    /// Whether this item is soft-deleted
     pub deleted: bool,
 }
 
 /// Raw field data from database (before decryption)
 #[derive(Debug, Clone)]
 pub struct RawField {
+    /// Parent item ID
     pub item_id: String,
+    /// Unique field identifier
     pub field_id: String,
+    /// Field type code (e.g. "MAIL", "PASS", "NOTE")
     pub field_type: String,
+    /// AES-256 encrypted field value
     pub value_encrypted: Vec<u8>,
+    /// Last modification timestamp
     pub change_timestamp: Option<String>,
+    /// Whether this field is soft-deleted
     pub deleted: bool,
+    /// Display ordering weight
     pub sort_weight: Option<i32>,
 }
 
 /// Raw label data from database
 #[derive(Debug, Clone)]
 pub struct RawLabel {
+    /// Label type code (e.g. "MAIL", "PASS")
     pub field_type: String,
+    /// Human-readable label name
     pub label_name: String,
+    /// Value type hint (e.g. "text", "password", "email")
     pub value_type: String,
+    /// Icon identifier
     pub icon: String,
+    /// Whether this is a built-in system label
     pub system: bool,
+    /// Last modification timestamp
     pub change_timestamp: Option<String>,
+    /// Whether this label is soft-deleted
     pub deleted: bool,
+    /// Number of fields using this label
     pub usage: i32,
 }
 
