@@ -315,6 +315,23 @@ impl Wallet {
         Ok(result)
     }
 
+    /// Get database statistics (counts of items, fields, labels, deleted records, file size)
+    pub fn get_database_stats(&self) -> Result<queries::DatabaseStats> {
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+
+        let mut stats = queries::get_database_stats(conn)?;
+
+        // Set file size from filesystem metadata
+        let db_path = self.database_path();
+        if let Ok(metadata) = std::fs::metadata(&db_path) {
+            stats.file_size_bytes = metadata.len();
+        }
+
+        Ok(stats)
+    }
+
     /// Get a reference to the database for backup operations
     pub fn database(&self) -> Result<&Database> {
         self.db.as_ref().ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))
@@ -504,12 +521,12 @@ pub(crate) mod tests {
         wallet.add_field(&item_id, "MAIL", "orphan@test.com", None).unwrap();
         wallet.add_field(&item_id, "PASS", "secret", None).unwrap();
 
-        // Delete item (fields become orphaned)
+        // Delete item (fields are cascade soft-deleted)
         wallet.delete_item(&item_id).unwrap();
 
         wallet.compact().unwrap();
 
-        // Orphaned fields should also be purged
+        // Cascade-deleted fields should also be purged
         let deleted_fields = wallet.get_deleted_fields().unwrap();
         assert!(deleted_fields.is_empty());
         let deleted_items = wallet.get_deleted_items().unwrap();
@@ -521,16 +538,15 @@ pub(crate) mod tests {
         let (mut wallet, _temp) = create_test_wallet();
         let item1_id = wallet.add_item("Item 1", "document", false, None).unwrap();
         let item2_id = wallet.add_item("Item 2", "document", false, None).unwrap();
-        let field_id = wallet.add_field(&item1_id, "MAIL", "test@test.com", None).unwrap();
+        let _field_id = wallet.add_field(&item1_id, "MAIL", "test@test.com", None).unwrap();
 
+        // delete_item cascades to fields now, so field is already deleted=1
         wallet.delete_item(&item1_id).unwrap();
         wallet.delete_item(&item2_id).unwrap();
-        wallet.delete_field(&item1_id, &field_id).unwrap();
 
         let (items_count, fields_count) = wallet.compact().unwrap();
         assert_eq!(items_count, 2);
-        // field_id was already counted as orphan of deleted item1
-        assert_eq!(fields_count, 1);
+        assert_eq!(fields_count, 1); // cascade-deleted field
     }
 
     #[test]
@@ -588,7 +604,7 @@ pub(crate) mod tests {
 
         let (items_count, fields_count) = wallet.compact().unwrap();
         assert_eq!(items_count, 3); // folder + 2 children
-        assert_eq!(fields_count, 2); // orphaned fields of deleted items
+        assert_eq!(fields_count, 2); // cascade-deleted fields
 
         // Everything gone
         assert!(wallet.get_deleted_items().unwrap().is_empty());
@@ -596,19 +612,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_compact_mixed_deleted_and_orphaned_fields() {
+    fn test_compact_mixed_deleted_and_cascaded_fields() {
         let (mut wallet, _temp) = create_test_wallet();
         let item_id = wallet.add_item("Item", "document", false, None).unwrap();
         let f1 = wallet.add_field(&item_id, "MAIL", "test@test.com", None).unwrap();
         wallet.add_field(&item_id, "PASS", "secret", None).unwrap();
 
-        // Explicitly delete one field, then delete the item (making the other orphaned)
+        // Explicitly delete one field, then delete the item (cascade-deletes the other)
         wallet.delete_field(&item_id, &f1).unwrap();
         wallet.delete_item(&item_id).unwrap();
 
         let (items_count, fields_count) = wallet.compact().unwrap();
         assert_eq!(items_count, 1);
-        // Both fields purged: f1 was soft-deleted, PASS was orphaned by item delete
+        // Both fields purged: f1 was explicitly soft-deleted, PASS was cascade-deleted
         assert_eq!(fields_count, 2);
     }
 
@@ -628,6 +644,29 @@ pub(crate) mod tests {
         let active = wallet.get_fields_by_item(&item_id).unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].value, "keep_me");
+    }
+
+    #[test]
+    fn test_database_stats() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder = wallet.add_item("Folder", "folder", true, None).unwrap();
+        let item1 = wallet.add_item("Item 1", "document", false, None).unwrap();
+        let item2 = wallet.add_item("Item 2", "document", false, Some(&folder)).unwrap();
+        wallet.add_field(&item1, "MAIL", "a@a.com", None).unwrap();
+        wallet.add_field(&item1, "PASS", "secret", None).unwrap();
+        wallet.add_field(&item2, "NOTE", "note", None).unwrap();
+
+        // Delete one item (cascades to its fields)
+        wallet.delete_item(&item2).unwrap();
+
+        let stats = wallet.get_database_stats().unwrap();
+        assert_eq!(stats.total_items, 1);    // item1 (item2 deleted)
+        assert_eq!(stats.total_folders, 1);  // folder
+        assert_eq!(stats.total_fields, 2);   // item1's 2 fields (item2's field cascade-deleted)
+        assert_eq!(stats.deleted_items, 1);  // item2
+        assert_eq!(stats.deleted_fields, 1); // item2's cascade-deleted field
+        assert!(stats.total_labels >= 19);   // system labels
+        assert!(stats.file_size_bytes > 0);
     }
 
     #[test]
@@ -673,6 +712,40 @@ pub(crate) mod tests {
         let deleted2 = wallet.get_deleted_fields().unwrap();
         assert_eq!(deleted2.len(), 1);
         assert_eq!(deleted2[0].value, "my_secret");
+    }
+
+    #[test]
+    fn test_change_password_reencrypts_cascade_deleted_fields() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        wallet.add_field(&item_id, "MAIL", "cascade@test.com", None).unwrap();
+        wallet.add_field(&item_id, "PASS", "cascade_secret", None).unwrap();
+
+        // Delete item — fields become cascade-deleted (deleted=1)
+        wallet.delete_item(&item_id).unwrap();
+
+        // Verify cascade-deleted fields are in deleted list
+        let deleted_before = wallet.get_deleted_fields().unwrap();
+        let our_fields: Vec<_> = deleted_before.iter().filter(|f| f.item_id == item_id).collect();
+        assert_eq!(our_fields.len(), 2);
+
+        // Change password
+        assert!(wallet.change_password("NewPassword456").unwrap());
+
+        // Cascade-deleted fields should still be accessible after password change
+        let deleted_after = wallet.get_deleted_fields().unwrap();
+        let our_fields_after: Vec<_> = deleted_after.iter().filter(|f| f.item_id == item_id).collect();
+        assert_eq!(our_fields_after.len(), 2);
+        let values: Vec<&str> = our_fields_after.iter().map(|f| f.value.as_str()).collect();
+        assert!(values.contains(&"cascade@test.com"));
+        assert!(values.contains(&"cascade_secret"));
+
+        // Verify after lock/unlock with new password
+        wallet.lock();
+        assert!(wallet.unlock("NewPassword456").unwrap());
+        let deleted_reopen = wallet.get_deleted_fields().unwrap();
+        let our_fields_reopen: Vec<_> = deleted_reopen.iter().filter(|f| f.item_id == item_id).collect();
+        assert_eq!(our_fields_reopen.len(), 2);
     }
 
     #[test]

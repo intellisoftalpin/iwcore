@@ -43,6 +43,7 @@ pub use backup::{BackupManager, BackupType};
 pub use localization::Translations;
 pub use crypto::{generate_password, generate_clever_password, PasswordOptions};
 pub use export::{ExportItemType, PDFItemModel};
+pub use database::queries::DatabaseStats;
 
 /// Database version constant
 pub const DB_VERSION: &str = "4";

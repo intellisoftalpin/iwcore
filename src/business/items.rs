@@ -614,9 +614,8 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_item_fields_remain_as_orphans() {
-        // Fields are NOT auto-deleted when their parent item is deleted.
-        // They become orphans and are cleaned up by compact().
+    fn test_delete_item_cascades_to_fields() {
+        // Fields are cascade soft-deleted when their parent item is deleted.
         let (mut wallet, _temp) = create_test_wallet();
         let item_id = wallet.add_item("Item", "document", false, None).unwrap();
         wallet.add_field(&item_id, "MAIL", "test@test.com", None).unwrap();
@@ -624,22 +623,27 @@ mod tests {
 
         wallet.delete_item(&item_id).unwrap();
 
-        // Fields are still in DB (not soft-deleted), accessible by item_id
+        // Fields are now soft-deleted (not returned by get_fields_by_item)
         let fields = wallet.get_fields_by_item(&item_id).unwrap();
-        assert_eq!(fields.len(), 2);
+        assert_eq!(fields.len(), 0);
 
         // But the item itself is gone from active items
         assert!(wallet.get_item(&item_id).unwrap().is_none());
 
-        // compact() cleans up orphans
+        // Fields appear in deleted fields list
+        let deleted_fields = wallet.get_deleted_fields().unwrap();
+        let item_deleted_fields: Vec<_> = deleted_fields.iter().filter(|f| f.item_id == item_id).collect();
+        assert_eq!(item_deleted_fields.len(), 2);
+
+        // compact() cleans them up
         wallet.compact().unwrap();
-        let fields_after = wallet.get_fields_by_item(&item_id).unwrap();
-        assert_eq!(fields_after.len(), 0);
+        let deleted_after = wallet.get_deleted_fields().unwrap();
+        assert!(deleted_after.iter().all(|f| f.item_id != item_id));
     }
 
     #[test]
-    fn test_delete_folder_cascade_fields_become_orphans() {
-        // Cascade-deleted items leave orphaned fields, cleaned up by compact()
+    fn test_delete_folder_cascades_to_child_fields() {
+        // Cascade-deleted items also cascade-delete their fields
         let (mut wallet, _temp) = create_test_wallet();
         let folder_id = wallet.add_item("Folder", "folder", true, None).unwrap();
         let child_id = wallet.add_item("Child", "document", false, Some(&folder_id)).unwrap();
@@ -647,14 +651,124 @@ mod tests {
 
         wallet.delete_item(&folder_id).unwrap();
 
-        // Fields still exist as orphans
+        // Fields are now soft-deleted
         let fields = wallet.get_fields_by_item(&child_id).unwrap();
-        assert_eq!(fields.len(), 1);
+        assert_eq!(fields.len(), 0);
+
+        // Fields appear in deleted list
+        let deleted_fields = wallet.get_deleted_fields().unwrap();
+        assert!(deleted_fields.iter().any(|f| f.item_id == child_id));
 
         // compact() cleans them up
         wallet.compact().unwrap();
-        let fields_after = wallet.get_fields_by_item(&child_id).unwrap();
-        assert_eq!(fields_after.len(), 0);
+        let deleted_after = wallet.get_deleted_fields().unwrap();
+        assert!(deleted_after.iter().all(|f| f.item_id != child_id));
+    }
+
+    #[test]
+    fn test_delete_item_then_undelete_single_field() {
+        // Delete item with 3 fields, undelete item + 1 field, assert only 1 field active
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        let f1 = wallet.add_field(&item_id, "MAIL", "a@test.com", None).unwrap();
+        wallet.add_field(&item_id, "PASS", "secret", None).unwrap();
+        wallet.add_field(&item_id, "NOTE", "note text", None).unwrap();
+
+        // Delete item (cascades to all 3 fields)
+        wallet.delete_item(&item_id).unwrap();
+        assert_eq!(wallet.get_fields_by_item(&item_id).unwrap().len(), 0);
+
+        // Undelete the item
+        wallet.undelete_item(&item_id).unwrap();
+        // Fields stay deleted after item undelete
+        assert_eq!(wallet.get_fields_by_item(&item_id).unwrap().len(), 0);
+
+        // Undelete only one field
+        wallet.undelete_field(&item_id, &f1).unwrap();
+
+        let active_fields = wallet.get_fields_by_item(&item_id).unwrap();
+        assert_eq!(active_fields.len(), 1);
+        assert_eq!(active_fields[0].value, "a@test.com");
+
+        // Other 2 fields still in deleted
+        let deleted_fields = wallet.get_deleted_fields().unwrap();
+        let still_deleted: Vec<_> = deleted_fields.iter().filter(|f| f.item_id == item_id).collect();
+        assert_eq!(still_deleted.len(), 2);
+    }
+
+    #[test]
+    fn test_delete_folder_deep_nesting_cascades_fields_at_all_levels() {
+        // Fields at every nesting level should be cascade-deleted
+        let (mut wallet, _temp) = create_test_wallet();
+        let l1 = wallet.add_item("Level 1", "folder", true, None).unwrap();
+        let l2 = wallet.add_item("Level 2", "folder", true, Some(&l1)).unwrap();
+        let l3 = wallet.add_item("Level 3", "folder", true, Some(&l2)).unwrap();
+        let item_l2 = wallet.add_item("Item in L2", "document", false, Some(&l2)).unwrap();
+        let item_l3 = wallet.add_item("Item in L3", "document", false, Some(&l3)).unwrap();
+
+        wallet.add_field(&item_l2, "MAIL", "l2@test.com", None).unwrap();
+        wallet.add_field(&item_l2, "PASS", "l2secret", None).unwrap();
+        wallet.add_field(&item_l3, "NOTE", "l3note", None).unwrap();
+
+        // Delete top-level folder
+        wallet.delete_item(&l1).unwrap();
+
+        // All items gone from active
+        assert!(wallet.get_item(&l1).unwrap().is_none());
+        assert!(wallet.get_item(&item_l2).unwrap().is_none());
+        assert!(wallet.get_item(&item_l3).unwrap().is_none());
+
+        // Fields at level 2 are cascade-deleted
+        let fields_l2 = wallet.get_fields_by_item(&item_l2).unwrap();
+        assert_eq!(fields_l2.len(), 0);
+
+        // Fields at level 3 are cascade-deleted
+        let fields_l3 = wallet.get_fields_by_item(&item_l3).unwrap();
+        assert_eq!(fields_l3.len(), 0);
+
+        // All 3 fields appear in deleted list
+        let deleted = wallet.get_deleted_fields().unwrap();
+        let our_deleted: Vec<_> = deleted.iter()
+            .filter(|f| f.item_id == item_l2 || f.item_id == item_l3)
+            .collect();
+        assert_eq!(our_deleted.len(), 3);
+    }
+
+    #[test]
+    fn test_explicit_field_delete_then_item_delete_intermediate_state() {
+        // Verify intermediate state: explicitly-deleted field stays deleted,
+        // remaining active field becomes cascade-deleted
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        let f1 = wallet.add_field(&item_id, "MAIL", "explicit@test.com", None).unwrap();
+        let f2 = wallet.add_field(&item_id, "PASS", "cascade_me", None).unwrap();
+
+        // Explicitly delete f1
+        wallet.delete_field(&item_id, &f1).unwrap();
+
+        // f1 is deleted, f2 is still active
+        let active = wallet.get_fields_by_item(&item_id).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].field_id, f2);
+
+        let deleted_before = wallet.get_deleted_fields().unwrap();
+        let our_deleted: Vec<_> = deleted_before.iter().filter(|f| f.item_id == item_id).collect();
+        assert_eq!(our_deleted.len(), 1);
+        assert_eq!(our_deleted[0].field_id, f1);
+
+        // Now delete the item — f2 should become cascade-deleted, f1 stays deleted
+        wallet.delete_item(&item_id).unwrap();
+
+        let active_after = wallet.get_fields_by_item(&item_id).unwrap();
+        assert_eq!(active_after.len(), 0);
+
+        let deleted_after = wallet.get_deleted_fields().unwrap();
+        let our_deleted_after: Vec<_> = deleted_after.iter().filter(|f| f.item_id == item_id).collect();
+        assert_eq!(our_deleted_after.len(), 2);
+
+        let deleted_ids: Vec<&str> = our_deleted_after.iter().map(|f| f.field_id.as_str()).collect();
+        assert!(deleted_ids.contains(&f1.as_str()));
+        assert!(deleted_ids.contains(&f2.as_str()));
     }
 
     #[test]

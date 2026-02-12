@@ -194,11 +194,16 @@ pub fn update_item_parent(conn: &Connection, item_id: &str, parent_id: &str) -> 
     Ok(())
 }
 
-/// Soft delete an item
+/// Soft delete an item and cascade to its fields
 pub fn delete_item(conn: &Connection, item_id: &str) -> Result<()> {
+    let now = now_timestamp();
     conn.execute(
         "UPDATE nswallet_items SET deleted = 1, change_timestamp = ? WHERE item_id = ?",
-        params![now_timestamp(), item_id],
+        params![now, item_id],
+    )?;
+    conn.execute(
+        "UPDATE nswallet_fields SET deleted = 1, change_timestamp = ? WHERE item_id = ? AND deleted = 0",
+        params![now, item_id],
     )?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
     Ok(())
@@ -240,7 +245,7 @@ pub fn undelete_item(conn: &Connection, item_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Soft-delete all descendants of a folder using recursive CTE
+/// Soft-delete all descendants of a folder using recursive CTE, including their fields
 pub fn delete_item_descendants(conn: &Connection, item_id: &str) -> Result<()> {
     let now = now_timestamp();
     conn.execute(
@@ -250,6 +255,15 @@ pub fn delete_item_descendants(conn: &Connection, item_id: &str) -> Result<()> {
             SELECT i.item_id FROM nswallet_items i JOIN descendants d ON i.parent_id = d.id WHERE i.deleted = 0
         )
         UPDATE nswallet_items SET deleted = 1, change_timestamp = ?2 WHERE item_id IN (SELECT id FROM descendants)",
+        params![item_id, now],
+    )?;
+    conn.execute(
+        "WITH RECURSIVE descendants(id) AS (
+            SELECT item_id FROM nswallet_items WHERE parent_id = ?1
+            UNION ALL
+            SELECT i.item_id FROM nswallet_items i JOIN descendants d ON i.parent_id = d.id
+        )
+        UPDATE nswallet_fields SET deleted = 1, change_timestamp = ?2 WHERE item_id IN (SELECT id FROM descendants) AND deleted = 0",
         params![item_id, now],
     )?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
@@ -429,6 +443,77 @@ pub fn purge_deleted(conn: &Connection) -> Result<(u32, u32)> {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
 
     Ok((items_count, fields_count))
+}
+
+/// Database statistics
+#[derive(Debug, Clone)]
+pub struct DatabaseStats {
+    /// Active items (excluding root)
+    pub total_items: u32,
+    /// Active folders
+    pub total_folders: u32,
+    /// Active fields
+    pub total_fields: u32,
+    /// All labels (system + custom)
+    pub total_labels: u32,
+    /// User-created labels only
+    pub custom_labels: u32,
+    /// Soft-deleted items
+    pub deleted_items: u32,
+    /// Soft-deleted fields
+    pub deleted_fields: u32,
+    /// Database file size in bytes
+    pub file_size_bytes: u64,
+}
+
+/// Get database statistics (counts of items, fields, labels, deleted records)
+pub fn get_database_stats(conn: &Connection) -> Result<DatabaseStats> {
+    let total_items: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM nswallet_items WHERE deleted = 0 AND item_id != '__ROOT__' AND folder = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    let total_folders: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM nswallet_items WHERE deleted = 0 AND item_id != '__ROOT__' AND folder = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let total_fields: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM nswallet_fields WHERE deleted = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    let total_labels: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM nswallet_labels WHERE deleted = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    let custom_labels: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM nswallet_labels WHERE deleted = 0 AND system = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    let deleted_items: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM nswallet_items WHERE deleted = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let deleted_fields: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM nswallet_fields WHERE deleted = 1",
+        [],
+        |row| row.get(0),
+    )?;
+
+    Ok(DatabaseStats {
+        total_items,
+        total_folders,
+        total_fields,
+        total_labels,
+        custom_labels,
+        deleted_items,
+        deleted_fields,
+        file_size_bytes: 0, // Caller sets this from file metadata
+    })
 }
 
 /// Get max sort weight for an item's fields
