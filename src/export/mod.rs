@@ -5,10 +5,10 @@
 
 use std::collections::HashMap;
 
-use genpdf::elements::{Break, Paragraph};
+use genpdf::elements::{Break, FrameCellDecorator, LinearLayout, Paragraph, TableLayout};
 use genpdf::fonts::{FontData, FontFamily};
 use genpdf::style::{Color, Style, StyledString};
-use genpdf::{Document, SimplePageDecorator};
+use genpdf::{Document, Element as _, Margins, SimplePageDecorator};
 use serde::{Deserialize, Serialize};
 
 use crate::database::models::{IWField, IWItem};
@@ -95,10 +95,13 @@ impl PDFItemModel {
     }
 }
 
+/// Maximum number of fields before an entry gets a full-width row.
+const WIDE_CARD_THRESHOLD: usize = 6;
+
 /// Generate a PDF document from wallet items and fields.
 ///
-/// Produces a flat alphabetical list of all non-deleted entries with their
-/// fields, rendered in a "password book" style layout.
+/// Produces a compact 2-column card layout of all non-deleted entries
+/// with their fields, sorted alphabetically.
 pub fn generate_pdf(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
     // Load embedded fonts
     let regular = FontData::new(REGULAR_FONT.to_vec(), None)
@@ -117,7 +120,7 @@ pub fn generate_pdf(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
     doc.set_title("IntelliWallet Export");
 
     let mut decorator = SimplePageDecorator::new();
-    decorator.set_margins(20);
+    decorator.set_margins(10);
     doc.set_page_decorator(decorator);
 
     // Build field lookup: item_id -> Vec<&IWField> (non-deleted, sorted by sort_weight)
@@ -147,8 +150,8 @@ pub fn generate_pdf(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
         .collect();
     entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
-    // -- Title area --
-    let title_style = Style::new().bold().with_font_size(18);
+    // -- Compact header --
+    let title_style = Style::new().bold().with_font_size(14);
     doc.push(
         Paragraph::new(StyledString::new("IntelliWallet", title_style))
             .aligned(genpdf::Alignment::Center),
@@ -156,78 +159,94 @@ pub fn generate_pdf(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
 
     let date_str = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
     let date_style = Style::new()
-        .with_font_size(10)
-        .with_color(Color::Rgb(128, 128, 128));
+        .with_font_size(8)
+        .with_color(Color::Rgb(130, 130, 130));
     doc.push(
         Paragraph::new(StyledString::new(date_str, date_style))
             .aligned(genpdf::Alignment::Center),
     );
 
-    let line = "\u{2500}".repeat(92);
-    let line_style = Style::new()
-        .with_font_size(6)
-        .with_color(Color::Rgb(200, 200, 200));
+    doc.push(Break::new(1.5));
 
-    doc.push(Break::new(2.0));
-    doc.push(Paragraph::new(StyledString::new(line.clone(), line_style)));
-    doc.push(Break::new(4.0));
-
-    // -- Entry blocks --
-    let sep_style = Style::new()
-        .with_font_size(4)
-        .with_color(Color::Rgb(220, 220, 220));
-    let thin_sep_style = Style::new()
-        .with_font_size(3)
-        .with_color(Color::Rgb(200, 200, 200));
-    let name_style = Style::new().bold().with_font_size(12);
+    // -- Entry cards in 2-column grid --
+    let name_style = Style::new().bold().with_font_size(9);
     let path_style = Style::new()
-        .with_font_size(8)
-        .with_color(Color::Rgb(128, 128, 128));
-    let label_style = Style::new().bold().with_font_size(9);
-    let value_style = Style::new().with_font_size(9);
-    let thin_line = "\u{2500}".repeat(72);
+        .with_font_size(7)
+        .with_color(Color::Rgb(120, 120, 120));
+    let label_style = Style::new().bold().with_font_size(7);
+    let value_style = Style::new().with_font_size(7);
+    let sep_style = Style::new()
+        .with_font_size(3)
+        .with_color(Color::Rgb(190, 190, 190));
+    let card_padding = Margins::trbl(2.0, 2.5, 2.0, 2.5);
 
-    for (i, item) in entries.iter().enumerate() {
-        if i > 0 {
-            doc.push(Paragraph::new(StyledString::new(
-                line.clone(),
-                sep_style,
-            )));
-            doc.push(Break::new(2.0));
-        }
+    let mut i = 0;
+    while i < entries.len() {
+        let field_count = fields_by_item
+            .get(&entries[i].item_id)
+            .map_or(0, |f| f.len());
+        let is_wide = field_count > WIDE_CARD_THRESHOLD;
 
-        // Item name
-        doc.push(Paragraph::new(StyledString::new(
-            item.name.clone(),
-            name_style,
-        )));
-
-        // Path
-        let path = compute_path(item, &items_map);
-        if !path.is_empty() {
-            doc.push(Paragraph::new(StyledString::new(path, path_style)));
-        }
-
-        // Thin separator under name
-        doc.push(Paragraph::new(StyledString::new(
-            thin_line.clone(),
-            thin_sep_style,
-        )));
-        doc.push(Break::new(1.0));
-
-        // Fields
-        if let Some(item_fields) = fields_by_item.get(&item.item_id) {
-            for field in item_fields {
-                let mut p = Paragraph::new(StyledString::new(
-                    format!("{}: ", field.label),
-                    label_style,
-                ));
-                p.push_styled(&field.value, value_style);
-                doc.push(p);
+        if is_wide {
+            // Full-width row for entries with many fields
+            let mut table = TableLayout::new(vec![1]);
+            table.set_cell_decorator(FrameCellDecorator::new(true, true, false));
+            let card = build_card(entries[i], &fields_by_item, &items_map,
+                &name_style, &path_style, &label_style, &value_style, &sep_style)
+                .padded(card_padding);
+            table.row().element(card).push()
+                .map_err(|e| WalletError::ExportError(format!("Table error: {}", e)))?;
+            doc.push(table);
+            doc.push(Break::new(1.0));
+            i += 1;
+        } else if i + 1 < entries.len() {
+            // Check if next entry is also narrow
+            let next_count = fields_by_item
+                .get(&entries[i + 1].item_id)
+                .map_or(0, |f| f.len());
+            if next_count > WIDE_CARD_THRESHOLD {
+                // Current is narrow but next is wide — put current alone
+                let mut table = TableLayout::new(vec![1, 1]);
+                table.set_cell_decorator(FrameCellDecorator::new(true, true, false));
+                let left = build_card(entries[i], &fields_by_item, &items_map,
+                    &name_style, &path_style, &label_style, &value_style, &sep_style)
+                    .padded(card_padding);
+                let right = LinearLayout::vertical();
+                table.row().element(left).element(right).push()
+                    .map_err(|e| WalletError::ExportError(format!("Table error: {}", e)))?;
+                doc.push(table);
+                doc.push(Break::new(1.0));
+                i += 1;
+            } else {
+                // Two narrow entries side by side
+                let mut table = TableLayout::new(vec![1, 1]);
+                table.set_cell_decorator(FrameCellDecorator::new(true, true, false));
+                let left = build_card(entries[i], &fields_by_item, &items_map,
+                    &name_style, &path_style, &label_style, &value_style, &sep_style)
+                    .padded(card_padding);
+                let right = build_card(entries[i + 1], &fields_by_item, &items_map,
+                    &name_style, &path_style, &label_style, &value_style, &sep_style)
+                    .padded(card_padding);
+                table.row().element(left).element(right).push()
+                    .map_err(|e| WalletError::ExportError(format!("Table error: {}", e)))?;
+                doc.push(table);
+                doc.push(Break::new(1.0));
+                i += 2;
             }
+        } else {
+            // Last entry alone
+            let mut table = TableLayout::new(vec![1, 1]);
+            table.set_cell_decorator(FrameCellDecorator::new(true, true, false));
+            let left = build_card(entries[i], &fields_by_item, &items_map,
+                &name_style, &path_style, &label_style, &value_style, &sep_style)
+                .padded(card_padding);
+            let right = LinearLayout::vertical();
+            table.row().element(left).element(right).push()
+                .map_err(|e| WalletError::ExportError(format!("Table error: {}", e)))?;
+            doc.push(table);
+            doc.push(Break::new(1.0));
+            i += 1;
         }
-
-        doc.push(Break::new(2.0));
     }
 
     // Render to bytes
@@ -236,6 +255,52 @@ pub fn generate_pdf(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
         .map_err(|e| WalletError::ExportError(format!("Failed to render PDF: {}", e)))?;
 
     Ok(buf)
+}
+
+/// Build a single entry card as a LinearLayout.
+fn build_card(
+    item: &IWItem,
+    fields_by_item: &HashMap<String, Vec<&IWField>>,
+    items_map: &HashMap<&str, &IWItem>,
+    name_style: &Style,
+    path_style: &Style,
+    label_style: &Style,
+    value_style: &Style,
+    sep_style: &Style,
+) -> LinearLayout {
+    let mut card = LinearLayout::vertical();
+
+    // Item name
+    card.push(Paragraph::new(StyledString::new(
+        item.name.clone(),
+        *name_style,
+    )));
+
+    // Path (if nested)
+    let path = compute_path(item, items_map);
+    if !path.is_empty() {
+        card.push(Paragraph::new(StyledString::new(path, *path_style)));
+    }
+
+    // Thin separator
+    card.push(Paragraph::new(StyledString::new(
+        "\u{2500}".repeat(42),
+        *sep_style,
+    )));
+
+    // Fields
+    if let Some(item_fields) = fields_by_item.get(&item.item_id) {
+        for field in item_fields {
+            let mut p = Paragraph::new(StyledString::new(
+                format!("{}: ", field.label),
+                *label_style,
+            ));
+            p.push_styled(&field.value, *value_style);
+            card.push(p);
+        }
+    }
+
+    card
 }
 
 fn compute_path(item: &IWItem, items_map: &HashMap<&str, &IWItem>) -> String {
