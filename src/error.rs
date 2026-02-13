@@ -60,6 +60,10 @@ pub enum WalletError {
     /// Localization error
     #[error("Localization error: {0}")]
     LocalizationError(String),
+
+    /// Export error
+    #[error("Export error: {0}")]
+    ExportError(String),
 }
 
 impl From<rusqlite::Error> for WalletError {

@@ -1866,3 +1866,42 @@ fn test_undelete_deep_nested_item_restores_to_root() {
 
     wallet.close();
 }
+
+#[test]
+fn test_export_pdf_produces_valid_pdf() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    let bytes = wallet.export_pdf().unwrap();
+    assert!(!bytes.is_empty(), "PDF should not be empty");
+    assert!(bytes.starts_with(b"%PDF"), "Output should be a valid PDF");
+
+    wallet.close();
+}
+
+#[test]
+fn test_export_pdf_with_new_data() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    // Add a folder with an item and fields
+    let folder_id = wallet.add_item("Test Folder", "folder", true, None).unwrap();
+    let item_id = wallet.add_item("Test Entry", "document", false, Some(&folder_id)).unwrap();
+    wallet.add_field(&item_id, "MAIL", "test@example.com", Some(0)).unwrap();
+    wallet.add_field(&item_id, "PASS", "s3cret!", Some(1)).unwrap();
+
+    let bytes = wallet.export_pdf().unwrap();
+    assert!(bytes.starts_with(b"%PDF"));
+    // PDF with content should be larger than an empty one
+    assert!(bytes.len() > 1000, "PDF with entries should have substantial size");
+
+    wallet.close();
+}
+
+#[test]
+fn test_export_pdf_requires_unlock() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    // Don't unlock
+    let result = wallet.export_pdf();
+    assert!(result.is_err());
+}

@@ -8,5 +8,6 @@ pub mod items;
 pub mod fields;
 pub mod labels;
 pub mod search;
+pub mod export;
 
 pub use wallet::Wallet;
