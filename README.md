@@ -13,7 +13,7 @@
 - **AES-256-CBC Encryption** - Industry-standard encryption with PKCS7 padding
 - **SQLite Storage** - Reliable database storage with full ACID compliance
 - **Hierarchical Organization** - Organize items in folders with drag-and-drop support
-- **Custom Field Types** - 19 built-in field types (email, password, credit card, etc.) plus custom labels
+- **Custom Field Types** - 20 built-in field types (email, password, credit card, etc.) plus custom labels
 - **Delete & Restore** - Soft-delete with full undo capability for items and fields
 - **Backup & Restore** - ZIP-based backup with versioning, auto-cleanup, and integrity verification
 - **Multi-language Support** - 11 languages included
@@ -28,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-iwcore = "0.1.9"
+iwcore = "0.1.11"
 ```
 
 Or use cargo:
@@ -189,7 +189,7 @@ wallet.delete_label("CUST")?;
 
 ## Field Types
 
-iwcore supports 19 built-in field types:
+iwcore supports 20 built-in field types:
 
 | Code | Name | Value Type |
 |------|------|------------|
@@ -212,6 +212,7 @@ iwcore supports 19 built-in field types:
 | SQUE | Secret Question | text |
 | SANS | Secret Answer | text |
 | 2FAC | 2FA | text |
+| SEED | Seed Phrase | text |
 
 ## Supported Languages
 

@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn test_undelete_item_preserves_parent() {
+    fn test_undelete_item_restores_to_root() {
         let (mut wallet, _temp) = create_test_wallet();
         let folder_id = wallet.add_item("Parent Folder", "folder", true, None).unwrap();
         let item_id = wallet.add_item("Child Item", "document", false, Some(&folder_id)).unwrap();
@@ -586,7 +586,7 @@ mod tests {
         wallet.undelete_item(&item_id).unwrap();
 
         let item = wallet.get_item(&item_id).unwrap().unwrap();
-        assert_eq!(item.parent_id.as_deref(), Some(folder_id.as_str()));
+        assert_eq!(item.parent_id.as_deref(), Some("__ROOT__"));
     }
 
     #[test]
@@ -810,5 +810,67 @@ mod tests {
         // Should return empty, not error
         let deleted = wallet.get_deleted_items().unwrap();
         assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn test_undelete_item_with_purged_parent() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder_id = wallet.add_item("Folder", "folder", true, None).unwrap();
+        let item_id = wallet.add_item("Item", "document", false, Some(&folder_id)).unwrap();
+
+        // Delete folder (cascades to item)
+        wallet.delete_item(&folder_id).unwrap();
+
+        // Simulate: folder was purged but item remains in deleted state
+        // (e.g., folder purged in older version, item retained)
+        let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+        conn.execute(
+            "DELETE FROM nswallet_items WHERE item_id = ?",
+            rusqlite::params![folder_id],
+        ).unwrap();
+
+        // Undelete the item — parent is gone, item restores to root
+        wallet.undelete_item(&item_id).unwrap();
+
+        let item = wallet.get_item(&item_id).unwrap().unwrap();
+        assert_eq!(item.parent_id.as_deref(), Some("__ROOT__"));
+        assert!(!item.deleted);
+    }
+
+    #[test]
+    fn test_undelete_item_from_deep_nesting() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let l1 = wallet.add_item("Level 1", "folder", true, None).unwrap();
+        let l2 = wallet.add_item("Level 2", "folder", true, Some(&l1)).unwrap();
+        let l3 = wallet.add_item("Level 3", "folder", true, Some(&l2)).unwrap();
+        let leaf = wallet.add_item("Leaf Item", "document", false, Some(&l3)).unwrap();
+
+        // Delete top-level folder (cascades all)
+        wallet.delete_item(&l1).unwrap();
+
+        // Undelete only the leaf item
+        wallet.undelete_item(&leaf).unwrap();
+
+        let item = wallet.get_item(&leaf).unwrap().unwrap();
+        assert_eq!(item.parent_id.as_deref(), Some("__ROOT__"));
+        assert!(!item.deleted);
+    }
+
+    #[test]
+    fn test_undelete_folder_restores_to_root() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let parent = wallet.add_item("Parent", "folder", true, None).unwrap();
+        let child_folder = wallet.add_item("Child Folder", "folder", true, Some(&parent)).unwrap();
+
+        // Delete parent (cascades to child folder)
+        wallet.delete_item(&parent).unwrap();
+
+        // Undelete child folder
+        wallet.undelete_item(&child_folder).unwrap();
+
+        let item = wallet.get_item(&child_folder).unwrap().unwrap();
+        assert_eq!(item.parent_id.as_deref(), Some("__ROOT__"));
+        assert!(item.folder);
+        assert!(!item.deleted);
     }
 }

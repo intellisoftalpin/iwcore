@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use crate::error::Result;
 
 /// Current database version
-pub const CURRENT_VERSION: &str = "4";
+pub const CURRENT_VERSION: &str = "5";
 
 /// Upgrade database to the latest version
 pub fn upgrade_database(conn: &Connection, current_version: &str) -> Result<()> {
@@ -20,6 +20,9 @@ pub fn upgrade_database(conn: &Connection, current_version: &str) -> Result<()> 
     }
     if version < 4 {
         upgrade_to_v4(conn)?;
+    }
+    if version < 5 {
+        upgrade_to_v5(conn)?;
     }
 
     Ok(())
@@ -75,6 +78,19 @@ fn upgrade_to_v4(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Upgrade from v4 to v5
+/// Adds Seed Phrase label
+fn upgrade_to_v5(conn: &Connection) -> Result<()> {
+    let _ = conn.execute(
+        r#"INSERT OR IGNORE INTO nswallet_labels
+           (field_type, label_name, value_type, icon, system, deleted)
+           VALUES ('SEED', 'Seed Phrase', 'text', 'icon_seed', 1, 0)"#,
+        [],
+    );
+
+    Ok(())
+}
+
 /// Check if database version is compatible
 pub fn is_version_compatible(version: &str) -> bool {
     let v: u32 = version.parse().unwrap_or(0);
@@ -111,14 +127,15 @@ mod tests {
         assert!(is_version_compatible("2"));
         assert!(is_version_compatible("3"));
         assert!(is_version_compatible("4"));
-        assert!(!is_version_compatible("5"));
+        assert!(is_version_compatible("5"));
+        assert!(!is_version_compatible("6"));
         assert!(!is_version_compatible("999"));
         assert!(is_version_compatible("invalid")); // Parses to 0, which is <= 4
     }
 
     #[test]
     fn test_current_version() {
-        assert_eq!(CURRENT_VERSION, "4");
+        assert_eq!(CURRENT_VERSION, "5");
     }
 
     #[test]

@@ -46,7 +46,7 @@ pub use export::{ExportItemType, PDFItemModel};
 pub use database::queries::DatabaseStats;
 
 /// Database version constant
-pub const DB_VERSION: &str = "4";
+pub const DB_VERSION: &str = "5";
 
 /// Root item ID
 pub const ROOT_ID: &str = "__ROOT__";

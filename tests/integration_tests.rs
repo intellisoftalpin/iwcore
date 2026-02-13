@@ -1474,11 +1474,12 @@ fn test_cascade_delete_then_undelete_child() {
 
     wallet.delete_item(&folder).unwrap();
 
-    // Undelete only the child
+    // Undelete only the child — it should land at root
     wallet.undelete_item(&child).unwrap();
 
     let restored = wallet.get_item(&child).unwrap().unwrap();
     assert_eq!(restored.name, "Child");
+    assert_eq!(restored.parent_id.as_deref(), Some("__ROOT__"));
 
     // Parent still deleted
     assert!(wallet.get_item(&folder).unwrap().is_none());
@@ -1830,6 +1831,38 @@ fn test_update_field_history_preservation() {
     let values: Vec<&str> = history.iter().map(|f| f.value.as_str()).collect();
     assert!(values.contains(&"version1"));
     assert!(values.contains(&"version2"));
+
+    wallet.close();
+}
+
+// =========================================================================
+// Undelete after compact — item restores to root even when parent is purged
+// =========================================================================
+
+#[test]
+fn test_undelete_deep_nested_item_restores_to_root() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    let l1 = wallet.add_item("Level 1", "folder", true, None).unwrap();
+    let l2 = wallet.add_item("Level 2", "folder", true, Some(&l1)).unwrap();
+    let l3 = wallet.add_item("Level 3", "folder", true, Some(&l2)).unwrap();
+    let leaf = wallet.add_item("Leaf", "document", false, Some(&l3)).unwrap();
+
+    // Delete top-level folder (cascades all)
+    wallet.delete_item(&l1).unwrap();
+
+    // Undelete only the leaf — it should land at root
+    wallet.undelete_item(&leaf).unwrap();
+
+    let restored = wallet.get_item(&leaf).unwrap().unwrap();
+    assert_eq!(restored.name, "Leaf");
+    assert_eq!(restored.parent_id.as_deref(), Some("__ROOT__"));
+    assert!(!restored.deleted);
+
+    // Verify it appears in root listing
+    let root_items = wallet.get_items_by_parent("__ROOT__").unwrap();
+    assert!(root_items.iter().any(|i| i.item_id == leaf));
 
     wallet.close();
 }

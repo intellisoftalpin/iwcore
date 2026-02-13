@@ -181,6 +181,7 @@ pub const SYSTEM_FIELD_TYPES: &[(&str, &str, &str, &str)] = &[
     ("SQUE", "text", "icon_question", "label_secret_question"),
     ("SANS", "pass", "icon_answer", "label_secret_answer"),
     ("2FAC", "pass", "icon_2fa", "label_2fa"),
+    ("SEED", "text", "icon_seed", "label_seed"),
 ];
 
 #[cfg(test)]
@@ -235,6 +236,6 @@ mod tests {
 
     #[test]
     fn test_system_field_types_count() {
-        assert_eq!(SYSTEM_FIELD_TYPES.len(), 19);
+        assert_eq!(SYSTEM_FIELD_TYPES.len(), 20);
     }
 }

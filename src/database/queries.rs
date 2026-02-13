@@ -232,10 +232,10 @@ pub fn get_deleted_items_raw(conn: &Connection) -> Result<Vec<RawItem>> {
     items.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-/// Undelete an item (set deleted = 0)
+/// Undelete an item (set deleted = 0, move to root)
 pub fn undelete_item(conn: &Connection, item_id: &str) -> Result<()> {
     let rows = conn.execute(
-        "UPDATE nswallet_items SET deleted = 0, change_timestamp = ? WHERE item_id = ? AND deleted = 1",
+        "UPDATE nswallet_items SET deleted = 0, parent_id = '__ROOT__', change_timestamp = ? WHERE item_id = ? AND deleted = 1",
         params![now_timestamp(), item_id],
     )?;
     if rows == 0 {
