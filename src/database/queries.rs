@@ -516,6 +516,37 @@ pub fn get_database_stats(conn: &Connection) -> Result<DatabaseStats> {
     })
 }
 
+/// Get a single active field's raw data by field_id
+pub fn get_field_raw_by_id(conn: &Connection, field_id: &str) -> Result<Option<RawField>> {
+    let result = conn.query_row(
+        "SELECT item_id, field_id, type, value, change_timestamp, deleted, sort_weight
+         FROM nswallet_fields WHERE field_id = ? AND deleted = 0",
+        params![field_id],
+        |row| {
+            Ok(RawField {
+                item_id: row.get(0)?,
+                field_id: row.get(1)?,
+                field_type: row.get(2)?,
+                value_encrypted: row.get(3)?,
+                change_timestamp: row.get(4)?,
+                deleted: row.get::<_, i32>(5)? != 0,
+                sort_weight: row.get(6)?,
+            })
+        },
+    );
+    Ok(result.ok())
+}
+
+/// Get the OLDP field_id for a given item
+pub fn get_oldp_field_id(conn: &Connection, item_id: &str) -> Result<Option<String>> {
+    let result = conn.query_row(
+        "SELECT field_id FROM nswallet_fields WHERE item_id = ? AND type = 'OLDP' AND deleted = 0",
+        params![item_id],
+        |row| row.get(0),
+    );
+    Ok(result.ok())
+}
+
 /// Get max sort weight for an item's fields
 pub fn get_max_field_weight(conn: &Connection, item_id: &str) -> Result<i32> {
     let result: Option<i32> = conn.query_row(

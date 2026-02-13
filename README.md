@@ -28,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-iwcore = "0.1.8"
+iwcore = "0.1.9"
 ```
 
 Or use cargo:

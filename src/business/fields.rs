@@ -121,37 +121,46 @@ impl Wallet {
         Ok(field_id)
     }
 
-    /// Update a field's value
-    pub fn update_field(&mut self, field_id: &str, value: &str, sort_weight: Option<i32>) -> Result<()> {
+    /// Update a field's value. Soft-deletes the old field (preserving its value in the deleted pool)
+    /// and creates a new field with the updated value. Returns the new field_id.
+    pub fn update_field(&mut self, field_id: &str, value: &str, sort_weight: Option<i32>) -> Result<String> {
         self.ensure_unlocked()?;
 
         let password = self.password.as_ref().unwrap().clone();
-
-        let encrypted_value = crypto::encrypt(value, &password, self.encryption_count, None)
-            .map_err(|e| WalletError::EncryptionError(e))?;
 
         let conn = self.db.as_ref()
             .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
             .connection()?;
 
-        // Handle old password preservation
-        // If updating a PASS field and OLDP field exists, save old password to OLDP
-        if let Some(fields) = &self.fields_cache {
-            if let Some(field) = fields.iter().find(|f| f.field_id == field_id) {
-                if field.field_type == "PASS" {
-                    if let Some(oldp_field) = fields.iter().find(|f| f.item_id == field.item_id && f.field_type == "OLDP") {
-                        let old_encrypted = crypto::encrypt(&field.value, &password, self.encryption_count, None)
-                            .map_err(|e| WalletError::EncryptionError(e))?;
-                        queries::update_field(conn, &oldp_field.field_id, &old_encrypted, None)?;
-                    }
-                }
+        // Fetch old field from DB
+        let old_field = queries::get_field_raw_by_id(conn, field_id)?
+            .ok_or_else(|| WalletError::FieldNotFound(field_id.to_string()))?;
+
+        // If PASS type: copy old encrypted bytes directly to OLDP (no decrypt/re-encrypt needed)
+        if old_field.field_type == "PASS" {
+            if let Some(oldp_field_id) = queries::get_oldp_field_id(conn, &old_field.item_id)? {
+                queries::update_field_value_only(conn, &old_field.item_id, &oldp_field_id, &old_field.value_encrypted)?;
             }
         }
 
-        queries::update_field(conn, field_id, &encrypted_value, sort_weight)?;
+        // Encrypt new value
+        let encrypted_value = crypto::encrypt(value, &password, self.encryption_count, None)
+            .map_err(|e| WalletError::EncryptionError(e))?;
+
+        // Generate new field_id
+        let new_field_id = generate_field_id();
+
+        // Determine sort_weight: use explicit param if provided, else preserve old
+        let weight = sort_weight.unwrap_or(old_field.sort_weight.unwrap_or(0));
+
+        // Soft-delete old field
+        queries::delete_field(conn, &old_field.item_id, field_id)?;
+
+        // Create new field
+        queries::create_field(conn, &old_field.item_id, &new_field_id, &old_field.field_type, &encrypted_value, weight)?;
 
         self.fields_cache = None;
-        Ok(())
+        Ok(new_field_id)
     }
 
     /// Delete a field
@@ -312,15 +321,27 @@ mod tests {
     fn test_update_field() {
         let (mut wallet, _temp) = create_test_wallet();
         let item_id = wallet.add_item("Test Item", "document", false, None).unwrap();
-        let field_id = wallet.add_field(&item_id, "LINK", "http://old.com", None).unwrap();
+        let field_id = wallet.add_field(&item_id, "LINK", "http://old.com", Some(200)).unwrap();
 
-        // Update value
-        wallet.update_field(&field_id, "http://new.com", None).unwrap();
+        // Update value — returns new field_id
+        let new_field_id = wallet.update_field(&field_id, "http://new.com", None).unwrap();
 
-        // Verify change
+        // New field_id should differ from original
+        assert_ne!(new_field_id, field_id);
+
+        // Verify new field has updated value
         let fields = wallet.get_fields_by_item(&item_id).unwrap();
-        let field = fields.iter().find(|f| f.field_id == field_id).unwrap();
+        assert_eq!(fields.len(), 1);
+        let field = fields.iter().find(|f| f.field_id == new_field_id).unwrap();
         assert_eq!(field.value, "http://new.com");
+        assert_eq!(field.field_type, "LINK");
+        assert_eq!(field.sort_weight, 200);
+
+        // Old value should be in deleted pool
+        let deleted = wallet.get_deleted_fields().unwrap();
+        let old = deleted.iter().find(|f| f.field_id == field_id).unwrap();
+        assert_eq!(old.value, "http://old.com");
+        assert_eq!(old.field_type, "LINK");
     }
 
     /// Test: CopyField from C# BusinessFixture
@@ -610,5 +631,118 @@ mod tests {
         // Should return empty, not error
         let deleted = wallet.get_deleted_fields().unwrap();
         assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn test_update_field_creates_deleted_history() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        let field_id = wallet.add_field(&item_id, "NOTE", "original value", None).unwrap();
+
+        wallet.update_field(&field_id, "new value", None).unwrap();
+
+        let deleted = wallet.get_deleted_fields().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].value, "original value");
+        assert_eq!(deleted[0].field_type, "NOTE");
+    }
+
+    #[test]
+    fn test_update_field_multiple_history() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        let fid = wallet.add_field(&item_id, "NOTE", "v1", None).unwrap();
+
+        let fid2 = wallet.update_field(&fid, "v2", None).unwrap();
+        let fid3 = wallet.update_field(&fid2, "v3", None).unwrap();
+        wallet.update_field(&fid3, "v4", None).unwrap();
+
+        // 3 old values in deleted pool
+        let deleted = wallet.get_deleted_fields().unwrap();
+        assert_eq!(deleted.len(), 3);
+        let values: Vec<&str> = deleted.iter().map(|f| f.value.as_str()).collect();
+        assert!(values.contains(&"v1"));
+        assert!(values.contains(&"v2"));
+        assert!(values.contains(&"v3"));
+
+        // Active field has latest value
+        let fields = wallet.get_fields_by_item(&item_id).unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].value, "v4");
+    }
+
+    #[test]
+    fn test_update_pass_field_updates_oldp_and_creates_history() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        wallet.add_field(&item_id, "PASS", "password1", None).unwrap();
+        let oldp_id = wallet.add_field(&item_id, "OLDP", "", None).unwrap();
+
+        // Load fields so we can get the PASS field_id
+        let fields = wallet.get_fields_by_item(&item_id).unwrap();
+        let pass_field_id = fields.iter().find(|f| f.field_type == "PASS").unwrap().field_id.clone();
+
+        // Update PASS
+        wallet.update_field(&pass_field_id, "password2", None).unwrap();
+
+        // OLDP should have old password
+        let fields = wallet.get_fields_by_item(&item_id).unwrap();
+        let oldp = fields.iter().find(|f| f.field_id == oldp_id).unwrap();
+        assert_eq!(oldp.value, "password1");
+
+        // Old PASS should be in deleted pool
+        let deleted = wallet.get_deleted_fields().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].value, "password1");
+        assert_eq!(deleted[0].field_type, "PASS");
+    }
+
+    #[test]
+    fn test_update_pass_without_oldp() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        let pass_id = wallet.add_field(&item_id, "PASS", "password1", None).unwrap();
+
+        // No OLDP field — should not error
+        let new_id = wallet.update_field(&pass_id, "password2", None).unwrap();
+        assert_ne!(new_id, pass_id);
+
+        let fields = wallet.get_fields_by_item(&item_id).unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].value, "password2");
+    }
+
+    #[test]
+    fn test_update_field_does_not_affect_others() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        let f1 = wallet.add_field(&item_id, "MAIL", "email@test.com", None).unwrap();
+        let f2 = wallet.add_field(&item_id, "NOTE", "some note", None).unwrap();
+
+        // Update only f1
+        wallet.update_field(&f1, "new@test.com", None).unwrap();
+
+        // f2 should be unchanged
+        let fields = wallet.get_fields_by_item(&item_id).unwrap();
+        let note = fields.iter().find(|f| f.field_id == f2).unwrap();
+        assert_eq!(note.value, "some note");
+
+        // Only 1 deleted entry (old f1)
+        let deleted = wallet.get_deleted_fields().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].value, "email@test.com");
+    }
+
+    #[test]
+    fn test_update_field_preserves_sort_weight() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+        let field_id = wallet.add_field(&item_id, "NOTE", "old", Some(500)).unwrap();
+
+        let new_id = wallet.update_field(&field_id, "new", None).unwrap();
+
+        let fields = wallet.get_fields_by_item(&item_id).unwrap();
+        let field = fields.iter().find(|f| f.field_id == new_id).unwrap();
+        assert_eq!(field.sort_weight, 500);
     }
 }

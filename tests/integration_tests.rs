@@ -342,12 +342,20 @@ fn test_update_field_value() {
     let item_id = wallet.add_item("Test Item", "document", false, None).unwrap();
     let field_id = wallet.add_field(&item_id, "NOTE", "Original value", None).unwrap();
 
-    // Update field
-    wallet.update_field(&field_id, "Updated value", None).unwrap();
+    // Update field — returns new field_id
+    let new_field_id = wallet.update_field(&field_id, "Updated value", None).unwrap();
+    assert_ne!(new_field_id, field_id);
 
-    // Verify
+    // New field has updated value
     let fields = wallet.get_fields_by_item(&item_id).unwrap();
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].field_id, new_field_id);
     assert_eq!(fields[0].value, "Updated value");
+
+    // Old value in deleted pool
+    let deleted = wallet.get_deleted_fields().unwrap();
+    let old = deleted.iter().find(|f| f.field_id == field_id).unwrap();
+    assert_eq!(old.value, "Original value");
 
     wallet.close();
 }
@@ -1788,6 +1796,40 @@ fn test_legacy_db_change_password_with_deleted_records() {
     wallet.lock();
     assert!(wallet.unlock(new_password).unwrap());
     assert!(!wallet.unlock(TEST_PASSWORD).unwrap_or(false));
+
+    wallet.close();
+}
+
+// =========================================================================
+// Update Field History Preservation
+// =========================================================================
+
+#[test]
+fn test_update_field_history_preservation() {
+    let (mut wallet, _temp_dir) = setup_test_wallet();
+    wallet.unlock(TEST_PASSWORD).unwrap();
+
+    // Create item with field
+    let item_id = wallet.add_item("History Test", "document", false, None).unwrap();
+    let fid1 = wallet.add_field(&item_id, "NOTE", "version1", None).unwrap();
+
+    // Update twice
+    let fid2 = wallet.update_field(&fid1, "version2", None).unwrap();
+    let fid3 = wallet.update_field(&fid2, "version3", None).unwrap();
+
+    // Active field has latest value
+    let fields = wallet.get_fields_by_item(&item_id).unwrap();
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].field_id, fid3);
+    assert_eq!(fields[0].value, "version3");
+
+    // 2 deleted entries with correct old values
+    let deleted = wallet.get_deleted_fields().unwrap();
+    let history: Vec<_> = deleted.iter().filter(|f| f.item_id == item_id).collect();
+    assert_eq!(history.len(), 2);
+    let values: Vec<&str> = history.iter().map(|f| f.value.as_str()).collect();
+    assert!(values.contains(&"version1"));
+    assert!(values.contains(&"version2"));
 
     wallet.close();
 }
