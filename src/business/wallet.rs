@@ -127,6 +127,8 @@ impl Wallet {
             Ok(_) => {
                 self.password = Some(password.to_string());
                 self.clear_caches();
+                // Ensure any new system labels are added to existing wallets
+                self.add_system_labels()?;
                 Ok(true)
             }
             Err(_) => Ok(false)

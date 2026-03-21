@@ -39,6 +39,7 @@ impl Wallet {
             ("SANS", "Secret Answer", "pass", "answer"),
             ("2FAC", "2FA", "pass", "2fa"),
             ("SEED", "Seed Phrase", "text", "seed"),
+            ("CVVC", "CVV", "pass", "cvv"),
         ];
 
         for (field_type, name, value_type, icon) in system_labels {
@@ -164,7 +165,7 @@ mod tests {
     fn test_labels() {
         let (mut wallet, _temp) = create_test_wallet();
         let labels = wallet.get_labels().unwrap();
-        assert_eq!(labels.len(), 20); // System labels count
+        assert_eq!(labels.len(), 21); // System labels count
     }
 
     /// Test: CreateDeleteLabel from C# BusinessFixture
