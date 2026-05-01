@@ -41,7 +41,10 @@ pub use database::models::{IWItem, IWField, IWLabel, IWProperties, SearchResult,
 pub use business::Wallet;
 pub use backup::{BackupManager, BackupType};
 pub use localization::Translations;
-pub use crypto::{generate_password, generate_clever_password, PasswordOptions};
+pub use crypto::{
+    generate_password, generate_clever_password, generate_memorable_password,
+    PasswordOptions, MemorableOptions, MemorableCaps,
+};
 pub use export::{ExportItemType, PDFItemModel};
 pub use database::queries::DatabaseStats;
 

@@ -7,11 +7,15 @@ mod aes;
 mod md5;
 mod key;
 pub mod password;
+mod wordlist;
 
 pub use aes::{encrypt, decrypt};
 pub use md5::md5_hex;
 pub use key::prepare_key;
-pub use password::{generate_password, generate_clever_password, PasswordOptions};
+pub use password::{
+    generate_password, generate_clever_password, generate_memorable_password,
+    PasswordOptions, MemorableOptions, MemorableCaps,
+};
 
 #[cfg(test)]
 mod tests;
