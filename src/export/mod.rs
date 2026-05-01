@@ -1,7 +1,15 @@
 //! Export functionality for IntelliWallet
 //!
 //! This module provides data structures and utilities for exporting
-//! wallet data to various formats (e.g., PDF).
+//! wallet data to various formats (PDF, CSV, JSON, XML).
+
+mod csv;
+mod json;
+mod xml;
+
+pub use csv::generate_csv;
+pub use json::generate_json;
+pub use xml::generate_xml;
 
 use std::collections::HashMap;
 
