@@ -104,24 +104,21 @@ pub fn generate_password(options: &PasswordOptions) -> String {
     let mut rng = csprng();
     let mut char_pool = String::new();
 
-    // Build character pool with weighting (matching C# implementation)
+    // Build weighted character pool (matching C# implementation: letters×3, digits×2)
     if options.lowercase {
         char_pool.push_str(LOWER_LETTERS);
         char_pool.push_str(LOWER_LETTERS);
         char_pool.push_str(LOWER_LETTERS);
     }
-
     if options.uppercase {
         char_pool.push_str(UPPER_LETTERS);
         char_pool.push_str(UPPER_LETTERS);
         char_pool.push_str(UPPER_LETTERS);
     }
-
     if options.digits {
         char_pool.push_str(DIGITS);
         char_pool.push_str(DIGITS);
     }
-
     if options.special {
         char_pool.push_str(SPECIAL_SYMBOLS);
     }
@@ -139,24 +136,82 @@ pub fn generate_password(options: &PasswordOptions) -> String {
             .chars()
             .filter(|c| !AMBIGUOUS_CHARS.contains(*c))
             .collect();
-        // Defensive fallback if every selected class was entirely ambiguous
-        // (only realistically happens if the caller picks a char-class pool
-        // we later remove entirely — for current ambiguous set this can't
-        // happen because each class still has plenty of letters left).
         if char_pool.is_empty() {
             char_pool.push_str(LOWER_LETTERS);
         }
     }
 
-    let chars: Vec<char> = char_pool.chars().collect();
-    let mut password = String::with_capacity(options.length);
+    let pool_chars: Vec<char> = char_pool.chars().collect();
 
-    for _ in 0..options.length {
-        let idx = rng.random_range(0..chars.len());
-        password.push(chars[idx]);
+    // Guarantee at least one character from EACH selected class. Many
+    // third-party password rules ("must contain a digit", "must contain a
+    // symbol", etc.) demand this — without it a long random password can
+    // randomly fail validation on, say, a banking site.
+    let mut required: Vec<char> = Vec::new();
+    if options.lowercase {
+        if let Some(c) = pick_from_class(LOWER_LETTERS, options.avoid_ambiguous, &mut rng) {
+            required.push(c);
+        }
+    }
+    if options.uppercase {
+        if let Some(c) = pick_from_class(UPPER_LETTERS, options.avoid_ambiguous, &mut rng) {
+            required.push(c);
+        }
+    }
+    if options.digits {
+        if let Some(c) = pick_from_class(DIGITS, options.avoid_ambiguous, &mut rng) {
+            required.push(c);
+        }
+    }
+    if options.special {
+        if let Some(c) = pick_from_class(SPECIAL_SYMBOLS, options.avoid_ambiguous, &mut rng) {
+            required.push(c);
+        }
     }
 
-    password
+    // If the user asked for a length shorter than the number of selected
+    // classes, shuffle the required chars and truncate. (Practically
+    // impossible — UI enforces length ≥ 8 — but we handle it cleanly.)
+    if options.length <= required.len() {
+        shuffle(&mut required, &mut rng);
+        return required.into_iter().take(options.length).collect();
+    }
+
+    // Fill the rest from the weighted pool.
+    let remaining = options.length - required.len();
+    let mut password_chars: Vec<char> = required;
+    for _ in 0..remaining {
+        let idx = rng.random_range(0..pool_chars.len());
+        password_chars.push(pool_chars[idx]);
+    }
+
+    // Shuffle so the guaranteed chars aren't always at the start.
+    shuffle(&mut password_chars, &mut rng);
+    password_chars.into_iter().collect()
+}
+
+/// Pick a single random character from a character-class string, optionally
+/// honouring the avoid-ambiguous filter. Returns None if every char in the
+/// class is filtered out (shouldn't happen for the current ambiguous set
+/// but guarded for future-proofing).
+fn pick_from_class(class: &str, avoid_ambiguous: bool, rng: &mut StdRng) -> Option<char> {
+    let candidates: Vec<char> = class
+        .chars()
+        .filter(|c| !avoid_ambiguous || !AMBIGUOUS_CHARS.contains(*c))
+        .collect();
+    if candidates.is_empty() {
+        None
+    } else {
+        Some(candidates[rng.random_range(0..candidates.len())])
+    }
+}
+
+/// Fisher-Yates shuffle in place using the given CSPRNG.
+fn shuffle<T>(items: &mut [T], rng: &mut StdRng) {
+    for i in (1..items.len()).rev() {
+        let j = rng.random_range(0..=i);
+        items.swap(i, j);
+    }
 }
 
 /// Generate a password based on a pattern.
@@ -463,6 +518,74 @@ mod tests {
             saw_any_ambiguous,
             "expected at least one ambiguous char in 1000-char password",
         );
+    }
+
+    #[test]
+    fn test_generate_password_guarantees_each_selected_class() {
+        // Run many short passwords with all 4 classes. Every single result
+        // must contain at least one of each class — never zero.
+        let options = PasswordOptions {
+            lowercase: true,
+            uppercase: true,
+            digits: true,
+            special: true,
+            avoid_ambiguous: false,
+            length: 8,
+        };
+        for _ in 0..200 {
+            let pwd = generate_password(&options);
+            assert_eq!(pwd.len(), 8);
+            assert!(pwd.chars().any(|c| c.is_ascii_lowercase()), "{pwd}");
+            assert!(pwd.chars().any(|c| c.is_ascii_uppercase()), "{pwd}");
+            assert!(pwd.chars().any(|c| c.is_ascii_digit()), "{pwd}");
+            assert!(
+                pwd.chars().any(|c| SPECIAL_SYMBOLS.contains(c)),
+                "expected a special symbol in {pwd}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_password_unselected_class_never_appears() {
+        // Inverse guard: classes the user did NOT select must not appear.
+        let options = PasswordOptions {
+            lowercase: true,
+            uppercase: false,
+            digits: true,
+            special: false,
+            avoid_ambiguous: false,
+            length: 100,
+        };
+        for _ in 0..50 {
+            let pwd = generate_password(&options);
+            assert!(
+                pwd.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "unexpected char in {pwd}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_password_guarantees_with_avoid_ambiguous() {
+        // Combined: avoid ambiguous + at-least-one-of-each.
+        let options = PasswordOptions {
+            lowercase: true,
+            uppercase: true,
+            digits: true,
+            special: true,
+            avoid_ambiguous: true,
+            length: 8,
+        };
+        for _ in 0..200 {
+            let pwd = generate_password(&options);
+            assert!(pwd.chars().any(|c| c.is_ascii_lowercase()));
+            assert!(pwd.chars().any(|c| c.is_ascii_uppercase()));
+            assert!(pwd.chars().any(|c| c.is_ascii_digit()));
+            assert!(pwd.chars().any(|c| SPECIAL_SYMBOLS.contains(c)));
+            for c in pwd.chars() {
+                assert!(!AMBIGUOUS_CHARS.contains(c), "ambiguous {c} in {pwd}");
+            }
+        }
     }
 
     #[test]
