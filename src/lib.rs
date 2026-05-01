@@ -76,4 +76,4 @@ pub const PASSWORD_MIN_LENGTH: usize = 3;
 pub const PASSWORD_MAX_LENGTH: usize = 32;
 
 /// Minimum search phrase length
-pub const SEARCH_MIN_LENGTH: usize = 3;
+pub const SEARCH_MIN_LENGTH: usize = 2;

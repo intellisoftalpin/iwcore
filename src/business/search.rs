@@ -39,7 +39,7 @@ impl Wallet {
     /// Search items and fields
     ///
     /// Matches the original C# implementation:
-    /// - Requires minimum search phrase length (SEARCH_MIN_LENGTH = 3)
+    /// - Requires minimum search phrase length (SEARCH_MIN_LENGTH = 2)
     /// - Name matches exclude folders (only items are matched by name)
     /// - Field value matches include all items
     /// - Returns distinct results
@@ -116,7 +116,8 @@ mod tests {
     fn test_is_valid_search_phrase() {
         assert!(is_valid_search_phrase("abc"));
         assert!(is_valid_search_phrase("test"));
-        assert!(!is_valid_search_phrase("ab"));
+        assert!(is_valid_search_phrase("ab"));
+        assert!(!is_valid_search_phrase("a"));
         assert!(!is_valid_search_phrase(""));
     }
 
@@ -164,15 +165,16 @@ mod tests {
     #[test]
     fn test_search_minimum_length() {
         let (mut wallet, _temp) = create_test_wallet();
+        wallet.add_item("A", "document", false, None).unwrap();
         wallet.add_item("AB", "document", false, None).unwrap();
 
         // Search with phrase shorter than minimum length should return empty
-        let results = wallet.search("ab").unwrap();
+        let results = wallet.search("a").unwrap();
         assert!(results.is_empty());
 
-        // Search with phrase at minimum length should work
-        let results = wallet.search("abc").unwrap();
-        assert!(results.is_empty()); // No match, but search executed
+        // Search with phrase at minimum length should match
+        let results = wallet.search("ab").unwrap();
+        assert!(!results.is_empty());
     }
 
     #[test]

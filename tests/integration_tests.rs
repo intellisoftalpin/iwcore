@@ -893,16 +893,17 @@ fn test_search_minimum_length() {
     let (mut wallet, _temp_dir) = setup_test_wallet();
     wallet.unlock(TEST_PASSWORD).unwrap();
 
-    // Create item with short name
+    // Create items with short names
+    wallet.add_item("A", "document", false, None).unwrap();
     wallet.add_item("AB", "document", false, None).unwrap();
 
-    // Search with phrase shorter than minimum (3 chars) should return empty
-    let results = wallet.search("AB").unwrap();
-    assert!(results.is_empty(), "Search with <3 chars should return empty");
+    // Search with phrase shorter than minimum (2 chars) should return empty
+    let results = wallet.search("A").unwrap();
+    assert!(results.is_empty(), "Search with <2 chars should return empty");
 
-    // Search with exactly 3 chars should work
-    let _results2 = wallet.search("ABC").unwrap();
-    // May be empty if no match, but search executed
+    // Search with exactly 2 chars should work and match the AB item
+    let results2 = wallet.search("AB").unwrap();
+    assert!(!results2.is_empty(), "Search with 2 chars should return matches");
 
     wallet.close();
 }
