@@ -37,7 +37,7 @@ fn csprng() -> StdRng {
 const LOWER_LETTERS: &str = "qwertyuiopasdfghjklzxcvbnm";
 const UPPER_LETTERS: &str = "QWERTYUIOPASDFGHJKLZXCVBNM";
 const DIGITS: &str = "1234567890";
-const SPECIAL_SYMBOLS: &str = "!@#$%^&*()_+-={}[];:|,.<>?~";
+const SPECIAL_SYMBOLS: &str = "!@#$%^&*()_+-=;:,.?~";
 
 /// Options for password generation
 #[derive(Debug, Clone)]
