@@ -39,6 +39,11 @@ const UPPER_LETTERS: &str = "QWERTYUIOPASDFGHJKLZXCVBNM";
 const DIGITS: &str = "1234567890";
 const SPECIAL_SYMBOLS: &str = "!@#$%^&*()_+-=;:,.?~";
 
+/// Characters that look alike in many fonts and confuse the user when
+/// reading a password aloud or copying it by hand.
+/// Pairs/groups: l-1-I-i, o-O-0, B-8, S-5-s, Z-2.
+const AMBIGUOUS_CHARS: &str = "lIi1oO0B8Ss5Z2";
+
 /// Options for password generation
 #[derive(Debug, Clone)]
 pub struct PasswordOptions {
@@ -50,6 +55,8 @@ pub struct PasswordOptions {
     pub digits: bool,
     /// Include special symbols (!@#$%...)
     pub special: bool,
+    /// Exclude visually-similar characters (l/I/i/1, o/O/0, B/8, S/5/s, Z/2).
+    pub avoid_ambiguous: bool,
     /// Password length
     pub length: usize,
 }
@@ -61,6 +68,7 @@ impl Default for PasswordOptions {
             uppercase: true,
             digits: true,
             special: false,
+            avoid_ambiguous: false,
             length: 16,
         }
     }
@@ -121,6 +129,23 @@ pub fn generate_password(options: &PasswordOptions) -> String {
     // If nothing selected, use lowercase as fallback
     if char_pool.is_empty() {
         char_pool.push_str(LOWER_LETTERS);
+    }
+
+    // Strip visually-similar characters when requested. Done after pool
+    // construction so the per-class weighting (lower×3, upper×3, digit×2)
+    // is preserved across the surviving characters.
+    if options.avoid_ambiguous {
+        char_pool = char_pool
+            .chars()
+            .filter(|c| !AMBIGUOUS_CHARS.contains(*c))
+            .collect();
+        // Defensive fallback if every selected class was entirely ambiguous
+        // (only realistically happens if the caller picks a char-class pool
+        // we later remove entirely — for current ambiguous set this can't
+        // happen because each class still has plenty of letters left).
+        if char_pool.is_empty() {
+            char_pool.push_str(LOWER_LETTERS);
+        }
     }
 
     let chars: Vec<char> = char_pool.chars().collect();
@@ -314,6 +339,7 @@ mod tests {
             uppercase: false,
             digits: false,
             special: false,
+            avoid_ambiguous: false,
             length: 20,
         };
         let password = generate_password(&options);
@@ -328,6 +354,7 @@ mod tests {
             uppercase: true,
             digits: false,
             special: false,
+            avoid_ambiguous: false,
             length: 20,
         };
         let password = generate_password(&options);
@@ -342,6 +369,7 @@ mod tests {
             uppercase: false,
             digits: true,
             special: false,
+            avoid_ambiguous: false,
             length: 20,
         };
         let password = generate_password(&options);
@@ -356,6 +384,7 @@ mod tests {
             uppercase: false,
             digits: false,
             special: true,
+            avoid_ambiguous: false,
             length: 20,
         };
         let password = generate_password(&options);
@@ -370,6 +399,7 @@ mod tests {
             uppercase: true,
             digits: true,
             special: true,
+            avoid_ambiguous: false,
             length: 100,
         };
         let password = generate_password(&options);
@@ -384,12 +414,55 @@ mod tests {
             uppercase: false,
             digits: false,
             special: false,
+            avoid_ambiguous: false,
             length: 10,
         };
         let password = generate_password(&options);
         assert_eq!(password.len(), 10);
         // Should fallback to lowercase
         assert!(password.chars().all(|c| c.is_ascii_lowercase()));
+    }
+
+    #[test]
+    fn test_generate_password_avoid_ambiguous() {
+        let options = PasswordOptions {
+            lowercase: true,
+            uppercase: true,
+            digits: true,
+            special: false,
+            avoid_ambiguous: true,
+            length: 200,
+        };
+        let password = generate_password(&options);
+        assert_eq!(password.len(), 200);
+        for c in password.chars() {
+            assert!(
+                !AMBIGUOUS_CHARS.contains(c),
+                "ambiguous char {c:?} should be excluded but appeared in {password}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_password_avoid_ambiguous_off_does_not_filter() {
+        // Sanity guard: with avoid_ambiguous=false, ambiguous chars CAN
+        // appear (probabilistically — with length 1000 it's effectively
+        // certain).
+        let options = PasswordOptions {
+            lowercase: true,
+            uppercase: true,
+            digits: true,
+            special: false,
+            avoid_ambiguous: false,
+            length: 1000,
+        };
+        let password = generate_password(&options);
+        let saw_any_ambiguous =
+            password.chars().any(|c| AMBIGUOUS_CHARS.contains(c));
+        assert!(
+            saw_any_ambiguous,
+            "expected at least one ambiguous char in 1000-char password",
+        );
     }
 
     #[test]

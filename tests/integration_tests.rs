@@ -719,6 +719,7 @@ fn test_password_generator_basic() {
         uppercase: true,
         digits: true,
         special: false,
+        avoid_ambiguous: false,
         length: 16,
     };
 
@@ -736,6 +737,7 @@ fn test_password_generator_all_types() {
         uppercase: true,
         digits: true,
         special: true,
+        avoid_ambiguous: false,
         length: 32,
     };
 
@@ -752,6 +754,7 @@ fn test_password_generator_lowercase_only() {
         uppercase: false,
         digits: false,
         special: false,
+        avoid_ambiguous: false,
         length: 20,
     };
 
@@ -769,6 +772,7 @@ fn test_password_generator_digits_only() {
         uppercase: false,
         digits: true,
         special: false,
+        avoid_ambiguous: false,
         length: 10,
     };
 
