@@ -2,9 +2,11 @@
 //!
 //! This module provides field management operations for the Wallet.
 
+use std::collections::HashMap;
+
 use chrono::Utc;
 use crate::error::{WalletError, Result};
-use crate::database::{IWField, queries};
+use crate::database::{IWField, FieldValueUsage, queries};
 use crate::database::queries::parse_timestamp;
 use crate::crypto;
 use crate::utils::generate_field_id;
@@ -31,6 +33,35 @@ impl Wallet {
         result.sort_by_key(|f| f.sort_weight);
 
         Ok(result)
+    }
+
+    /// Returns up to `limit` distinct values for the given field type,
+    /// sorted by occurrence count desc (then by value asc as tiebreaker).
+    /// Empty values and soft-deleted fields are excluded. Reuses the
+    /// already-decrypted field cache — no new SQL or decryption.
+    pub fn get_top_field_values_by_type(
+        &mut self,
+        field_type: &str,
+        limit: usize,
+    ) -> Result<Vec<FieldValueUsage>> {
+        let fields = self.get_fields()?;
+        let mut counts: HashMap<&str, u32> = HashMap::new();
+        for f in fields {
+            if f.deleted || f.field_type != field_type || f.value.is_empty() {
+                continue;
+            }
+            *counts.entry(f.value.as_str()).or_insert(0) += 1;
+        }
+        let mut entries: Vec<FieldValueUsage> = counts
+            .into_iter()
+            .map(|(value, count)| FieldValueUsage {
+                value: value.to_string(),
+                count,
+            })
+            .collect();
+        entries.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
+        entries.truncate(limit);
+        Ok(entries)
     }
 
     /// Load fields from database if not cached
@@ -744,5 +775,61 @@ mod tests {
         let fields = wallet.get_fields_by_item(&item_id).unwrap();
         let field = fields.iter().find(|f| f.field_id == new_id).unwrap();
         assert_eq!(field.sort_weight, 500);
+    }
+
+    #[test]
+    fn test_top_field_values_basic() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+
+        wallet.add_field(&item_id, "MAIL", "a@x.com", None).unwrap();
+        wallet.add_field(&item_id, "MAIL", "b@x.com", None).unwrap();
+        wallet.add_field(&item_id, "MAIL", "a@x.com", None).unwrap();
+
+        let top = wallet.get_top_field_values_by_type("MAIL", 5).unwrap();
+
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].value, "a@x.com");
+        assert_eq!(top[0].count, 2);
+        assert_eq!(top[1].value, "b@x.com");
+        assert_eq!(top[1].count, 1);
+    }
+
+    #[test]
+    fn test_top_field_values_filters_deleted_and_empty() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+
+        wallet.add_field(&item_id, "MAIL", "keep@x.com", None).unwrap();
+        let to_delete = wallet
+            .add_field(&item_id, "MAIL", "gone@x.com", None)
+            .unwrap();
+        wallet.add_field(&item_id, "MAIL", "", None).unwrap();
+        wallet.delete_field(&item_id, &to_delete).unwrap();
+
+        let top = wallet.get_top_field_values_by_type("MAIL", 5).unwrap();
+
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].value, "keep@x.com");
+        assert_eq!(top[0].count, 1);
+    }
+
+    #[test]
+    fn test_top_field_values_respects_limit_and_other_types() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Item", "document", false, None).unwrap();
+
+        for n in 0..6 {
+            wallet
+                .add_field(&item_id, "USER", &format!("user{n}"), None)
+                .unwrap();
+        }
+        wallet.add_field(&item_id, "MAIL", "noise@x.com", None).unwrap();
+
+        let top = wallet.get_top_field_values_by_type("USER", 3).unwrap();
+
+        assert_eq!(top.len(), 3);
+        assert!(top.iter().all(|u| u.value.starts_with("user")));
+        assert!(top.iter().all(|u| u.count == 1));
     }
 }

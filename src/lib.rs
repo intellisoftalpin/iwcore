@@ -37,7 +37,7 @@ pub mod export;
 
 // Re-export main types
 pub use error::{WalletError, Result};
-pub use database::models::{IWItem, IWField, IWLabel, IWProperties, SearchResult, SearchMatchType};
+pub use database::models::{IWItem, IWField, IWLabel, IWProperties, SearchResult, SearchMatchType, FieldValueUsage};
 pub use business::Wallet;
 pub use backup::{BackupManager, BackupType};
 pub use localization::Translations;

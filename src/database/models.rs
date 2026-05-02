@@ -90,6 +90,15 @@ pub struct IWField {
     pub expiring: bool,
 }
 
+/// Frequency entry for a stored value of a given field type. Returned
+/// by `Wallet::get_top_field_values_by_type` so callers can render
+/// suggestion chips ranked by how often a value has been used.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldValueUsage {
+    pub value: String,
+    pub count: u32,
+}
+
 /// Field type label definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IWLabel {
