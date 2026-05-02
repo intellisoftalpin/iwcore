@@ -8,9 +8,19 @@ use crate::error::Result;
 /// Current database version
 pub const CURRENT_VERSION: &str = "5";
 
-/// Upgrade database to the latest version
+/// Upgrade database to the latest version.
+///
+/// Runs every per-version migration whose target is greater than
+/// `current_version`, then writes `CURRENT_VERSION` back into
+/// `nswallet_properties.version`. Idempotent — calling on an already-
+/// current database is a no-op (no SQL fired, no writes).
 pub fn upgrade_database(conn: &Connection, current_version: &str) -> Result<()> {
     let version: u32 = current_version.parse().unwrap_or(1);
+    let target: u32 = CURRENT_VERSION.parse().unwrap_or(version);
+
+    if version >= target {
+        return Ok(());
+    }
 
     if version < 2 {
         upgrade_to_v2(conn)?;
@@ -24,6 +34,9 @@ pub fn upgrade_database(conn: &Connection, current_version: &str) -> Result<()> 
     if version < 5 {
         upgrade_to_v5(conn)?;
     }
+
+    // Persist the new version so the migration is recorded as applied.
+    set_database_version(conn, CURRENT_VERSION)?;
 
     Ok(())
 }
@@ -168,8 +181,10 @@ mod tests {
             );
         "#).unwrap();
 
-        // Should upgrade without error
         upgrade_database(&conn, "1").unwrap();
+
+        // Version field must be bumped to CURRENT_VERSION.
+        assert_eq!(get_database_version(&conn).unwrap(), CURRENT_VERSION);
     }
 
     #[test]
@@ -194,16 +209,71 @@ mod tests {
             );
         "#).unwrap();
 
-        // Upgrade from v3 to v4
         upgrade_database(&conn, "3").unwrap();
 
-        // Check 2FA label was added
-        let count: i32 = conn.query_row(
+        // 2FA label was added by the v4 migration.
+        let count_2fa: i32 = conn.query_row(
             "SELECT COUNT(*) FROM nswallet_labels WHERE field_type = '2FAC'",
             [],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count_2fa, 1);
+
+        // Version field must be bumped to CURRENT_VERSION.
+        assert_eq!(get_database_version(&conn).unwrap(), CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_upgrade_database_persists_version_and_v5_label() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(r#"
+            CREATE TABLE nswallet_properties (
+                database_id TEXT PRIMARY KEY,
+                version TEXT
+            );
+            INSERT INTO nswallet_properties (database_id, version) VALUES ('test', '4');
+
+            CREATE TABLE nswallet_labels (
+                field_type TEXT PRIMARY KEY,
+                label_name TEXT,
+                value_type TEXT,
+                icon TEXT,
+                system INTEGER,
+                deleted INTEGER
+            );
+        "#).unwrap();
+
+        upgrade_database(&conn, "4").unwrap();
+
+        // Seed Phrase label (v5 migration) is present.
+        let count_seed: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nswallet_labels WHERE field_type = 'SEED'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count_seed, 1);
+
+        assert_eq!(get_database_version(&conn).unwrap(), CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_upgrade_database_no_op_on_current() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(r#"
+            CREATE TABLE nswallet_properties (
+                database_id TEXT PRIMARY KEY,
+                version TEXT
+            );
+        "#).unwrap();
+        conn.execute(
+            "INSERT INTO nswallet_properties (database_id, version) VALUES ('test', ?)",
+            [CURRENT_VERSION],
+        ).unwrap();
+
+        // No labels table needed — migrations should bail out before touching it.
+        upgrade_database(&conn, CURRENT_VERSION).unwrap();
+
+        assert_eq!(get_database_version(&conn).unwrap(), CURRENT_VERSION);
     }
 
     #[test]

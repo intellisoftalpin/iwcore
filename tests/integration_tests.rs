@@ -111,9 +111,8 @@ fn test_properties() {
     println!("  Language: {}", props.lang);
     println!("  Encryption count: {}", props.encryption_count);
 
-    // Verify version is valid
-    let version: u32 = props.version.parse().unwrap_or(0);
-    assert!(version > 0 && version <= 4, "Version should be between 1 and 4");
+    // Verify version is current (matches iwcore::DB_VERSION).
+    assert_eq!(props.version, iwcore::DB_VERSION);
 }
 
 #[test]

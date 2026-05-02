@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use crate::error::{WalletError, Result};
 use crate::database::{Database, IWItem, IWField, IWLabel, IWProperties};
 use crate::database::queries::{self, parse_timestamp};
+use crate::database::migrations;
 use crate::crypto;
 use crate::utils::generate_database_id;
 use crate::{DATABASE_FILENAME, ROOT_ID, ROOT_PARENT_ID, DB_VERSION, ENCRYPTION_COUNT_DEFAULT};
@@ -33,7 +34,11 @@ pub struct Wallet {
 impl Wallet {
     /// Open a wallet from a folder
     ///
-    /// The folder should contain a `nswallet.dat` file.
+    /// The folder should contain a `nswallet.dat` file. Runs any pending
+    /// schema migrations as part of opening so that databases coming from
+    /// older app versions (whether on disk from an older install or freshly
+    /// imported via restore) get their schema and version field brought
+    /// up to `DB_VERSION` before any other code touches them.
     pub fn open(folder: &Path) -> Result<Self> {
         let db_path = folder.join(DATABASE_FILENAME);
 
@@ -44,6 +49,15 @@ impl Wallet {
         }
 
         let db = Database::open(&db_path)?;
+
+        // Apply pending migrations. Idempotent on already-current DBs.
+        // Migrations operate on plaintext schema and label rows, so they
+        // don't need the master password — safe to run pre-unlock.
+        {
+            let conn = db.connection()?;
+            let current = migrations::get_database_version(conn)?;
+            migrations::upgrade_database(conn, &current)?;
+        }
 
         Ok(Self {
             folder: folder.to_path_buf(),
@@ -365,6 +379,72 @@ pub(crate) mod tests {
         assert!(!wallet.is_unlocked());
         assert!(wallet.unlock("TestPassword123").unwrap());
         assert!(wallet.is_unlocked());
+    }
+
+    #[test]
+    fn test_open_migrates_old_database() {
+        // Simulate the "imported v4 backup" scenario: drop an old-version
+        // database file into a folder, then call Wallet::open() and confirm
+        // the version field is bumped without ever calling unlock().
+        use rusqlite::Connection;
+        let temp_dir = TempDir::new().unwrap();
+        let wallet = Wallet::create(temp_dir.path(), "TestPassword123", "en").unwrap();
+        let folder = temp_dir.path().to_path_buf();
+        drop(wallet);
+
+        // Force the version field back to "4" to simulate an older DB.
+        let db_path = folder.join(crate::DATABASE_FILENAME);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("UPDATE nswallet_properties SET version = ?", ["4"]).unwrap();
+        drop(conn);
+
+        // Re-open the wallet — migrations should run and bump the version.
+        let _ = Wallet::open(&folder).unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let v: String = conn
+            .query_row(
+                "SELECT version FROM nswallet_properties LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, DB_VERSION);
+
+        // SEED label (added by the v4→v5 migration) must now be present.
+        let seed_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nswallet_labels WHERE field_type = 'SEED'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seed_count, 1);
+    }
+
+    #[test]
+    fn test_open_no_op_on_current_database() {
+        // Open a fresh DB twice; the second open shouldn't change anything
+        // version-wise.
+        let temp_dir = TempDir::new().unwrap();
+        let wallet = Wallet::create(temp_dir.path(), "TestPassword123", "en").unwrap();
+        let folder = temp_dir.path().to_path_buf();
+        drop(wallet);
+
+        // Re-open — should be a no-op for migration purposes.
+        let _ = Wallet::open(&folder).unwrap();
+
+        use rusqlite::Connection;
+        let db_path = folder.join(crate::DATABASE_FILENAME);
+        let conn = Connection::open(&db_path).unwrap();
+        let v: String = conn
+            .query_row(
+                "SELECT version FROM nswallet_properties LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, DB_VERSION);
     }
 
     #[test]
