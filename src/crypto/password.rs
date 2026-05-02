@@ -95,6 +95,7 @@ impl Default for PasswordOptions {
 ///     uppercase: true,
 ///     digits: true,
 ///     special: false,
+///     avoid_ambiguous: false,
 ///     length: 12,
 /// };
 /// let password = generate_password(&options);
