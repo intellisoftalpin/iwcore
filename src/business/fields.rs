@@ -297,19 +297,24 @@ impl Wallet {
     }
 }
 
-/// Check if a date field is expired or expiring soon
+/// Check if a date field is expired or expiring soon. The wallet's
+/// canonical storage format for date values is compact `YYYYMMDD`
+/// (e.g. `20250625`); we also tolerate ISO `YYYY-MM-DD` so any
+/// legacy / hand-typed values still resolve. Unparseable input
+/// returns `(false, false)`.
 pub(crate) fn check_expiry(date_str: &str) -> (bool, bool) {
-    // Try to parse date in format YYYY-MM-DD
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-        let today = Utc::now().date_naive();
-        let days_until = (date - today).num_days();
+    let date = chrono::NaiveDate::parse_from_str(date_str.trim(), "%Y%m%d")
+        .or_else(|_| chrono::NaiveDate::parse_from_str(date_str.trim(), "%Y-%m-%d"));
 
-        let expired = days_until < 0;
-        let expiring = days_until >= 0 && days_until <= 30;
+    let Ok(date) = date else { return (false, false); };
 
-        return (expired, expiring);
-    }
-    (false, false)
+    let today = Utc::now().date_naive();
+    let days_until = (date - today).num_days();
+
+    let expired = days_until < 0;
+    let expiring = days_until >= 0 && days_until <= 30;
+
+    (expired, expiring)
 }
 
 #[cfg(test)]
@@ -431,27 +436,51 @@ mod tests {
         assert_eq!(fields[0].value, special_value);
     }
 
+    // The wallet stores date-value fields as compact `YYYYMMDD` (no
+    // separators). The expired/expiring flags must work against THAT
+    // exact format — every test below uses the canonical form. A
+    // separate test asserts the legacy ISO `YYYY-MM-DD` is still
+    // tolerated for backward compatibility.
+
     #[test]
-    fn test_check_expiry_expired() {
+    fn test_check_expiry_expired_compact() {
+        let yesterday = (Utc::now() - chrono::Duration::days(1)).format("%Y%m%d").to_string();
+        let (expired, expiring) = check_expiry(&yesterday);
+        assert!(expired, "yesterday should be expired");
+        assert!(!expiring, "yesterday is past, not expiring");
+    }
+
+    #[test]
+    fn test_check_expiry_expiring_soon_compact() {
+        let in_15_days = (Utc::now() + chrono::Duration::days(15)).format("%Y%m%d").to_string();
+        let (expired, expiring) = check_expiry(&in_15_days);
+        assert!(!expired);
+        assert!(expiring, "15 days out should fall in the 0..=30 expiring window");
+    }
+
+    #[test]
+    fn test_check_expiry_today_compact() {
+        let today = Utc::now().format("%Y%m%d").to_string();
+        let (expired, expiring) = check_expiry(&today);
+        assert!(!expired, "today is not yet expired");
+        assert!(expiring, "today (0 days remaining) is expiring");
+    }
+
+    #[test]
+    fn test_check_expiry_future_compact() {
+        let in_60_days = (Utc::now() + chrono::Duration::days(60)).format("%Y%m%d").to_string();
+        let (expired, expiring) = check_expiry(&in_60_days);
+        assert!(!expired);
+        assert!(!expiring, "60 days is well outside the 30-day window");
+    }
+
+    #[test]
+    fn test_check_expiry_legacy_iso_still_tolerated() {
+        // Pre-fix data may exist in `YYYY-MM-DD` form; confirm the
+        // function still resolves it.
         let yesterday = (Utc::now() - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
         let (expired, expiring) = check_expiry(&yesterday);
         assert!(expired);
-        assert!(!expiring);
-    }
-
-    #[test]
-    fn test_check_expiry_expiring_soon() {
-        let in_15_days = (Utc::now() + chrono::Duration::days(15)).format("%Y-%m-%d").to_string();
-        let (expired, expiring) = check_expiry(&in_15_days);
-        assert!(!expired);
-        assert!(expiring);
-    }
-
-    #[test]
-    fn test_check_expiry_future() {
-        let in_60_days = (Utc::now() + chrono::Duration::days(60)).format("%Y-%m-%d").to_string();
-        let (expired, expiring) = check_expiry(&in_60_days);
-        assert!(!expired);
         assert!(!expiring);
     }
 
@@ -460,6 +489,29 @@ mod tests {
         let (expired, expiring) = check_expiry("invalid");
         assert!(!expired);
         assert!(!expiring);
+        // Empty / partial / wrong-length numeric inputs must NOT be
+        // misread as a date.
+        for bad in ["", "2025", "20250", "20250230" /* 30 Feb */, "20251301" /* month 13 */] {
+            let (ex, exp) = check_expiry(bad);
+            assert!(!ex && !exp, "invalid input {bad:?} must yield (false, false)");
+        }
+    }
+
+    #[test]
+    fn test_check_expiry_via_get_fields_uses_compact_format() {
+        // End-to-end: store a YYYYMMDD value through the regular
+        // add_field path and verify get_fields_by_item surfaces the
+        // expired flag. Catches any regression that breaks the
+        // storage-format assumption upstream of `check_expiry`.
+        let (mut wallet, _temp) = create_test_wallet();
+        let item_id = wallet.add_item("Card", "card", false, None).unwrap();
+        let yesterday = (Utc::now() - chrono::Duration::days(1)).format("%Y%m%d").to_string();
+        wallet.add_field(&item_id, "EXPD", &yesterday, None).unwrap();
+
+        let fields = wallet.get_fields_by_item(&item_id).unwrap();
+        let expd = fields.iter().find(|f| f.field_type == "EXPD").unwrap();
+        assert!(expd.expired, "EXPD field with yesterday's date must be flagged expired");
+        assert!(!expd.expiring);
     }
 
     #[test]
