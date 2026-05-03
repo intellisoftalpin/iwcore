@@ -40,6 +40,7 @@ impl Wallet {
             ("2FAC", "2FA", "pass", "2fa"),
             ("SEED", "Seed Phrase", "text", "seed"),
             ("CVVC", "CVV", "pass", "cvv"),
+            ("WIFI", "Wi-Fi Password", "pass", "wifi"),
         ];
 
         for (field_type, name, value_type, icon) in system_labels {
@@ -165,7 +166,21 @@ mod tests {
     fn test_labels() {
         let (mut wallet, _temp) = create_test_wallet();
         let labels = wallet.get_labels().unwrap();
-        assert_eq!(labels.len(), 21); // System labels count
+        assert_eq!(labels.len(), 22); // System labels count
+    }
+
+    #[test]
+    fn test_wifi_label_present_with_correct_attributes() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let labels = wallet.get_labels().unwrap();
+        let wifi = labels
+            .iter()
+            .find(|l| l.field_type == "WIFI")
+            .expect("WIFI system label must be seeded on wallet creation");
+        assert_eq!(wifi.name, "Wi-Fi Password");
+        assert_eq!(wifi.value_type, "pass");
+        assert_eq!(wifi.icon, "wifi");
+        assert!(wifi.system, "WIFI must be a system label");
     }
 
     /// Test: CreateDeleteLabel from C# BusinessFixture
