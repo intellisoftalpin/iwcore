@@ -142,8 +142,16 @@ impl Wallet {
         Ok(())
     }
 
-    /// Move item to a new parent
+    /// Move item to a new parent. Refuses to move the root folder —
+    /// reparenting it orphans the entire tree and makes the wallet
+    /// unrecoverable.
     pub fn move_item(&mut self, item_id: &str, new_parent_id: &str) -> Result<()> {
+        if item_id == ROOT_ID {
+            return Err(WalletError::InvalidOperation(
+                "Cannot move the root folder".to_string(),
+            ));
+        }
+
         let conn = self.db.as_ref()
             .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
             .connection()?;
@@ -154,9 +162,18 @@ impl Wallet {
         Ok(())
     }
 
-    /// Delete an item (soft delete). If the item is a folder, cascades to all descendants.
+    /// Delete an item (soft delete). If the item is a folder, cascades
+    /// to all descendants. Refuses to delete the root folder — its
+    /// encrypted name is the wallet's password check, so removing it
+    /// makes subsequent unlocks fail.
     pub fn delete_item(&mut self, item_id: &str) -> Result<()> {
         self.ensure_unlocked()?;
+
+        if item_id == ROOT_ID {
+            return Err(WalletError::InvalidOperation(
+                "Cannot delete the root folder".to_string(),
+            ));
+        }
 
         // Check if item is a folder and cascade if needed
         let is_folder = self.get_item(item_id)?
@@ -872,5 +889,74 @@ mod tests {
         assert_eq!(item.parent_id.as_deref(), Some("__ROOT__"));
         assert!(item.folder);
         assert!(!item.deleted);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Root-folder protection
+    //
+    // The root folder (`item_id == ROOT_ID`) is structurally required:
+    // its encrypted name is what `unlock` decrypts as the password
+    // check. If a downstream consumer accidentally soft-deletes it and
+    // then calls `compact()`, the row vanishes from disk and the
+    // wallet becomes unrecoverable. These tests pin the library-level
+    // guards that prevent both delete and move on the root.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_delete_root_is_rejected() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let err = wallet.delete_item(ROOT_ID).unwrap_err();
+        match err {
+            WalletError::InvalidOperation(msg) => {
+                assert!(msg.to_lowercase().contains("root"));
+            }
+            other => panic!("expected InvalidOperation, got {other:?}"),
+        }
+        // Root must still exist and be reachable.
+        let root = wallet.get_item(ROOT_ID).unwrap();
+        assert!(root.is_some(), "root must remain after a rejected delete");
+        assert!(!root.unwrap().deleted);
+    }
+
+    #[test]
+    fn test_move_root_is_rejected() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder = wallet
+            .add_item("Folder", "folder", true, None)
+            .unwrap();
+        let err = wallet.move_item(ROOT_ID, &folder).unwrap_err();
+        match err {
+            WalletError::InvalidOperation(msg) => {
+                assert!(msg.to_lowercase().contains("root"));
+            }
+            other => panic!("expected InvalidOperation, got {other:?}"),
+        }
+        // Root parent_id is unchanged.
+        let root = wallet.get_item(ROOT_ID).unwrap().unwrap();
+        assert_eq!(root.parent_id.as_deref(), Some(crate::ROOT_PARENT_ID));
+    }
+
+    #[test]
+    fn test_root_survives_compact_after_delete_attempt() {
+        // Worst-case scenario: a buggy consumer attempts to delete root,
+        // then calls compact(). The wallet must still unlock with the
+        // original password afterwards.
+        use crate::DATABASE_FILENAME;
+        let (mut wallet, temp) = create_test_wallet();
+        let _ = wallet.delete_item(ROOT_ID); // rejected, but try
+        wallet.compact().unwrap();           // would normally purge soft-deleted
+        wallet.lock();
+        // Re-open the database file and unlock with the original password.
+        let folder = temp.path().to_path_buf();
+        drop(wallet);
+        // Sanity: file still on disk.
+        assert!(folder.join(DATABASE_FILENAME).exists());
+        let mut reopened = Wallet::open(&folder).unwrap();
+        let unlocked = reopened
+            .unlock("TestPassword123")
+            .expect("unlock must succeed because root row still exists");
+        assert!(unlocked, "password check must pass");
+        let root = reopened.get_item(ROOT_ID).unwrap();
+        assert!(root.is_some(), "root must survive a rejected delete + compact");
     }
 }
