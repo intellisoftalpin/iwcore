@@ -8,7 +8,10 @@ mod restore;
 // Re-export version checking functions
 pub use restore::{
     get_backup_db_version,
+    get_backup_db_version_in,
     is_backup_compatible,
+    is_backup_compatible_in,
+    check_backup_password_in,
     get_db_version,
     check_db_version,
 };

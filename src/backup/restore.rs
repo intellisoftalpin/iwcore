@@ -69,17 +69,42 @@ pub fn verify_backup(backup_path: &Path) -> Result<bool> {
     }
 }
 
-/// Check database version from a backup without fully restoring
+/// Create a temporary directory inside the given base folder.
+///
+/// On some platforms (notably Android/Pixel) the OS default temp location is
+/// not writable by the app sandbox, causing "permission denied". Callers can
+/// pass an app-controlled, writable base folder to avoid that.
+fn temp_dir_in(base: &Path) -> Result<tempfile::TempDir> {
+    fs::create_dir_all(base)
+        .map_err(|e| WalletError::BackupError(format!("Failed to create temp base folder: {}", e)))?;
+    tempfile::TempDir::new_in(base)
+        .map_err(|e| WalletError::BackupError(format!("Failed to create temp dir: {}", e)))
+}
+
+/// Check database version from a backup without fully restoring.
+///
+/// Uses the OS default temp location. Prefer [`get_backup_db_version_in`] on
+/// platforms where the default temp folder may not be writable.
 pub fn get_backup_db_version(backup_path: &Path) -> Result<String> {
-    use rusqlite::Connection;
     use tempfile::TempDir;
 
-    // Extract to temp location
     let temp_dir = TempDir::new()
         .map_err(|e| WalletError::BackupError(format!("Failed to create temp dir: {}", e)))?;
-    let db_path = extract_backup(backup_path, temp_dir.path())?;
+    db_version_from_extracted(backup_path, temp_dir.path())
+}
 
-    // Open and check version
+/// Check database version from a backup, extracting into the given temp base folder.
+pub fn get_backup_db_version_in(backup_path: &Path, temp_base: &Path) -> Result<String> {
+    let temp_dir = temp_dir_in(temp_base)?;
+    db_version_from_extracted(backup_path, temp_dir.path())
+}
+
+/// Extract a backup into `target` and read its database version.
+fn db_version_from_extracted(backup_path: &Path, target: &Path) -> Result<String> {
+    use rusqlite::Connection;
+
+    let db_path = extract_backup(backup_path, target)?;
+
     let conn = Connection::open(&db_path)
         .map_err(|e| WalletError::DatabaseError(format!("Failed to open database: {}", e)))?;
 
@@ -92,14 +117,38 @@ pub fn get_backup_db_version(backup_path: &Path) -> Result<String> {
     Ok(version)
 }
 
-/// Check if a backup's database version is compatible
+/// Check if a backup's database version is compatible.
+///
+/// Uses the OS default temp location. Prefer [`is_backup_compatible_in`] on
+/// platforms where the default temp folder may not be writable.
 pub fn is_backup_compatible(backup_path: &Path, current_version: &str) -> Result<bool> {
-    let backup_version = get_backup_db_version(backup_path)?;
+    compatible(get_backup_db_version(backup_path)?, current_version)
+}
+
+/// Check if a backup's database version is compatible, extracting into the
+/// given app-writable temp base folder.
+pub fn is_backup_compatible_in(backup_path: &Path, current_version: &str, temp_base: &Path) -> Result<bool> {
+    compatible(get_backup_db_version_in(backup_path, temp_base)?, current_version)
+}
+
+/// Compare a backup version string against the current version string.
+fn compatible(backup_version: String, current_version: &str) -> Result<bool> {
     let backup_v: u32 = backup_version.parse().unwrap_or(1);
     let current_v: u32 = current_version.parse().unwrap_or(4);
 
     // Backup version should be <= current version
     Ok(backup_v <= current_v)
+}
+
+/// Verify a password against a backup database, extracting into the given
+/// app-writable temp base folder.
+pub fn check_backup_password_in(backup_path: &Path, password: &str, temp_base: &Path) -> Result<bool> {
+    use crate::business::Wallet;
+
+    let temp_dir = temp_dir_in(temp_base)?;
+    extract_backup(backup_path, temp_dir.path())?;
+    let wallet = Wallet::open(temp_dir.path())?;
+    wallet.check_password(password)
 }
 
 /// Check database version directly from a database file (not a backup)
@@ -184,6 +233,30 @@ mod tests {
         assert!(db_path.exists());
         let content = fs::read_to_string(&db_path).unwrap();
         assert_eq!(content, "test database content");
+    }
+
+    #[test]
+    fn test_get_backup_db_version_in_uses_base() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = create_test_backup(temp_dir.path());
+
+        // App-controlled temp base that does not yet exist (must be created)
+        let base = temp_dir.path().join("app_temp").join("nested");
+        let version = get_backup_db_version_in(&backup_path, &base).unwrap();
+
+        // Dummy backup has no valid properties table → defaults to "1"
+        assert_eq!(version, "1");
+        assert!(base.exists(), "temp base folder should have been created");
+    }
+
+    #[test]
+    fn test_is_backup_compatible_in() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = create_test_backup(temp_dir.path());
+        let base = temp_dir.path().join("app_temp");
+
+        // version "1" backup is compatible with current "5"
+        assert!(is_backup_compatible_in(&backup_path, "5", &base).unwrap());
     }
 
     /// Test: CheckFutureVersionOfDb from C# BackupFixture
