@@ -66,8 +66,7 @@ pub fn parse_short_date(s: &str) -> Option<DateTime<Utc>> {
     let day: u32 = s[6..8].parse().ok()?;
 
     chrono::NaiveDate::from_ymd_opt(year, month, day)
-        .map(|d| d.and_hms_opt(0, 0, 0))
-        .flatten()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
         .map(|ndt| DateTime::from_naive_utc_and_offset(ndt, Utc))
 }
 

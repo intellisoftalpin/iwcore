@@ -3,7 +3,7 @@
 //! This module provides low-level query functions for database operations.
 //! For business-level operations, use the Wallet API.
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use chrono::{DateTime, Utc};
 use crate::error::Result;
 
@@ -96,6 +96,148 @@ pub fn set_db_version(conn: &Connection, version: &str) -> Result<()> {
     )?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
     Ok(())
+}
+
+/// Update the version field WITHOUT a WAL checkpoint. A `PRAGMA wal_checkpoint`
+/// cannot run inside an open write transaction, so the v5->v6 migration (which
+/// runs entirely in one transaction) uses this and checkpoints after COMMIT.
+pub fn set_db_version_no_checkpoint(conn: &Connection, version: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE nswallet_properties SET version = ?, update_timestamp = ?",
+        params![version, now_timestamp()],
+    )?;
+    Ok(())
+}
+
+// ============================================================================
+// v6 crypto key material (nswallet_crypto)
+// ============================================================================
+
+/// Per-vault key material for the v6 scheme. Single row (id = 1).
+#[derive(Debug, Clone)]
+pub struct CryptoRecord {
+    /// Cipher/scheme id (1 = XChaCha20-Poly1305 / Argon2id).
+    pub scheme: i64,
+    /// KDF identifier ("argon2id").
+    pub kdf: String,
+    /// Argon2id memory cost in KiB.
+    pub m_cost_kib: u32,
+    /// Argon2id time cost (iterations).
+    pub t_cost: u32,
+    /// Argon2id parallelism (lanes).
+    pub p_cost: u32,
+    /// Random KDF salt.
+    pub salt: Vec<u8>,
+    /// DEK wrapped (AEAD-encrypted) under the password-derived KEK.
+    pub dek_wrapped: Vec<u8>,
+}
+
+/// Create the crypto table if it does not exist (used by the migration on an
+/// existing v5 database). Safe to call repeatedly.
+pub fn ensure_crypto_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(crate::database::schema::CREATE_CRYPTO_TABLE)?;
+    Ok(())
+}
+
+/// Read the vault's crypto record. Returns `None` when the table is absent (a
+/// not-yet-migrated v5 vault) or empty.
+pub fn get_crypto_record(conn: &Connection) -> Result<Option<CryptoRecord>> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'nswallet_crypto'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(None);
+    }
+
+    let rec = conn
+        .query_row(
+            "SELECT scheme, kdf, kdf_m_cost, kdf_t_cost, kdf_p_cost, kdf_salt, dek_wrapped
+             FROM nswallet_crypto WHERE id = 1",
+            [],
+            |row| {
+                Ok(CryptoRecord {
+                    scheme: row.get(0)?,
+                    kdf: row.get(1)?,
+                    m_cost_kib: row.get::<_, i64>(2)? as u32,
+                    t_cost: row.get::<_, i64>(3)? as u32,
+                    p_cost: row.get::<_, i64>(4)? as u32,
+                    salt: row.get(5)?,
+                    dek_wrapped: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(rec)
+}
+
+/// Insert or replace the single crypto record. Does not checkpoint, so it is
+/// safe to call inside the migration transaction.
+pub fn set_crypto_record(conn: &Connection, rec: &CryptoRecord) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO nswallet_crypto
+         (id, scheme, kdf, kdf_m_cost, kdf_t_cost, kdf_p_cost, kdf_salt, dek_wrapped)
+         VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            rec.scheme,
+            rec.kdf,
+            rec.m_cost_kib as i64,
+            rec.t_cost as i64,
+            rec.p_cost as i64,
+            rec.salt,
+            rec.dek_wrapped
+        ],
+    )?;
+    Ok(())
+}
+
+/// Permanently remove a single item row. Used by the v5->v6 migration to purge
+/// soft-deleted records whose ciphertext is unreadable under the master
+/// password (pre-existing dead history the app never surfaced).
+pub fn hard_delete_item(conn: &Connection, item_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM nswallet_items WHERE item_id = ?", [item_id])?;
+    Ok(())
+}
+
+/// Permanently remove a single field row. See [`hard_delete_item`].
+pub fn hard_delete_field(conn: &Connection, item_id: &str, field_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM nswallet_fields WHERE item_id = ? AND field_id = ?",
+        params![item_id, field_id],
+    )?;
+    Ok(())
+}
+
+/// A raw item name blob row for migration: `(item_id, name, deleted)`.
+pub type ItemBlobRow = (String, Vec<u8>, bool);
+
+/// A raw field value blob row for migration: `(item_id, field_id, value, deleted)`.
+pub type FieldBlobRow = (String, String, Vec<u8>, bool);
+
+/// Every item name blob `(item_id, name, deleted)` for ALL rows, including the
+/// root item and soft-deleted items. Used by the v5->v6 re-encryption pass; the
+/// `deleted` flag lets the migration treat undecryptable active vs deleted rows
+/// differently.
+pub fn get_all_item_blobs(conn: &Connection) -> Result<Vec<ItemBlobRow>> {
+    let mut stmt = conn.prepare("SELECT item_id, name, deleted FROM nswallet_items")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Every field value blob `(item_id, field_id, value, deleted)` for ALL rows,
+/// including soft-deleted fields. Used by the v5->v6 re-encryption pass.
+pub fn get_all_field_blobs(conn: &Connection) -> Result<Vec<FieldBlobRow>> {
+    let mut stmt = conn.prepare("SELECT item_id, field_id, value, deleted FROM nswallet_fields")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)? != 0))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 // ============================================================================

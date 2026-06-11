@@ -101,9 +101,12 @@ fn test_read_fields() {
 
 #[test]
 fn test_properties() {
-    let (wallet, _temp_dir) = setup_test_wallet();
+    let (mut wallet, _temp_dir) = setup_test_wallet();
 
-    // Get properties (doesn't require unlock)
+    // Unlock so the legacy vault completes its v5->v6 crypto migration; only
+    // then is the version field bumped to the current DB_VERSION.
+    assert!(wallet.unlock(TEST_PASSWORD).unwrap());
+
     let props = wallet.get_properties().unwrap();
 
     println!("Database properties:");
@@ -111,7 +114,7 @@ fn test_properties() {
     println!("  Language: {}", props.lang);
     println!("  Encryption count: {}", props.encryption_count);
 
-    // Verify version is current (matches iwcore::DB_VERSION).
+    // Verify version is current (matches iwcore::DB_VERSION) after migration.
     assert_eq!(props.version, iwcore::DB_VERSION);
 }
 

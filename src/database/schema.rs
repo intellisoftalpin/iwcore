@@ -12,6 +12,24 @@ CREATE TABLE IF NOT EXISTS nswallet_properties (
 )
 "#;
 
+/// SQL to create the v6 crypto key-material table (single row, id = 1).
+///
+/// Holds the per-vault Argon2id parameters + salt and the password-wrapped DEK.
+/// New vaults get this on creation; v5 vaults get it created during the v5->v6
+/// migration. Item names and field values stay in their existing BLOB columns.
+pub const CREATE_CRYPTO_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS nswallet_crypto (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    scheme      INTEGER NOT NULL,
+    kdf         TEXT NOT NULL,
+    kdf_m_cost  INTEGER NOT NULL,
+    kdf_t_cost  INTEGER NOT NULL,
+    kdf_p_cost  INTEGER NOT NULL,
+    kdf_salt    BLOB NOT NULL,
+    dek_wrapped BLOB NOT NULL
+)
+"#;
+
 /// SQL to create the items table
 pub const CREATE_ITEMS_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS nswallet_items (
@@ -98,6 +116,7 @@ ORDER BY usage DESC
 /// All table creation statements in order
 pub const CREATE_ALL_TABLES: &[&str] = &[
     CREATE_PROPERTIES_TABLE,
+    CREATE_CRYPTO_TABLE,
     CREATE_ITEMS_TABLE,
     CREATE_FIELDS_TABLE,
     CREATE_LABELS_TABLE,

@@ -104,10 +104,15 @@ fn upgrade_to_v5(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Check if database version is compatible
+/// Check if database version is compatible (<= the current app DB version).
+///
+/// Note this is the full app version ([`crate::DB_VERSION`], 6), not the
+/// schema-migration ceiling [`CURRENT_VERSION`] (5): a v6 database is fully
+/// supported even though the password-free schema upgrader only reaches 5.
 pub fn is_version_compatible(version: &str) -> bool {
     let v: u32 = version.parse().unwrap_or(0);
-    v <= CURRENT_VERSION.parse::<u32>().unwrap_or(4)
+    let ceiling: u32 = crate::DB_VERSION.parse().unwrap_or(6);
+    v <= ceiling
 }
 
 /// Get the current database version from properties
@@ -141,9 +146,10 @@ mod tests {
         assert!(is_version_compatible("3"));
         assert!(is_version_compatible("4"));
         assert!(is_version_compatible("5"));
-        assert!(!is_version_compatible("6"));
+        assert!(is_version_compatible("6")); // current full DB version
+        assert!(!is_version_compatible("7"));
         assert!(!is_version_compatible("999"));
-        assert!(is_version_compatible("invalid")); // Parses to 0, which is <= 4
+        assert!(is_version_compatible("invalid")); // Parses to 0, which is <= 6
     }
 
     #[test]

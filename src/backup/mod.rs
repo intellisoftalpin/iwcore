@@ -107,21 +107,17 @@ impl BackupManager {
             let entry = entry?;
             let path = entry.path();
 
-            if path.is_file() {
-                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                    if (filename.starts_with(BACKUP_PREFIX) || filename.starts_with(BACKUP_PREFIX_LEGACY))
+            if path.is_file()
+                && let Some(filename) = path.file_name().and_then(|n| n.to_str())
+                    && (filename.starts_with(BACKUP_PREFIX) || filename.starts_with(BACKUP_PREFIX_LEGACY))
                         && filename.ends_with(".zip")
-                    {
-                        if let Some(info) = parse_backup_filename(filename, &path) {
+                        && let Some(info) = parse_backup_filename(filename, &path) {
                             backups.push(info);
                         }
-                    }
-                }
-            }
         }
 
         // Sort by timestamp, newest first
-        backups.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        backups.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
 
         Ok(backups)
     }

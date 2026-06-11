@@ -9,7 +9,7 @@ const TEST_CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz\
     0123456789_!@#$%^&*()<>,./?ЙЦУКЕНГШЩЗФЫВАПРОЛДЯЧСМИТЬБЮйцукенгшщзхъфывапролджэёячсмитьбю";
 
 fn random_string(len: usize) -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let chars: Vec<char> = TEST_CHARS.chars().collect();
     (0..len)
@@ -21,7 +21,7 @@ fn random_string(len: usize) -> String {
 /// 100 iterations, strings up to 100 chars
 #[test]
 fn test_stress_short_strings() {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
 
     for i in 0..100 {
@@ -32,10 +32,10 @@ fn test_stress_short_strings() {
         let plaintext = random_string(data_len);
 
         let encrypted = encrypt(&plaintext, &password, 0, None)
-            .expect(&format!("Encryption should succeed, iteration {}", i));
+            .unwrap_or_else(|_| panic!("Encryption should succeed, iteration {}", i));
 
         let decrypted = decrypt(&encrypted, &password, 0, None)
-            .expect(&format!("Decryption should succeed, iteration {}", i));
+            .unwrap_or_else(|_| panic!("Decryption should succeed, iteration {}", i));
 
         assert_eq!(decrypted, plaintext, "Mismatch at iteration {}", i);
     }
@@ -45,7 +45,7 @@ fn test_stress_short_strings() {
 /// 100 iterations, strings up to 1000 chars
 #[test]
 fn test_stress_long_strings() {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
 
     for i in 0..100 {
@@ -56,10 +56,10 @@ fn test_stress_long_strings() {
         let plaintext = random_string(data_len);
 
         let encrypted = encrypt(&plaintext, &password, 0, None)
-            .expect(&format!("Encryption should succeed, iteration {}", i));
+            .unwrap_or_else(|_| panic!("Encryption should succeed, iteration {}", i));
 
         let decrypted = decrypt(&encrypted, &password, 0, None)
-            .expect(&format!("Decryption should succeed, iteration {}", i));
+            .unwrap_or_else(|_| panic!("Decryption should succeed, iteration {}", i));
 
         assert_eq!(decrypted, plaintext, "Mismatch at iteration {}", i);
     }
@@ -69,7 +69,7 @@ fn test_stress_long_strings() {
 /// 10 iterations (reduced from 100), strings up to 60000 chars
 #[test]
 fn test_stress_huge_strings() {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
 
     // Reduced iterations for huge strings (C# had 100, we use 10 for test speed)
@@ -81,10 +81,10 @@ fn test_stress_huge_strings() {
         let plaintext = random_string(data_len);
 
         let encrypted = encrypt(&plaintext, &password, 0, None)
-            .expect(&format!("Encryption should succeed, iteration {}", i));
+            .unwrap_or_else(|_| panic!("Encryption should succeed, iteration {}", i));
 
         let decrypted = decrypt(&encrypted, &password, 0, None)
-            .expect(&format!("Decryption should succeed, iteration {}", i));
+            .unwrap_or_else(|_| panic!("Decryption should succeed, iteration {}", i));
 
         assert_eq!(decrypted, plaintext, "Mismatch at iteration {}", i);
     }

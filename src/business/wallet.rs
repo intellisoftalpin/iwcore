@@ -7,11 +7,37 @@ use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use crate::error::{WalletError, Result};
 use crate::database::{Database, IWItem, IWField, IWLabel, IWProperties};
-use crate::database::queries::{self, parse_timestamp};
+use crate::database::queries::{self, parse_timestamp, CryptoRecord};
 use crate::database::migrations;
 use crate::crypto;
+use crate::crypto::dek::DEK_LEN;
 use crate::utils::generate_database_id;
 use crate::{DATABASE_FILENAME, ROOT_ID, ROOT_PARENT_ID, DB_VERSION, ENCRYPTION_COUNT_DEFAULT};
+use rand::Rng;
+use zeroize::Zeroizing;
+
+/// Filename of the pre-migration snapshot kept (permanently) next to the
+/// database when a v5 vault is upgraded to v6. See `iwcore-hardening.md`.
+pub const PRE_V6_BACKUP_FILENAME: &str = "nswallet.pre-v6.bak";
+
+/// Scheme id stored in the crypto record (1 = XChaCha20-Poly1305 / Argon2id).
+const CRYPTO_SCHEME_V6: i64 = 1;
+
+/// KDF salt length in bytes.
+const KDF_SALT_LEN: usize = 16;
+
+/// In-memory state of an unlocked wallet. Holds the per-vault Data Encryption
+/// Key; zeroized on drop / lock.
+pub(crate) struct Unlocked {
+    dek: Zeroizing<[u8; DEK_LEN]>,
+}
+
+/// Draw `n` cryptographically random bytes from the OS CSPRNG.
+fn random_bytes(n: usize) -> Vec<u8> {
+    let mut v = vec![0u8; n];
+    rand::rng().fill_bytes(&mut v);
+    v
+}
 
 /// Main wallet interface
 pub struct Wallet {
@@ -19,9 +45,10 @@ pub struct Wallet {
     pub(crate) folder: PathBuf,
     /// Database connection
     pub(crate) db: Option<Database>,
-    /// Current password (when unlocked)
-    pub(crate) password: Option<String>,
-    /// Encryption iteration count
+    /// Unlocked state (holds the per-vault DEK) when unlocked, else None.
+    pub(crate) unlocked: Option<Unlocked>,
+    /// Legacy encryption iteration count. Used only to read pre-v6 data during
+    /// the one-time migration; ignored once the vault is v6.
     pub(crate) encryption_count: u32,
     /// Cached items (decrypted)
     pub(crate) items_cache: Option<Vec<IWItem>>,
@@ -62,7 +89,7 @@ impl Wallet {
         Ok(Self {
             folder: folder.to_path_buf(),
             db: Some(db),
-            password: None,
+            unlocked: None,
             encryption_count: ENCRYPTION_COUNT_DEFAULT,
             items_cache: None,
             fields_cache: None,
@@ -70,7 +97,8 @@ impl Wallet {
         })
     }
 
-    /// Create a new wallet in the specified folder
+    /// Create a new wallet in the specified folder. New wallets are born at the
+    /// current (v6) scheme; legacy crypto is never written.
     pub fn create(folder: &Path, password: &str, lang: &str) -> Result<Self> {
         std::fs::create_dir_all(folder)?;
 
@@ -80,84 +108,151 @@ impl Wallet {
         let mut wallet = Self {
             folder: folder.to_path_buf(),
             db: Some(db),
-            password: Some(password.to_string()),
-            encryption_count: 0, // New databases use 0
+            unlocked: None,
+            encryption_count: 0,
             items_cache: None,
             fields_cache: None,
             labels_cache: None,
         };
 
-        // Initialize the database with required data
         wallet.init_new_database(password, lang)?;
 
         Ok(wallet)
     }
 
-    /// Initialize a new database with properties and root item
+    /// Initialize a new (v6) database: properties, crypto record, root item,
+    /// system labels.
     fn init_new_database(&mut self, password: &str, lang: &str) -> Result<()> {
-        let conn = self.db.as_ref()
-            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
-            .connection()?;
+        // Generate fresh key material and wrap the DEK under the password.
+        let dek = crypto::dek::generate_dek();
+        let params = crypto::kdf::KdfParams::current();
+        let salt = random_bytes(KDF_SALT_LEN);
+        let kek = crypto::kdf::derive_kek(password.as_bytes(), &salt, params)
+            .map_err(WalletError::EncryptionError)?;
+        let dek_wrapped = crypto::dek::wrap_dek(&kek, &dek)
+            .map_err(WalletError::EncryptionError)?;
 
-        // Create properties
+        // Hold the DEK so the root item can be encrypted under it.
+        self.unlocked = Some(Unlocked { dek: Zeroizing::new(dek) });
+
         let db_id = generate_database_id();
-        queries::set_properties(conn, &db_id, lang, DB_VERSION, 0)?;
-
-        // Create root item with encrypted random string
         let root_data = crate::utils::generate_id(32);
-        let encrypted = crypto::encrypt(&root_data, password, 0, None)
-            .map_err(|e| WalletError::EncryptionError(e))?;
-        queries::create_item(conn, ROOT_ID, ROOT_PARENT_ID, &encrypted, "", true)?;
+        let encrypted_root = self.enc_value(&root_data)?;
 
-        // Add system labels
+        {
+            let conn = self.db.as_ref()
+                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+                .connection()?;
+
+            queries::set_properties(conn, &db_id, lang, DB_VERSION, 0)?;
+            queries::set_crypto_record(conn, &CryptoRecord {
+                scheme: CRYPTO_SCHEME_V6,
+                kdf: "argon2id".to_string(),
+                m_cost_kib: params.m_cost_kib,
+                t_cost: params.t_cost,
+                p_cost: params.p_cost,
+                salt,
+                dek_wrapped,
+            })?;
+            queries::create_item(conn, ROOT_ID, ROOT_PARENT_ID, &encrypted_root, "", true)?;
+        }
+
         self.add_system_labels()?;
 
         Ok(())
     }
 
-    /// Unlock the wallet with a password
+    /// Unlock the wallet with a password.
+    ///
+    /// For a v6 vault: derive the KEK with the stored Argon2id params and unwrap
+    /// the DEK (the AEAD tag is the password verifier). For a not-yet-migrated
+    /// v5 vault: verify the password against the legacy root item, then perform
+    /// the one-time v5->v6 migration before returning.
     pub fn unlock(&mut self, password: &str) -> Result<bool> {
-        // Try to decrypt the root item to verify password
-        let db = self.db.as_ref().ok_or(WalletError::DatabaseError(
-            "Database not open".to_string()
-        ))?;
-
-        let conn = db.connection()?;
-
-        // Get root item's encrypted name
-        let root_name = queries::get_root_item_raw(conn)?;
-
-        let Some(encrypted_name) = root_name else {
-            return Err(WalletError::DatabaseError("Root item not found".to_string()));
+        // Read all metadata up front into owned values so the immutable
+        // connection borrow is fully released before any mutation/migration.
+        let (props, crypto_rec, root_blob) = {
+            let conn = self.db.as_ref()
+                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+                .connection()?;
+            (
+                queries::get_properties(conn)?,
+                queries::get_crypto_record(conn)?,
+                queries::get_root_item_raw(conn)?,
+            )
         };
 
-        // Get encryption count from properties
-        if let Some(props) = queries::get_properties(conn)? {
-            self.encryption_count = props.email.parse().unwrap_or(ENCRYPTION_COUNT_DEFAULT);
-        }
+        self.encryption_count = props
+            .as_ref()
+            .and_then(|p| p.email.parse().ok())
+            .unwrap_or(ENCRYPTION_COUNT_DEFAULT);
 
-        // Try to decrypt
-        match crypto::decrypt(&encrypted_name, password, self.encryption_count, None) {
-            Ok(_) => {
-                self.password = Some(password.to_string());
-                self.clear_caches();
-                // Ensure any new system labels are added to existing wallets
-                self.add_system_labels()?;
-                Ok(true)
+        if let Some(rec) = crypto_rec {
+            // v6 vault: derive KEK from the stored params and unwrap the DEK.
+            match self.unwrap_with_password(&rec, password) {
+                Some(dek) => {
+                    self.unlocked = Some(Unlocked { dek: Zeroizing::new(dek) });
+                    self.clear_caches();
+                    self.add_system_labels()?;
+                    Ok(true)
+                }
+                None => Ok(false),
             }
-            Err(_) => Ok(false)
+        } else {
+            // Legacy v5 vault: verify against the root item, then migrate.
+            let Some(encrypted_name) = root_blob else {
+                return Err(WalletError::DatabaseError("Root item not found".to_string()));
+            };
+            if crypto::legacy::decrypt(&encrypted_name, password, self.encryption_count, None).is_err() {
+                return Ok(false);
+            }
+            // Password verified. Perform the one-time migration (sets the DEK).
+            self.migrate_v5_to_v6(password)?;
+            self.clear_caches();
+            self.add_system_labels()?;
+            Ok(true)
         }
     }
 
-    /// Lock the wallet
+    /// Derive the KEK from `password` using the record's stored params and try
+    /// to unwrap the DEK. Returns the DEK on success, `None` on wrong password.
+    fn unwrap_with_password(&self, rec: &CryptoRecord, password: &str) -> Option<[u8; DEK_LEN]> {
+        let params = crypto::kdf::KdfParams {
+            m_cost_kib: rec.m_cost_kib,
+            t_cost: rec.t_cost,
+            p_cost: rec.p_cost,
+        };
+        let kek = crypto::kdf::derive_kek(password.as_bytes(), &rec.salt, params).ok()?;
+        crypto::dek::unwrap_dek(&kek, &rec.dek_wrapped).ok()
+    }
+
+    /// Lock the wallet (zeroizes the in-memory DEK).
     pub fn lock(&mut self) {
-        self.password = None;
+        self.unlocked = None;
         self.clear_caches();
     }
 
     /// Check if the wallet is unlocked
     pub fn is_unlocked(&self) -> bool {
-        self.password.is_some()
+        self.unlocked.is_some()
+    }
+
+    /// Borrow the in-memory DEK, or error if locked.
+    fn dek(&self) -> Result<&[u8; DEK_LEN]> {
+        self.unlocked.as_ref().map(|u| &*u.dek).ok_or(WalletError::Locked)
+    }
+
+    /// AEAD-encrypt a plaintext value (item name / field value) under the DEK.
+    pub(crate) fn enc_value(&self, plaintext: &str) -> Result<Vec<u8>> {
+        crypto::aead::seal(self.dek()?, plaintext.as_bytes())
+            .map_err(WalletError::EncryptionError)
+    }
+
+    /// AEAD-decrypt a stored v6 blob under the DEK.
+    pub(crate) fn dec_value(&self, blob: &[u8]) -> Result<String> {
+        let pt = crypto::aead::open(self.dek()?, blob).map_err(WalletError::DecryptionError)?;
+        String::from_utf8(pt)
+            .map_err(|e| WalletError::DecryptionError(format!("invalid UTF-8: {e}")))
     }
 
     /// Close the wallet
@@ -180,29 +275,32 @@ impl Wallet {
         &self.folder
     }
 
-    /// Check password without unlocking
+    /// Check a password without unlocking or migrating. Works on both v6 vaults
+    /// (verify via DEK unwrap) and not-yet-migrated v5 vaults (verify via the
+    /// legacy root item). Read-only: never mutates the database.
     pub fn check_password(&self, password: &str) -> Result<bool> {
-        let db = self.db.as_ref().ok_or(WalletError::DatabaseError(
-            "Database not open".to_string()
-        ))?;
-
-        let conn = db.connection()?;
-
-        let root_name = queries::get_root_item_raw(conn)?;
-
-        let Some(encrypted_name) = root_name else {
-            return Err(WalletError::DatabaseError("Root item not found".to_string()));
+        let (props, crypto_rec, root_blob) = {
+            let conn = self.db.as_ref()
+                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+                .connection()?;
+            (
+                queries::get_properties(conn)?,
+                queries::get_crypto_record(conn)?,
+                queries::get_root_item_raw(conn)?,
+            )
         };
 
-        let encryption_count = if let Some(props) = queries::get_properties(conn)? {
-            props.email.parse().unwrap_or(ENCRYPTION_COUNT_DEFAULT)
+        if let Some(rec) = crypto_rec {
+            Ok(self.unwrap_with_password(&rec, password).is_some())
         } else {
-            self.encryption_count
-        };
-
-        match crypto::decrypt(&encrypted_name, password, encryption_count, None) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false)
+            let Some(encrypted_name) = root_blob else {
+                return Err(WalletError::DatabaseError("Root item not found".to_string()));
+            };
+            let encryption_count = props
+                .as_ref()
+                .and_then(|p| p.email.parse().ok())
+                .unwrap_or(ENCRYPTION_COUNT_DEFAULT);
+            Ok(crypto::legacy::decrypt(&encrypted_name, password, encryption_count, None).is_ok())
         }
     }
 
@@ -227,87 +325,183 @@ impl Wallet {
         })
     }
 
-    /// Change the wallet password (re-encrypts all data)
+    /// Change the wallet password.
+    ///
+    /// Under the v6 scheme this only re-wraps the DEK: a fresh salt + KEK are
+    /// derived from `new_password` and the same DEK is re-wrapped. The encrypted
+    /// item names and field values are NOT touched (they are under the DEK, not
+    /// the password), so this is fast and leaves all data blobs byte-identical.
     pub fn change_password(&mut self, new_password: &str) -> Result<bool> {
         self.ensure_unlocked()?;
 
-        let old_password = self.password.as_ref().unwrap().clone();
+        let dek = *self.dek()?;
+        let params = crypto::kdf::KdfParams::current();
+        let salt = random_bytes(KDF_SALT_LEN);
+        let kek = crypto::kdf::derive_kek(new_password.as_bytes(), &salt, params)
+            .map_err(WalletError::EncryptionError)?;
+        let dek_wrapped = crypto::dek::wrap_dek(&kek, &dek)
+            .map_err(WalletError::EncryptionError)?;
 
-        // Load all data first
-        self.load_items_if_needed()?;
-        self.load_fields_if_needed()?;
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+        queries::set_crypto_record(conn, &CryptoRecord {
+            scheme: CRYPTO_SCHEME_V6,
+            kdf: "argon2id".to_string(),
+            m_cost_kib: params.m_cost_kib,
+            t_cost: params.t_cost,
+            p_cost: params.p_cost,
+            salt,
+            dek_wrapped,
+        })?;
 
-        let items = self.items_cache.take().unwrap();
-        let fields = self.fields_cache.take().unwrap();
-        let encryption_count = self.encryption_count;
-
-        let db = self.db.as_mut()
-            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
-
-        db.begin_transaction()?;
-
-        let result = (|| -> Result<()> {
-            let conn = db.connection()?;
-
-            // Re-encrypt all active items
-            for item in &items {
-                let new_encrypted = crypto::encrypt(&item.name, new_password, encryption_count, None)
-                    .map_err(|e| WalletError::EncryptionError(e))?;
-                queries::update_item_name_only(conn, &item.item_id, &new_encrypted)?;
-            }
-
-            // Re-encrypt all active fields
-            for field in &fields {
-                let new_encrypted = crypto::encrypt(&field.value, new_password, encryption_count, None)
-                    .map_err(|e| WalletError::EncryptionError(e))?;
-                queries::update_field_value_only(conn, &field.item_id, &field.field_id, &new_encrypted)?;
-            }
-
-            // Re-encrypt deleted items
-            let deleted_items_raw = queries::get_deleted_items_raw(conn)?;
-            for raw in &deleted_items_raw {
-                if let Ok(name) = crypto::decrypt(&raw.name_encrypted, &old_password, encryption_count, None) {
-                    let new_encrypted = crypto::encrypt(&name, new_password, encryption_count, None)
-                        .map_err(|e| WalletError::EncryptionError(e))?;
-                    queries::update_item_name_only(conn, &raw.item_id, &new_encrypted)?;
-                }
-            }
-
-            // Re-encrypt deleted fields
-            let deleted_fields_raw = queries::get_deleted_fields_raw(conn)?;
-            for raw in &deleted_fields_raw {
-                if let Ok(value) = crypto::decrypt(&raw.value_encrypted, &old_password, encryption_count, None) {
-                    let new_encrypted = crypto::encrypt(&value, new_password, encryption_count, None)
-                        .map_err(|e| WalletError::EncryptionError(e))?;
-                    queries::update_field_value_only(conn, &raw.item_id, &raw.field_id, &new_encrypted)?;
-                }
-            }
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                db.commit_transaction()?;
-                self.password = Some(new_password.to_string());
-                self.clear_caches();
-                Ok(true)
-            }
-            Err(e) => {
-                db.rollback_transaction()?;
-                self.password = Some(old_password);
-                self.items_cache = Some(items);
-                self.fields_cache = Some(fields);
-                Err(e)
-            }
-        }
+        Ok(true)
     }
 
     /// Ensure wallet is unlocked
     pub(crate) fn ensure_unlocked(&self) -> Result<()> {
-        if self.password.is_none() {
+        if self.unlocked.is_none() {
             return Err(WalletError::Locked);
         }
+        Ok(())
+    }
+
+    /// Write a consistent pre-migration snapshot of the database to
+    /// `<folder>/nswallet.pre-v6.bak` using SQLite `VACUUM INTO`. Kept
+    /// permanently as a recovery anchor. Overwrites any stale snapshot (safe:
+    /// only called while the live DB is still an intact v5).
+    fn create_pre_v6_backup(&self) -> Result<()> {
+        let dst = self.folder.join(PRE_V6_BACKUP_FILENAME);
+        if dst.exists() {
+            std::fs::remove_file(&dst).map_err(|e| {
+                WalletError::BackupError(format!("Failed to remove stale pre-v6 backup: {e}"))
+            })?;
+        }
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+        conn.execute("VACUUM INTO ?", [dst.to_string_lossy().to_string()])
+            .map_err(|e| WalletError::BackupError(format!("Pre-v6 snapshot (VACUUM INTO) failed: {e}")))?;
+        Ok(())
+    }
+
+    /// One-time v5->v6 crypto migration. Precondition: the password has already
+    /// been verified against the legacy root item.
+    ///
+    /// Sequence (see `iwcore-hardening.md`): checkpoint, write a kept pre-v6
+    /// snapshot, then in a single transaction generate fresh key material,
+    /// re-encrypt every item name and field value (active, deleted, and root)
+    /// from the legacy scheme to the DEK AEAD scheme, write the crypto record,
+    /// and bump the version to 6. Any undecryptable blob aborts the whole
+    /// migration (rollback to intact v5). On success the DEK is held in memory.
+    fn migrate_v5_to_v6(&mut self, password: &str) -> Result<()> {
+        let enc_count = self.encryption_count;
+
+        // 1. Flush WAL so the live file is self-contained, then snapshot it.
+        self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .checkpoint()?;
+        self.create_pre_v6_backup()?;
+
+        // 2. Fresh key material; wrap the DEK under the password.
+        let dek = crypto::dek::generate_dek();
+        let params = crypto::kdf::KdfParams::current();
+        let salt = random_bytes(KDF_SALT_LEN);
+        let kek = crypto::kdf::derive_kek(password.as_bytes(), &salt, params)
+            .map_err(WalletError::EncryptionError)?;
+        let dek_wrapped = crypto::dek::wrap_dek(&kek, &dek)
+            .map_err(WalletError::EncryptionError)?;
+
+        // 3. Read every blob up front (owned), releasing the conn borrow.
+        let (item_blobs, field_blobs) = {
+            let conn = self.db.as_ref()
+                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+                .connection()?;
+            (queries::get_all_item_blobs(conn)?, queries::get_all_field_blobs(conn)?)
+        };
+
+        // 4. Re-encrypt everything inside a single transaction.
+        let db = self.db.as_mut()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
+        db.begin_transaction()?;
+
+        let result = (|| -> Result<()> {
+            let conn = db.connection()?;
+            queries::ensure_crypto_table(conn)?;
+
+            for (item_id, blob, deleted) in &item_blobs {
+                match crypto::legacy::decrypt(blob, password, enc_count, None) {
+                    Ok(plaintext) => {
+                        let new_blob = crypto::aead::seal(&dek, plaintext.as_bytes())
+                            .map_err(WalletError::EncryptionError)?;
+                        queries::update_item_name_only(conn, item_id, &new_blob)?;
+                    }
+                    Err(e) => {
+                        // An undecryptable ACTIVE record is real corruption: abort
+                        // and roll back to intact v5. An undecryptable SOFT-DELETED
+                        // record is pre-existing dead history that is unreadable
+                        // under the master password (the app never surfaced it), so
+                        // there is nothing to preserve: purge the row.
+                        if *deleted {
+                            queries::hard_delete_item(conn, item_id)?;
+                        } else {
+                            return Err(WalletError::DecryptionError(
+                                format!("active item {item_id}: {e}"),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            for (item_id, field_id, blob, deleted) in &field_blobs {
+                match crypto::legacy::decrypt(blob, password, enc_count, None) {
+                    Ok(plaintext) => {
+                        let new_blob = crypto::aead::seal(&dek, plaintext.as_bytes())
+                            .map_err(WalletError::EncryptionError)?;
+                        queries::update_field_value_only(conn, item_id, field_id, &new_blob)?;
+                    }
+                    Err(e) => {
+                        if *deleted {
+                            queries::hard_delete_field(conn, item_id, field_id)?;
+                        } else {
+                            return Err(WalletError::DecryptionError(
+                                format!("active field {item_id}/{field_id}: {e}"),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            queries::set_crypto_record(conn, &CryptoRecord {
+                scheme: CRYPTO_SCHEME_V6,
+                kdf: "argon2id".to_string(),
+                m_cost_kib: params.m_cost_kib,
+                t_cost: params.t_cost,
+                p_cost: params.p_cost,
+                salt: salt.clone(),
+                dek_wrapped: dek_wrapped.clone(),
+            })?;
+            queries::set_db_version_no_checkpoint(conn, DB_VERSION)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => db.commit_transaction()?,
+            Err(e) => {
+                db.rollback_transaction()?;
+                return Err(e);
+            }
+        }
+
+        // 5. Best-effort checkpoint so the on-disk file fully reflects the
+        // migrated state. The commit above is already durable (in the WAL), so a
+        // checkpoint failure must NOT fail the migration: SQLite will checkpoint
+        // automatically later. Making this fatal would surface a spurious error
+        // on an otherwise-successful, already-committed v6 migration.
+        let _ = self.db.as_ref().unwrap().checkpoint();
+
+        // 6. Hold the DEK: the vault is now unlocked under v6.
+        self.unlocked = Some(Unlocked { dek: Zeroizing::new(dek) });
         Ok(())
     }
 
@@ -385,7 +579,9 @@ pub(crate) mod tests {
     fn test_open_migrates_old_database() {
         // Simulate the "imported v4 backup" scenario: drop an old-version
         // database file into a folder, then call Wallet::open() and confirm
-        // the version field is bumped without ever calling unlock().
+        // the schema-migration version is bumped without ever calling unlock().
+        // open() only runs the password-free schema migrations (ceiling = 5);
+        // the crypto bump to v6 happens later in unlock().
         use rusqlite::Connection;
         let temp_dir = TempDir::new().unwrap();
         let wallet = Wallet::create(temp_dir.path(), "TestPassword123", "en").unwrap();
@@ -398,7 +594,7 @@ pub(crate) mod tests {
         conn.execute("UPDATE nswallet_properties SET version = ?", ["4"]).unwrap();
         drop(conn);
 
-        // Re-open the wallet — migrations should run and bump the version.
+        // Re-open the wallet — schema migrations should run and bump to 5.
         let _ = Wallet::open(&folder).unwrap();
 
         let conn = Connection::open(&db_path).unwrap();
@@ -409,7 +605,7 @@ pub(crate) mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(v, DB_VERSION);
+        assert_eq!(v, migrations::CURRENT_VERSION); // "5": schema-migrated, not yet crypto-migrated
 
         // SEED label (added by the v4→v5 migration) must now be present.
         let seed_count: i32 = conn
@@ -507,34 +703,38 @@ pub(crate) mod tests {
         assert!(!wallet.check_password("WrongPassword").unwrap());
     }
 
-    /// Creates a wallet encrypted with the given encryption_count.
-    /// Re-encrypts root item and updates DB properties accordingly.
+    /// Fabricates a genuine legacy (v5) vault encrypted with the given
+    /// encryption_count, so the legacy `check_password` path can be exercised.
+    /// Creates a fresh v6 wallet, recovers the root plaintext via its live DEK,
+    /// re-encrypts the root with the legacy scheme, drops the crypto record, and
+    /// marks the DB as version 5.
     fn create_wallet_with_encryption_count(encryption_count: u32) -> (TempDir, std::path::PathBuf) {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_path_buf();
         let password = "TestPassword123";
 
-        // Create wallet (encryption_count=0 by default)
         let wallet = Wallet::create(&path, password, "en").unwrap();
-        let db = wallet.db.as_ref().unwrap();
-        let conn = db.connection().unwrap();
 
-        // Re-encrypt root item with the target encryption_count
+        let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+
+        // Recover the root plaintext from its v6 blob using the live DEK.
         let root_raw = queries::get_root_item_raw(conn).unwrap().unwrap();
-        let plaintext = crypto::decrypt(&root_raw, password, 0, None).unwrap();
-        let new_encrypted = crypto::encrypt(&plaintext, password, encryption_count, None).unwrap();
+        let plaintext = wallet.dec_value(&root_raw).unwrap();
+
+        // Re-encrypt root with the legacy scheme at the target encryption_count.
+        let legacy_root = crypto::legacy::encrypt(&plaintext, password, encryption_count, None).unwrap();
         conn.execute(
             "UPDATE nswallet_items SET name = ? WHERE item_id = '__ROOT__'",
-            rusqlite::params![new_encrypted],
+            rusqlite::params![legacy_root],
         ).unwrap();
 
-        // Update stored encryption_count in properties
+        // Turn it into a real v5 vault: no crypto record, version 5, stored count.
+        conn.execute("DROP TABLE nswallet_crypto", []).unwrap();
         conn.execute(
-            "UPDATE nswallet_properties SET email = ?",
+            "UPDATE nswallet_properties SET version = '5', email = ?",
             rusqlite::params![encryption_count.to_string()],
         ).unwrap();
 
-        assert_eq!(wallet.get_properties().unwrap().encryption_count, encryption_count);
         drop(wallet);
         (temp_dir, path)
     }

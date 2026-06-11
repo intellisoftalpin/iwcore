@@ -26,3 +26,6 @@ lcov.info
 # Backup files
 *.orig
 *.bak
+
+# Internal security planning doc (not for GitHub or crates.io)
+/iwcore-hardening.md

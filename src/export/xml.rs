@@ -34,7 +34,7 @@ pub fn generate_xml(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
     out.push_str("  <items>\n");
 
     let mut entries: Vec<&IWItem> = items.iter().filter(|i| !i.deleted).collect();
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    entries.sort_by_key(|a| a.name.to_lowercase());
 
     for item in entries {
         let parent_attr = item.parent_id.as_deref().unwrap_or("");

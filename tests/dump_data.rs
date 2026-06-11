@@ -122,11 +122,11 @@ fn dump_main_database() {
 
     // Sort active items alphabetically (exclude ROOT)
     let mut active_items: Vec<_> = items.iter().filter(|i| !i.is_root()).collect();
-    active_items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    active_items.sort_by_key(|a| a.name.to_lowercase());
 
     // Sort deleted items alphabetically
     let mut sorted_deleted: Vec<_> = deleted_items.iter().collect();
-    sorted_deleted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    sorted_deleted.sort_by_key(|a| a.name.to_lowercase());
 
     // Build markdown
     let mut md = String::new();
@@ -285,6 +285,6 @@ fn dump_version_only(db_filename: &str) {
     ));
 
     let output_path = testdata_dir().join(format!("{}.md", db_filename));
-    fs::write(&output_path, &md).expect(&format!("Failed to write {}.md", db_filename));
+    fs::write(&output_path, &md).unwrap_or_else(|_| panic!("Failed to write {}.md", db_filename));
     println!("Wrote {}", output_path.display());
 }

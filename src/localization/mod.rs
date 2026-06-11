@@ -225,7 +225,7 @@ mod tests {
     fn test_all_languages_load() {
         for (code, _, _) in SUPPORTED_LANGUAGES {
             let mut tr = Translations::new().unwrap();
-            tr.set_language(code).expect(&format!("Failed to load language: {}", code));
+            tr.set_language(code).unwrap_or_else(|_| panic!("Failed to load language: {}", code));
             assert_eq!(tr.get_language(), *code);
         }
     }

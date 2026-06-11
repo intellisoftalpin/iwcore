@@ -8,7 +8,6 @@ use chrono::Utc;
 use crate::error::{WalletError, Result};
 use crate::database::{IWField, FieldValueUsage, queries};
 use crate::database::queries::parse_timestamp;
-use crate::crypto;
 use crate::utils::generate_field_id;
 use super::wallet::Wallet;
 
@@ -72,23 +71,20 @@ impl Wallet {
 
         // Ensure labels are loaded first
         self.load_labels_if_needed()?;
+        self.ensure_unlocked()?;
 
-        let password = self.password.as_ref()
-            .ok_or(WalletError::Locked)?
-            .clone();
-
-        let db = self.db.as_ref()
-            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
-
-        let conn = db.connection()?;
-        let raw_fields = queries::get_all_fields_raw(conn)?;
+        let raw_fields = {
+            let conn = self.db.as_ref()
+                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+                .connection()?;
+            queries::get_all_fields_raw(conn)?
+        };
 
         let labels = self.labels_cache.as_ref().unwrap();
         let mut fields = Vec::with_capacity(raw_fields.len());
 
         for raw in raw_fields {
-            let value = crypto::decrypt(&raw.value_encrypted, &password, self.encryption_count, None)
-                .map_err(|e| WalletError::DecryptionError(e))?;
+            let value = self.dec_value(&raw.value_encrypted)?;
 
             let label = labels.get(&raw.field_type);
             let (label_name, icon, value_type) = match label {
@@ -130,11 +126,9 @@ impl Wallet {
     pub fn add_field(&mut self, item_id: &str, field_type: &str, value: &str, sort_weight: Option<i32>) -> Result<String> {
         self.ensure_unlocked()?;
 
-        let password = self.password.as_ref().unwrap().clone();
         let field_id = generate_field_id();
 
-        let encrypted_value = crypto::encrypt(value, &password, self.encryption_count, None)
-            .map_err(|e| WalletError::EncryptionError(e))?;
+        let encrypted_value = self.enc_value(value)?;
 
         let conn = self.db.as_ref()
             .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
@@ -157,7 +151,9 @@ impl Wallet {
     pub fn update_field(&mut self, field_id: &str, value: &str, sort_weight: Option<i32>) -> Result<String> {
         self.ensure_unlocked()?;
 
-        let password = self.password.as_ref().unwrap().clone();
+        // Encrypt the new value up front (immutable borrow of the DEK) before
+        // taking the connection.
+        let encrypted_value = self.enc_value(value)?;
 
         let conn = self.db.as_ref()
             .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
@@ -167,16 +163,12 @@ impl Wallet {
         let old_field = queries::get_field_raw_by_id(conn, field_id)?
             .ok_or_else(|| WalletError::FieldNotFound(field_id.to_string()))?;
 
-        // If PASS type: copy old encrypted bytes directly to OLDP (no decrypt/re-encrypt needed)
-        if old_field.field_type == "PASS" {
-            if let Some(oldp_field_id) = queries::get_oldp_field_id(conn, &old_field.item_id)? {
+        // If PASS type: copy old encrypted bytes directly to OLDP. Both fields
+        // are encrypted under the same DEK, so the ciphertext is reusable as-is.
+        if old_field.field_type == "PASS"
+            && let Some(oldp_field_id) = queries::get_oldp_field_id(conn, &old_field.item_id)? {
                 queries::update_field_value_only(conn, &old_field.item_id, &oldp_field_id, &old_field.value_encrypted)?;
             }
-        }
-
-        // Encrypt new value
-        let encrypted_value = crypto::encrypt(value, &password, self.encryption_count, None)
-            .map_err(|e| WalletError::EncryptionError(e))?;
 
         // Generate new field_id
         let new_field_id = generate_field_id();
@@ -213,21 +205,18 @@ impl Wallet {
         // Ensure labels are loaded
         self.load_labels_if_needed()?;
 
-        let password = self.password.as_ref()
-            .ok_or(WalletError::Locked)?
-            .clone();
-
-        let db = self.db.as_ref()
-            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
-
-        let conn = db.connection()?;
-        let raw_fields = queries::get_deleted_fields_raw(conn)?;
+        let raw_fields = {
+            let conn = self.db.as_ref()
+                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+                .connection()?;
+            queries::get_deleted_fields_raw(conn)?
+        };
 
         let labels = self.labels_cache.as_ref().unwrap();
         let mut fields = Vec::with_capacity(raw_fields.len());
 
         for raw in raw_fields {
-            let value = match crypto::decrypt(&raw.value_encrypted, &password, self.encryption_count, None) {
+            let value = match self.dec_value(&raw.value_encrypted) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -312,7 +301,7 @@ pub(crate) fn check_expiry(date_str: &str) -> (bool, bool) {
     let days_until = (date - today).num_days();
 
     let expired = days_until < 0;
-    let expiring = days_until >= 0 && days_until <= 30;
+    let expiring = (0..=30).contains(&days_until);
 
     (expired, expiring)
 }

@@ -18,20 +18,20 @@
 //! per appended digit. Format-aware crackers benefit from knowing this
 //! structure. Use the random mode for high-value secrets.
 
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::rngs::{StdRng, SysRng};
+use rand::{RngExt, SeedableRng};
 
 use super::wordlist::WORDS;
 
 /// Build a fresh CSPRNG seeded from the OS entropy source.
 ///
-/// `StdRng` in rand 0.9 is a ChaCha12 stream cipher; `from_os_rng()` seeds
-/// it from `OsRng` (which on Apple platforms is `SecRandomCopyBytes`,
+/// `StdRng` in rand 0.10 is a ChaCha12 stream cipher; we seed it from `SysRng`
+/// (the OS entropy source: `SecRandomCopyBytes` on Apple platforms,
 /// `getrandom(2)` on modern Linux, `BCryptGenRandom` on Windows).
 /// We re-seed per call so password generation always reflects the current
-/// OS entropy state — never thread-local cached state.
+/// OS entropy state, never thread-local cached state.
 fn csprng() -> StdRng {
-    StdRng::from_os_rng()
+    StdRng::try_from_rng(&mut SysRng).expect("OS entropy source (SysRng) unavailable")
 }
 
 const LOWER_LETTERS: &str = "qwertyuiopasdfghjklzxcvbnm";
@@ -149,26 +149,22 @@ pub fn generate_password(options: &PasswordOptions) -> String {
     // symbol", etc.) demand this — without it a long random password can
     // randomly fail validation on, say, a banking site.
     let mut required: Vec<char> = Vec::new();
-    if options.lowercase {
-        if let Some(c) = pick_from_class(LOWER_LETTERS, options.avoid_ambiguous, &mut rng) {
+    if options.lowercase
+        && let Some(c) = pick_from_class(LOWER_LETTERS, options.avoid_ambiguous, &mut rng) {
             required.push(c);
         }
-    }
-    if options.uppercase {
-        if let Some(c) = pick_from_class(UPPER_LETTERS, options.avoid_ambiguous, &mut rng) {
+    if options.uppercase
+        && let Some(c) = pick_from_class(UPPER_LETTERS, options.avoid_ambiguous, &mut rng) {
             required.push(c);
         }
-    }
-    if options.digits {
-        if let Some(c) = pick_from_class(DIGITS, options.avoid_ambiguous, &mut rng) {
+    if options.digits
+        && let Some(c) = pick_from_class(DIGITS, options.avoid_ambiguous, &mut rng) {
             required.push(c);
         }
-    }
-    if options.special {
-        if let Some(c) = pick_from_class(SPECIAL_SYMBOLS, options.avoid_ambiguous, &mut rng) {
+    if options.special
+        && let Some(c) = pick_from_class(SPECIAL_SYMBOLS, options.avoid_ambiguous, &mut rng) {
             required.push(c);
         }
-    }
 
     // If the user asked for a length shorter than the number of selected
     // classes, shuffle the required chars and truncate. (Practically

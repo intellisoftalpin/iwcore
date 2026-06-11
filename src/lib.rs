@@ -48,8 +48,13 @@ pub use crypto::{
 pub use export::{ExportItemType, PDFItemModel};
 pub use database::queries::DatabaseStats;
 
-/// Database version constant
-pub const DB_VERSION: &str = "5";
+/// Database version constant.
+///
+/// Version 6 = schema 5 plus the v6 crypto scheme (XChaCha20-Poly1305 over a
+/// per-vault DEK wrapped by Argon2id). Password-free schema migrations on
+/// `open()` only reach version 5 (see `migrations::CURRENT_VERSION`); the bump
+/// to 6 happens inside `unlock()` after the one-time crypto re-encryption.
+pub const DB_VERSION: &str = "6";
 
 /// Root item ID
 pub const ROOT_ID: &str = "__ROOT__";

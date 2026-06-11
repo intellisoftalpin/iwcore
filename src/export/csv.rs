@@ -35,7 +35,7 @@ pub fn generate_csv(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
     out.push_str(HEADER);
 
     let mut entries: Vec<&IWItem> = items.iter().filter(|i| !i.deleted).collect();
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    entries.sort_by_key(|a| a.name.to_lowercase());
 
     for item in entries {
         let path = compute_path(item, &items_map);

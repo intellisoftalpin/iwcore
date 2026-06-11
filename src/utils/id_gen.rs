@@ -1,6 +1,6 @@
 //! ID generation utilities
 
-use rand::Rng;
+use rand::RngExt;
 
 /// Characters used for ID generation
 const ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";

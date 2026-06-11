@@ -156,7 +156,7 @@ pub fn generate_pdf(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
         .iter()
         .filter(|item| !item.deleted && !item.folder)
         .collect();
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    entries.sort_by_key(|a| a.name.to_lowercase());
 
     // -- Compact header --
     let title_style = Style::new().bold().with_font_size(14);
@@ -266,6 +266,7 @@ pub fn generate_pdf(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
 }
 
 /// Build a single entry card as a LinearLayout.
+#[allow(clippy::too_many_arguments)]
 fn build_card(
     item: &IWItem,
     fields_by_item: &HashMap<String, Vec<&IWField>>,
@@ -485,10 +486,8 @@ mod tests {
 
     #[test]
     fn test_compute_path_root_parent() {
-        let items = vec![
-            make_item("__ROOT__", "Root", None, true, false),
-            make_item("item1", "Entry", Some("__ROOT__"), false, false),
-        ];
+        let items = [make_item("__ROOT__", "Root", None, true, false),
+            make_item("item1", "Entry", Some("__ROOT__"), false, false)];
         let items_map: HashMap<&str, &IWItem> = items.iter().map(|i| (i.item_id.as_str(), i)).collect();
         let path = compute_path(&items[1], &items_map);
         assert_eq!(path, "");
@@ -496,11 +495,9 @@ mod tests {
 
     #[test]
     fn test_compute_path_one_level() {
-        let items = vec![
-            make_item("__ROOT__", "Root", None, true, false),
+        let items = [make_item("__ROOT__", "Root", None, true, false),
             make_item("folder1", "Banking", Some("__ROOT__"), true, false),
-            make_item("item1", "Entry", Some("folder1"), false, false),
-        ];
+            make_item("item1", "Entry", Some("folder1"), false, false)];
         let items_map: HashMap<&str, &IWItem> = items.iter().map(|i| (i.item_id.as_str(), i)).collect();
         let path = compute_path(&items[2], &items_map);
         assert_eq!(path, "Banking");
@@ -508,12 +505,10 @@ mod tests {
 
     #[test]
     fn test_compute_path_two_levels() {
-        let items = vec![
-            make_item("__ROOT__", "Root", None, true, false),
+        let items = [make_item("__ROOT__", "Root", None, true, false),
             make_item("folder1", "Banking", Some("__ROOT__"), true, false),
             make_item("folder2", "Credit Cards", Some("folder1"), true, false),
-            make_item("item1", "Visa", Some("folder2"), false, false),
-        ];
+            make_item("item1", "Visa", Some("folder2"), false, false)];
         let items_map: HashMap<&str, &IWItem> = items.iter().map(|i| (i.item_id.as_str(), i)).collect();
         let path = compute_path(&items[3], &items_map);
         assert_eq!(path, "Banking / Credit Cards");
@@ -521,9 +516,7 @@ mod tests {
 
     #[test]
     fn test_compute_path_missing_parent() {
-        let items = vec![
-            make_item("item1", "Entry", Some("nonexistent"), false, false),
-        ];
+        let items = [make_item("item1", "Entry", Some("nonexistent"), false, false)];
         let items_map: HashMap<&str, &IWItem> = items.iter().map(|i| (i.item_id.as_str(), i)).collect();
         let path = compute_path(&items[0], &items_map);
         assert_eq!(path, "");
@@ -531,9 +524,7 @@ mod tests {
 
     #[test]
     fn test_compute_path_no_parent() {
-        let items = vec![
-            make_item("item1", "Entry", None, false, false),
-        ];
+        let items = [make_item("item1", "Entry", None, false, false)];
         let items_map: HashMap<&str, &IWItem> = items.iter().map(|i| (i.item_id.as_str(), i)).collect();
         let path = compute_path(&items[0], &items_map);
         assert_eq!(path, "");

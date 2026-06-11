@@ -6,7 +6,6 @@ use chrono::Utc;
 use crate::error::{WalletError, Result};
 use crate::database::{IWItem, queries};
 use crate::database::queries::parse_timestamp;
-use crate::crypto;
 use crate::utils::generate_item_id;
 use crate::ROOT_ID;
 use super::wallet::Wallet;
@@ -52,21 +51,19 @@ impl Wallet {
             return Ok(());
         }
 
-        let password = self.password.as_ref()
-            .ok_or(WalletError::Locked)?
-            .clone();
+        self.ensure_unlocked()?;
 
-        let db = self.db.as_ref()
-            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
-
-        let conn = db.connection()?;
-        let raw_items = queries::get_all_items_raw(conn)?;
+        let raw_items = {
+            let conn = self.db.as_ref()
+                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+                .connection()?;
+            queries::get_all_items_raw(conn)?
+        };
 
         let mut items = Vec::with_capacity(raw_items.len());
 
         for raw in raw_items {
-            let name = crypto::decrypt(&raw.name_encrypted, &password, self.encryption_count, None)
-                .map_err(|e| WalletError::DecryptionError(e))?;
+            let name = self.dec_value(&raw.name_encrypted)?;
 
             items.push(IWItem {
                 item_id: raw.item_id,
@@ -94,12 +91,10 @@ impl Wallet {
     pub fn add_item(&mut self, name: &str, icon: &str, folder: bool, parent_id: Option<&str>) -> Result<String> {
         self.ensure_unlocked()?;
 
-        let password = self.password.as_ref().unwrap().clone();
         let item_id = generate_item_id();
         let parent = parent_id.unwrap_or(ROOT_ID);
 
-        let encrypted_name = crypto::encrypt(name, &password, self.encryption_count, None)
-            .map_err(|e| WalletError::EncryptionError(e))?;
+        let encrypted_name = self.enc_value(name)?;
 
         let conn = self.db.as_ref()
             .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
@@ -115,10 +110,7 @@ impl Wallet {
     pub fn update_item_name(&mut self, item_id: &str, name: &str) -> Result<()> {
         self.ensure_unlocked()?;
 
-        let password = self.password.as_ref().unwrap().clone();
-
-        let encrypted_name = crypto::encrypt(name, &password, self.encryption_count, None)
-            .map_err(|e| WalletError::EncryptionError(e))?;
+        let encrypted_name = self.enc_value(name)?;
 
         let conn = self.db.as_ref()
             .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
@@ -199,20 +191,17 @@ impl Wallet {
     pub fn get_deleted_items(&mut self) -> Result<Vec<IWItem>> {
         self.ensure_unlocked()?;
 
-        let password = self.password.as_ref()
-            .ok_or(WalletError::Locked)?
-            .clone();
-
-        let db = self.db.as_ref()
-            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
-
-        let conn = db.connection()?;
-        let raw_items = queries::get_deleted_items_raw(conn)?;
+        let raw_items = {
+            let conn = self.db.as_ref()
+                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+                .connection()?;
+            queries::get_deleted_items_raw(conn)?
+        };
 
         let mut items = Vec::with_capacity(raw_items.len());
 
         for raw in raw_items {
-            let name = match crypto::decrypt(&raw.name_encrypted, &password, self.encryption_count, None) {
+            let name = match self.dec_value(&raw.name_encrypted) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
