@@ -156,4 +156,13 @@ mod tests {
         assert!(!is_v6_blob(&legacy));
         assert!(open(&KEY, &legacy).is_err());
     }
+
+    #[test]
+    fn wrong_tag_but_long_enough_is_rejected() {
+        // Long enough to pass the length check, but the leading byte is not the
+        // v6 format tag (exercises the tag-mismatch branch, not the length one).
+        let blob = vec![0u8; MIN_BLOB_LEN + 4];
+        assert!(!is_v6_blob(&blob));
+        assert!(open(&KEY, &blob).is_err());
+    }
 }

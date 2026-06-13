@@ -111,4 +111,12 @@ mod tests {
         let k = derive_kek(b"pw", b"0123456789abcdef", fast()).unwrap();
         assert_eq!(k.len(), KEK_LEN);
     }
+
+    #[test]
+    fn invalid_params_return_error() {
+        // Argon2 requires m_cost >= 8 * p_cost; m_cost_kib = 1 is invalid and
+        // must surface as an error rather than panic.
+        let bad = KdfParams { m_cost_kib: 1, t_cost: 1, p_cost: 1 };
+        assert!(derive_kek(b"pw", b"0123456789abcdef", bad).is_err());
+    }
 }

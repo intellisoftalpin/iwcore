@@ -77,4 +77,13 @@ mod tests {
         wrapped[last] ^= 0x01;
         assert!(unwrap_dek(&kek, &wrapped).is_err());
     }
+
+    #[test]
+    fn unwrap_rejects_wrong_length_payload() {
+        // A correctly-authenticated blob whose plaintext is NOT 32 bytes must be
+        // rejected as a DEK (exercises the length guard, not the auth guard).
+        let kek = [5u8; KEY_LEN];
+        let blob = aead::seal(&kek, &[1u8; 10]).unwrap();
+        assert!(unwrap_dek(&kek, &blob).is_err());
+    }
 }
