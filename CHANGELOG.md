@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.2
+
+### Documentation & maintenance
+
+- Aligned the README and crate-level docs with the 0.2.x encryption scheme
+  (XChaCha20-Poly1305 + Argon2id): corrected the description, added a Security
+  section covering the authenticated-encryption model and the transparent,
+  crash-safe migration, and refreshed the password-change and
+  password-generation examples.
+- Added links to IntelliWallet (the password manager built on this library) and
+  its Google Play / App Store listings.
+- Upgraded CI to current GitHub Actions majors (`actions/checkout@v5`,
+  `codecov/codecov-action@v5`) to clear the Node.js 20 deprecation warnings.
+
 ## 0.2.0
 
 ### Security: new authenticated encryption scheme (v6)

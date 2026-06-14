@@ -6,21 +6,59 @@
 [![CI](https://github.com/intellisoftalpin/iwcore/actions/workflows/ci.yml/badge.svg)](https://github.com/intellisoftalpin/iwcore/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/intellisoftalpin/iwcore/branch/main/graph/badge.svg)](https://codecov.io/gh/intellisoftalpin/iwcore)
 
-**IntelliWallet Core** - A secure password manager library with AES-256 encryption.
+**IntelliWallet Core** (`iwcore`) is an open-source **Rust password manager library**: a small, embeddable engine for building secure password managers and digital vaults. It bundles authenticated encryption (**XChaCha20-Poly1305 + Argon2id**), encrypted SQLite storage, backups, search, and password generation behind a clean API.
+
+It is the storage and cryptography engine behind **[IntelliWallet](https://intelliwallet.io/)**, a free cross-platform password manager available on [Google Play](https://play.google.com/store/apps/details?id=com.nyxbull.nswallet) and the [App Store](https://apps.apple.com/app/intelliwallet/id6744400972).
+
+The core is **open by design**: anyone can audit exactly how IntelliWallet protects your data, and anyone can use `iwcore` to build their own client or an alternative to IntelliWallet.
+
+## Contents
+
+- [Features](#features)
+- [Security](#security)
+- [Open Source](#open-source)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Usage](#opening-an-existing-wallet)
+- [Field Types](#field-types)
+- [Supported Languages](#supported-languages)
+- [License](#license)
 
 ## Features
 
-- **AES-256-CBC Encryption** - Industry-standard encryption with PKCS7 padding
+- **Authenticated Encryption** - XChaCha20-Poly1305 (AEAD) over a per-vault Data Encryption Key, wrapped by an Argon2id-derived key; unique nonce per value and built-in tamper detection
 - **SQLite Storage** - Reliable database storage with full ACID compliance
 - **Hierarchical Organization** - Organize items in folders with drag-and-drop support
 - **Custom Field Types** - 20 built-in field types (email, password, credit card, etc.) plus custom labels
 - **Delete & Restore** - Soft-delete with full undo capability for items and fields
 - **Backup & Restore** - ZIP-based backup with versioning, auto-cleanup, and integrity verification
 - **Multi-language Support** - 11 languages included
-- **Password Generator** - Random and pattern-based password generation
+- **Password Generator** - Random, pattern-based, and memorable password generation
 - **Search** - Full-text search across item names and field values
 - **Export** - Data export with PDF item model support
 - **Database Maintenance** - Compact/optimize database by purging deleted records
+
+## Security
+
+iwcore protects item names and field values with modern authenticated encryption:
+
+- **XChaCha20-Poly1305 (AEAD)** encrypts every value with a unique random nonce, so identical plaintext never yields identical ciphertext, and any tampering is detected on decryption.
+- **Per-vault Data Encryption Key (DEK).** A random 256-bit DEK encrypts all data. The DEK is stored wrapped (encrypted) under a Key Encryption Key derived from the master password with **Argon2id** (memory-hard, per-vault random salt, parameters stored per vault). Password verification is simply "can we unwrap the DEK", so there is no separate verifier to attack.
+- **Cheap password changes and future hardening.** Changing the master password (or raising the Argon2id cost in a future release) only re-wraps the DEK; stored data is never re-encrypted.
+- **In-memory keys are zeroized** when the wallet is locked or dropped.
+- **Newly created vaults are born with this scheme.**
+
+## Open Source
+
+We believe the security of a password manager should be **verifiable, not taken on trust**. That is why the core of IntelliWallet is open source:
+
+- **Auditable.** Anyone can read exactly how vaults are encrypted, how keys are derived, and how data is stored. No black boxes around your passwords, security through transparency, not obscurity.
+- **Reusable.** `iwcore` is a standalone, MIT-licensed library. You are free to use it to build your own password manager or an alternative client to IntelliWallet.
+- **Improvable.** Anyone can propose enhancements, open a pull request, or fork the project. The library grows with its community.
+- **Yours for the long run.** Because the storage format and cryptography are open, you can always recover and use your data independently, regardless of the future of the IntelliWallet app or [IntelliSoftAlpin eG](https://intellisoftalpin.com). Your vault outlives any single product or company.
+- **Standard cryptography.** We rely on well-reviewed primitives from the Rust community (XChaCha20-Poly1305, Argon2id) rather than home-grown schemes.
+
+Found a security issue? Responsible disclosure is appreciated, please open an issue or get in touch.
 
 ## Installation
 
@@ -28,7 +66,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-iwcore = "0.1.11"
+iwcore = "0.2.2"
 ```
 
 Or use cargo:
@@ -115,7 +153,7 @@ let (purged_items, purged_fields) = wallet.compact()?;
 ## Password Management
 
 ```rust
-// Change wallet password (re-encrypts all data including deleted records)
+// Change wallet password (re-wraps the data key; stored data is untouched, effectively instant)
 wallet.change_password("new_secure_password")?;
 
 // Check password without unlocking
@@ -130,7 +168,10 @@ wallet.unlock("my_password")?;
 ## Password Generation
 
 ```rust
-use iwcore::{generate_password, generate_clever_password, PasswordOptions};
+use iwcore::{
+    generate_password, generate_clever_password, generate_memorable_password,
+    PasswordOptions, MemorableOptions, MemorableCaps,
+};
 
 // Random password with options
 let options = PasswordOptions {
@@ -144,6 +185,15 @@ let password = generate_password(&options);
 
 // Pattern-based password (A=uppercase, a=lowercase, 0=digit, @=special)
 let password = generate_clever_password("Aaaa0000@@");
+
+// Memorable password, e.g. "Garden7-River4-Maple2-Stone9"
+let memorable = generate_memorable_password(&MemorableOptions {
+    num_words: 4,
+    digits_per_word: 1,
+    separator: "-".to_string(),
+    prefix: String::new(),
+    caps: MemorableCaps::First,
+});
 ```
 
 ## Backup & Restore
@@ -172,6 +222,9 @@ backup_mgr.restore_backup(&backup_path, Path::new("./restored.dat"))?;
 backup_mgr.cleanup_old_backups(5)?;
 backup_mgr.cleanup_auto_backups(3, 30)?;
 ```
+
+Backups carry the database version, so newer backups are correctly rejected by older
+versions, while newer versions can read and migrate older backups on restore.
 
 ## Custom Labels
 
@@ -234,6 +287,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Links
 
-- [Homepage](https://intelliwallet.io)
+- [IntelliWallet](https://intelliwallet.io/) - the password manager built on this library
+- [IntelliWallet on Google Play](https://play.google.com/store/apps/details?id=com.nyxbull.nswallet)
+- [IntelliWallet on the App Store](https://apps.apple.com/app/intelliwallet/id6744400972)
 - [Documentation](https://docs.rs/iwcore)
 - [Repository](https://github.com/intellisoftalpin/iwcore)
+- [IntelliSoftAlpin eG](https://intellisoftalpin.com) - the company behind IntelliWallet

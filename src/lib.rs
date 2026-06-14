@@ -1,10 +1,16 @@
 //! # IntelliWallet Core
 //!
-//! A secure password manager library with AES-256 encryption.
+//! A secure password manager library with authenticated encryption
+//! (XChaCha20-Poly1305 + Argon2id).
+//!
+//! This is the storage and cryptography engine behind
+//! [IntelliWallet](https://intelliwallet.io/).
 //!
 //! ## Features
 //!
-//! - AES-256-CBC encryption with PKCS7 padding
+//! - Authenticated encryption: XChaCha20-Poly1305 over a per-vault Data
+//!   Encryption Key, wrapped by an Argon2id-derived key
+//! - Transparent, crash-safe migration of older vaults on first unlock
 //! - SQLite database storage
 //! - Hierarchical item organization (folders)
 //! - Custom field types and labels

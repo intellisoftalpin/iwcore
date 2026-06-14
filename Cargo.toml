@@ -1,6 +1,6 @@
 [package]
 name = "iwcore"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -9,9 +9,10 @@ homepage = "https://intelliwallet.io"
 documentation = "https://docs.rs/iwcore"
 authors = ["IntelliSoftAlpin"]
 description = "IntelliWallet Core - Password manager library with authenticated encryption"
-keywords = ["password-manager", "encryption", "argon2", "security"]
+keywords = ["password-manager", "encryption", "argon2", "security", "vault"]
 categories = ["cryptography", "database"]
 readme = "README.md"
+exclude = ["docs"]
 
 [dependencies]
 # Database

@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>iwcore - IntelliWallet Core | Open-source Rust password manager library</title>
+<meta name="description" content="iwcore is the open-source Rust library powering IntelliWallet: authenticated encryption (XChaCha20-Poly1305 + Argon2id), encrypted SQLite storage, backups, search and password generation. Audit it or build your own client." />
+<meta name="keywords" content="password manager, Rust, library, encryption, XChaCha20-Poly1305, Argon2id, open source, vault, IntelliWallet, security" />
+<meta name="author" content="IntelliSoftAlpin" />
+<link rel="canonical" href="https://intellisoftalpin.github.io/iwcore/" />
+
+<!-- Open Graph / social -->
+<meta property="og:type" content="website" />
+<meta property="og:title" content="iwcore - IntelliWallet Core" />
+<meta property="og:description" content="The open-source Rust library powering IntelliWallet. Authenticated encryption, encrypted storage, backups and password generation. Audit it or build your own client." />
+<meta property="og:url" content="https://intellisoftalpin.github.io/iwcore/" />
+<meta property="og:site_name" content="IntelliWallet Core" />
+<!-- Social preview image. Place og-image.png (1200x630) next to this file. -->
+<meta property="og:image" content="https://intellisoftalpin.github.io/iwcore/og-image.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="IntelliWallet Core - open-source Rust password manager library" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="iwcore - IntelliWallet Core" />
+<meta name="twitter:description" content="The open-source Rust library powering IntelliWallet. Authenticated encryption, encrypted storage and more." />
+<meta name="twitter:image" content="https://intellisoftalpin.github.io/iwcore/og-image.png" />
+
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-soft: #161b22;
+    --card: #1b2230;
+    --border: #2a3140;
+    --text: #e6edf3;
+    --muted: #9aa7b4;
+    --accent: #4f8cff;
+    --accent-2: #36d6a0;
+    --radius: 14px;
+    --maxw: 980px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 22px; }
+
+  /* Hero */
+  header {
+    background:
+      radial-gradient(1100px 500px at 50% -120px, rgba(79,140,255,0.22), transparent 60%),
+      linear-gradient(180deg, #0f1626, var(--bg));
+    border-bottom: 1px solid var(--border);
+    padding: 78px 0 64px;
+    text-align: center;
+  }
+  .logo {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 74px; height: 74px; border-radius: 18px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: #06121f; font-weight: 800; font-size: 30px;
+    margin-bottom: 22px; box-shadow: 0 12px 40px rgba(79,140,255,0.35);
+  }
+  h1 { font-size: 2.5rem; margin: 0 0 10px; letter-spacing: -0.5px; }
+  .tagline { font-size: 1.18rem; color: var(--muted); max-width: 680px; margin: 0 auto 10px; }
+  .sub { color: var(--muted); max-width: 640px; margin: 0 auto 28px; font-size: 1rem; }
+  .crypto-pill {
+    display: inline-block; margin-bottom: 26px; padding: 6px 14px;
+    border: 1px solid var(--border); border-radius: 999px;
+    background: var(--bg-soft); color: var(--accent-2);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem;
+  }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+  .btn {
+    display: inline-block; padding: 11px 20px; border-radius: 10px;
+    font-weight: 600; font-size: 0.95rem; border: 1px solid var(--border);
+    background: var(--card); color: var(--text);
+  }
+  .btn:hover { text-decoration: none; border-color: var(--accent); transform: translateY(-1px); }
+  .btn.primary { background: linear-gradient(135deg, var(--accent), #3a78f0); border-color: transparent; color: #fff; }
+  .btn.alt { background: linear-gradient(135deg, var(--accent-2), #29b98a); border-color: transparent; color: #06121f; }
+
+  section { padding: 56px 0; border-bottom: 1px solid var(--border); }
+  h2 { font-size: 1.6rem; margin: 0 0 6px; }
+  .lead { color: var(--muted); margin: 0 0 28px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px 20px 18px;
+  }
+  .card h3 { margin: 0 0 8px; font-size: 1.05rem; }
+  .card p { margin: 0; color: var(--muted); font-size: 0.94rem; }
+  .ico { font-size: 1.4rem; display: block; margin-bottom: 10px; }
+
+  pre {
+    background: #0a0e16; border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px; overflow-x: auto; font-size: 0.88rem; line-height: 1.6;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre code { color: #c9d4e3; }
+  .tok-k { color: #ff7b9c; } .tok-s { color: var(--accent-2); } .tok-c { color: #6b7787; }
+
+  .opensource ul { padding-left: 0; list-style: none; margin: 0; }
+  .opensource li { padding: 12px 0; border-top: 1px solid var(--border); color: var(--muted); }
+  .opensource li:first-child { border-top: none; }
+  .opensource strong { color: var(--text); }
+
+  .apps { display: flex; flex-wrap: wrap; gap: 12px; }
+
+  footer { padding: 40px 0 56px; text-align: center; color: var(--muted); font-size: 0.9rem; }
+  footer a { margin: 0 8px; }
+  .footlinks { margin-bottom: 14px; }
+
+  @media (max-width: 600px) {
+    h1 { font-size: 2rem; }
+    header { padding: 56px 0 48px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="logo">iw</div>
+    <h1>IntelliWallet Core</h1>
+    <p class="tagline">An open-source Rust library for building secure password managers and digital vaults.</p>
+    <span class="crypto-pill">XChaCha20-Poly1305 + Argon2id</span>
+    <p class="sub">The storage and cryptography engine behind <a href="https://intelliwallet.io/">IntelliWallet</a>. Audit it, or use it to build your own client.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://crates.io/crates/iwcore">crates.io</a>
+      <a class="btn" href="https://docs.rs/iwcore">Documentation</a>
+      <a class="btn" href="https://github.com/intellisoftalpin/iwcore">GitHub</a>
+      <a class="btn alt" href="https://intelliwallet.io/">IntelliWallet</a>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Features</h2>
+    <p class="lead">Everything you need for a password manager, in one embeddable crate.</p>
+    <div class="grid">
+      <div class="card">
+        <span class="ico">🔐</span>
+        <h3>Authenticated encryption</h3>
+        <p>XChaCha20-Poly1305 over a per-vault data key, wrapped by an Argon2id-derived key. Unique nonce per value, built-in tamper detection.</p>
+      </div>
+      <div class="card">
+        <span class="ico">🗃️</span>
+        <h3>Encrypted SQLite storage</h3>
+        <p>Reliable, ACID-compliant storage with hierarchical folders, soft-delete and full undo.</p>
+      </div>
+      <div class="card">
+        <span class="ico">💾</span>
+        <h3>Backup &amp; restore</h3>
+        <p>Versioned ZIP backups with integrity verification and automatic cleanup of old copies.</p>
+      </div>
+      <div class="card">
+        <span class="ico">🔎</span>
+        <h3>Search</h3>
+        <p>Full-text search across item names and field values, with match highlighting.</p>
+      </div>
+      <div class="card">
+        <span class="ico">🎲</span>
+        <h3>Password generation</h3>
+        <p>Random, pattern-based and memorable password generators built in.</p>
+      </div>
+      <div class="card">
+        <span class="ico">🌍</span>
+        <h3>11 languages</h3>
+        <p>Localized labels and metadata embedded at compile time, plus 20 built-in field types.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Security</h2>
+    <p class="lead">Modern, well-reviewed cryptography, no home-grown schemes.</p>
+    <div class="grid">
+      <div class="card">
+        <h3>Per-vault data key</h3>
+        <p>A random 256-bit Data Encryption Key protects all data. It is stored wrapped under a key derived from your master password with Argon2id (memory-hard, per-vault salt).</p>
+      </div>
+      <div class="card">
+        <h3>Tamper detection</h3>
+        <p>Every value is sealed with a unique nonce and an authentication tag, so identical secrets never look alike and any modification is caught on decryption.</p>
+      </div>
+      <div class="card">
+        <h3>Instant password changes</h3>
+        <p>Changing the master password only re-wraps the data key. Your stored data is never re-encrypted.</p>
+      </div>
+      <div class="card">
+        <h3>Keys zeroized in memory</h3>
+        <p>Sensitive key material is wiped from memory when the wallet is locked or dropped.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="opensource">
+  <div class="wrap">
+    <h2>Open source by design</h2>
+    <p class="lead">The security of a password manager should be verifiable, not taken on trust.</p>
+    <ul>
+      <li><strong>Auditable.</strong> Anyone can read exactly how vaults are encrypted, how keys are derived and how data is stored. Security through transparency, not obscurity.</li>
+      <li><strong>Reusable.</strong> iwcore is a standalone, MIT-licensed library. Use it to build your own password manager or an alternative client to IntelliWallet.</li>
+      <li><strong>Improvable.</strong> Anyone can propose enhancements, open a pull request or fork the project. The library grows with its community.</li>
+      <li><strong>Yours for the long run.</strong> Because the storage format and cryptography are open, you can always recover and use your data independently, regardless of the future of the IntelliWallet app or <a href="https://intellisoftalpin.com">IntelliSoftAlpin eG</a>. Your vault outlives any single product or company.</li>
+      <li><strong>Standard cryptography.</strong> Built on well-reviewed primitives from the Rust community (XChaCha20-Poly1305, Argon2id).</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Quick start</h2>
+    <p class="lead">Add <code>iwcore = "0.2.2"</code> to your <code>Cargo.toml</code> and you are ready.</p>
+<pre><code><span class="tok-k">use</span> iwcore::Wallet;
+<span class="tok-k">use</span> std::path::Path;
+
+<span class="tok-c">// Create a vault, add an item and some fields</span>
+<span class="tok-k">let mut</span> wallet = Wallet::create(Path::new(<span class="tok-s">"./my_wallet"</span>), <span class="tok-s">"my_password"</span>, <span class="tok-s">"en"</span>)?;
+<span class="tok-k">let</span> item = wallet.add_item(<span class="tok-s">"My Email"</span>, <span class="tok-s">"document"</span>, false, None)?;
+wallet.add_field(&amp;item, <span class="tok-s">"MAIL"</span>, <span class="tok-s">"user@example.com"</span>, None)?;
+wallet.add_field(&amp;item, <span class="tok-s">"PASS"</span>, <span class="tok-s">"secret123"</span>, None)?;
+
+<span class="tok-c">// Search</span>
+<span class="tok-k">for</span> result <span class="tok-k">in</span> wallet.search(<span class="tok-s">"email"</span>)? {
+    println!(<span class="tok-s">"Found: {}"</span>, result.item.name);
+}</code></pre>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Get IntelliWallet</h2>
+    <p class="lead">The free, cross-platform password manager built on iwcore.</p>
+    <div class="apps">
+      <a class="btn alt" href="https://intelliwallet.io/">intelliwallet.io</a>
+      <a class="btn" href="https://play.google.com/store/apps/details?id=com.nyxbull.nswallet">Google Play</a>
+      <a class="btn" href="https://apps.apple.com/app/intelliwallet/id6744400972">App Store</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="footlinks">
+      <a href="https://crates.io/crates/iwcore">crates.io</a> ·
+      <a href="https://docs.rs/iwcore">docs.rs</a> ·
+      <a href="https://github.com/intellisoftalpin/iwcore">GitHub</a> ·
+      <a href="https://intelliwallet.io/">IntelliWallet</a> ·
+      <a href="https://intellisoftalpin.com">IntelliSoftAlpin eG</a>
+    </div>
+    <div>IntelliWallet Core is open source under the MIT License. © <a href="https://intellisoftalpin.com">IntelliSoftAlpin eG</a>.</div>
+  </div>
+</footer>
+
+</body>
+</html>
