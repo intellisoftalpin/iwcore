@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.3
+
+### Dependencies
+
+- Moved `chacha20poly1305` off its release candidate onto the stable 0.11.0
+  release.
+- Bumped `zeroize` to 1.9.0, `rand` to 0.10.2, and `uuid` to 1.23.4.
+
 ## 0.2.2
 
 ### Documentation & maintenance
