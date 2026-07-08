@@ -808,8 +808,11 @@ pub struct RawProperties {
     pub lang: String,
     /// Database schema version
     pub version: String,
-    /// Encryption iteration count (stored in the legacy `email` column)
-    pub email: String,
+    /// Encryption iteration count (stored in the legacy `email` column).
+    /// `None` when the column is SQL `NULL` — real on legacy databases,
+    /// since the column was added without a backfill/default. See
+    /// `Wallet::legacy_encryption_count` for how this is turned into a count.
+    pub email: Option<String>,
     /// Last cloud sync timestamp
     pub sync_timestamp: Option<String>,
     /// Last local update timestamp
@@ -912,5 +915,49 @@ mod tests {
         assert_eq!(ts.len(), 19);
         assert!(ts.contains("-"));
         assert!(ts.contains(":"));
+    }
+
+    /// Bare `nswallet_properties` table, matching `schema::CREATE_PROPERTIES_TABLE`
+    /// (the `email` column is nullable, with no default).
+    fn conn_with_properties_table() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(super::super::schema::CREATE_PROPERTIES_TABLE).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_get_properties_with_numeric_email() {
+        let conn = conn_with_properties_table();
+        conn.execute(
+            "INSERT INTO nswallet_properties (database_id, lang, version, email, sync_timestamp, update_timestamp)
+             VALUES ('db1', 'en', '4', '0', NULL, NULL)",
+            [],
+        ).unwrap();
+
+        let props = get_properties(&conn).unwrap().expect("row must be found");
+        assert_eq!(props.email.as_deref(), Some("0"));
+    }
+
+    /// Regression test for the NULL-`email` bug: a legacy database whose
+    /// `email` column was never backfilled (SQL `NULL`, not `"0"`) must still
+    /// be readable as a properties row, with `email == None` - NOT silently
+    /// swallowed into `Ok(None)` for the whole row. Before the fix,
+    /// `RawProperties.email` was a plain (non-`Option`) `String`, so
+    /// `row.get::<_, String>()` on a NULL column errored out of the
+    /// `query_row` closure and `get_properties` mapped that error to
+    /// `Ok(None)` via `.ok()`, making a perfectly valid database look like it
+    /// had no properties row at all.
+    #[test]
+    fn test_get_properties_with_null_email_is_found() {
+        let conn = conn_with_properties_table();
+        conn.execute(
+            "INSERT INTO nswallet_properties (database_id, lang, version, email, sync_timestamp, update_timestamp)
+             VALUES ('db1', 'en', '5', NULL, NULL, NULL)",
+            [],
+        ).unwrap();
+
+        let props = get_properties(&conn).unwrap();
+        assert!(props.is_some(), "a row with a NULL email column must still be found");
+        assert_eq!(props.unwrap().email, None);
     }
 }

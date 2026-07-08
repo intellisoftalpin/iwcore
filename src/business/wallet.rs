@@ -39,6 +39,23 @@ fn random_bytes(n: usize) -> Vec<u8> {
     v
 }
 
+/// Turn the legacy `email` column (which actually stores the AES
+/// re-encryption iteration count) into the count used for legacy decrypt.
+///
+/// Mirrors the original C# `Convert.ToInt32(nswProps.email)`, which returns
+/// `0` for a `null` value. Many real legacy databases have this column as SQL
+/// `NULL` — it was added to the schema without a backfill/default (see
+/// `CHAR(200)` in `database::schema`, a column-width declaration, not a
+/// default value) — so a missing/empty/unparseable count MUST fall back to
+/// `0`, exactly like the old app did, not to `ENCRYPTION_COUNT_DEFAULT`
+/// (200): that constant is only a generic placeholder for
+/// `IWProperties::default()` and was never a valid fallback here. Using it
+/// as the fallback silently derived the wrong AES key for every vault with a
+/// NULL `email` column, making a correct password look "wrong" on import.
+fn legacy_encryption_count(email: Option<&str>) -> u32 {
+    email.and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
 /// Main wallet interface
 pub struct Wallet {
     /// Path to the wallet folder
@@ -182,10 +199,7 @@ impl Wallet {
             )
         };
 
-        self.encryption_count = props
-            .as_ref()
-            .and_then(|p| p.email.parse().ok())
-            .unwrap_or(ENCRYPTION_COUNT_DEFAULT);
+        self.encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()));
 
         if let Some(rec) = crypto_rec {
             // v6 vault: derive KEK from the stored params and unwrap the DEK.
@@ -296,10 +310,7 @@ impl Wallet {
             let Some(encrypted_name) = root_blob else {
                 return Err(WalletError::DatabaseError("Root item not found".to_string()));
             };
-            let encryption_count = props
-                .as_ref()
-                .and_then(|p| p.email.parse().ok())
-                .unwrap_or(ENCRYPTION_COUNT_DEFAULT);
+            let encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()));
             Ok(crypto::legacy::decrypt(&encrypted_name, password, encryption_count, None).is_ok())
         }
     }
@@ -319,7 +330,7 @@ impl Wallet {
             database_id: raw_props.database_id,
             lang: raw_props.lang,
             version: raw_props.version,
-            encryption_count: raw_props.email.parse().unwrap_or(ENCRYPTION_COUNT_DEFAULT),
+            encryption_count: legacy_encryption_count(raw_props.email.as_deref()),
             sync_timestamp: raw_props.sync_timestamp.as_ref().and_then(|s| parse_timestamp(s)),
             update_timestamp: raw_props.update_timestamp.as_ref().and_then(|s| parse_timestamp(s)),
         })
@@ -769,6 +780,85 @@ pub(crate) mod tests {
         let wallet = Wallet::open(&path).unwrap();
         assert!(wallet.check_password("TestPassword123").unwrap());
         assert!(!wallet.check_password("WrongPassword").unwrap());
+    }
+
+    /// Same fabrication as [`create_wallet_with_encryption_count`], but the
+    /// `email` column is left as SQL `NULL` instead of a numeric string -
+    /// simulating a real legacy database whose column was never backfilled.
+    /// The root is encrypted with `encryption_count = 0`, matching what the
+    /// original C# app actually used in this situation (`Convert.ToInt32(null)
+    /// == 0`).
+    fn create_wallet_with_null_email() -> (TempDir, std::path::PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_path_buf();
+        let password = "TestPassword123";
+
+        let wallet = Wallet::create(&path, password, "en").unwrap();
+
+        let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+
+        let root_raw = queries::get_root_item_raw(conn).unwrap().unwrap();
+        let plaintext = wallet.dec_value(&root_raw).unwrap();
+
+        // Legacy scheme, encryption_count = 0 - what the C# app used when its
+        // own `EncryptionCount` property read back as NULL.
+        let legacy_root = crypto::legacy::encrypt(&plaintext, password, 0, None).unwrap();
+        conn.execute(
+            "UPDATE nswallet_items SET name = ? WHERE item_id = '__ROOT__'",
+            rusqlite::params![legacy_root],
+        ).unwrap();
+
+        conn.execute("DROP TABLE nswallet_crypto", []).unwrap();
+        conn.execute(
+            "UPDATE nswallet_properties SET version = '5', email = NULL",
+            [],
+        ).unwrap();
+
+        drop(wallet);
+        (temp_dir, path)
+    }
+
+    /// Regression test for the reported customer bug: a genuine legacy vault
+    /// whose `email` column is SQL `NULL` (not `"0"`). Before the fix,
+    /// `get_properties()` silently mapped the NULL-decode error to
+    /// `Ok(None)`, so `encryption_count` fell back to
+    /// `ENCRYPTION_COUNT_DEFAULT` (200) instead of the `0` the C# app
+    /// actually used - deriving the wrong AES key and reporting the correct
+    /// password as wrong. `check_password` must succeed with the real
+    /// password and still reject a wrong one.
+    #[test]
+    fn test_check_password_after_reopen_null_email() {
+        let (_temp, path) = create_wallet_with_null_email();
+        let wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.check_password("TestPassword123").unwrap());
+        assert!(!wallet.check_password("WrongPassword").unwrap());
+    }
+
+    /// Same NULL-`email` scenario, but through the real end-user path:
+    /// `unlock()`, which verifies the password against the legacy root item
+    /// and then performs the one-time v5->v6 migration. Confirms a wrong
+    /// password is rejected without mutating anything, and the correct
+    /// password unlocks *and* the vault ends up on the v6 crypto scheme with
+    /// the root item still decryptable afterwards.
+    #[test]
+    fn test_unlock_and_migrate_with_null_email() {
+        let (_temp, path) = create_wallet_with_null_email();
+
+        // Wrong password: rejected, vault stays on the legacy scheme.
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(!wallet.unlock("WrongPassword").unwrap());
+        assert!(!wallet.is_unlocked());
+
+        // Correct password: unlocks and migrates to v6.
+        assert!(wallet.unlock("TestPassword123").unwrap());
+        assert!(wallet.is_unlocked());
+
+        let props = wallet.get_properties().unwrap();
+        assert_eq!(props.version, DB_VERSION);
+
+        // Root item must still be readable post-migration.
+        let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+        assert!(queries::get_crypto_record(conn).unwrap().is_some());
     }
 
     #[test]
