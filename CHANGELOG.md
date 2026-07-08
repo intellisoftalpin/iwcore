@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.4
+
+### Bug fixes
+
+- Fixed a legacy (v5) vault decryption bug: databases whose `email` column
+  (the legacy AES re-encryption counter) is SQL `NULL` instead of `"0"` were
+  silently treated as if it were `200`, deriving the wrong key and rejecting
+  the correct password on backup import and on first unlock after upgrade.
+  `NULL`/unparseable now falls back to `0`, matching the original app's
+  behavior.
+
 ## 0.2.3
 
 ### Dependencies
