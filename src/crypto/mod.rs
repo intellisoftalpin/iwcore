@@ -27,7 +27,7 @@ pub use key::prepare_key;
 /// one-time v5->v6 migration path and for verifying not-yet-migrated vaults.
 /// Do not use for new data.
 pub mod legacy {
-    pub use super::aes::{decrypt, encrypt};
+    pub use super::aes::{decrypt, encrypt, PreparedLegacyKey};
     pub use super::key::prepare_key;
     pub use super::md5::md5_hex;
 }

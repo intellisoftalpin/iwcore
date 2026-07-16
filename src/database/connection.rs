@@ -14,9 +14,17 @@ pub struct Database {
 }
 
 impl Database {
+    /// How long SQLite waits on a locked database before returning
+    /// SQLITE_BUSY. Without this the default is 0: any leftover lock (e.g.
+    /// stale sidecar files copied in by the legacy upgrade, or a second
+    /// connection during a slow first-unlock migration) fails instantly
+    /// instead of riding out a short contention window.
+    const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     /// Open a database at the specified path
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
         Ok(Self {
             path: path.to_path_buf(),
             conn: Some(conn),
@@ -26,6 +34,7 @@ impl Database {
     /// Create a new database with all tables
     pub fn create(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
 
         // Create all tables
         for sql in schema::CREATE_ALL_TABLES {
@@ -68,8 +77,17 @@ impl Database {
     }
 
     /// Begin a transaction
+    ///
+    /// If the connection is already inside a transaction (a previous operation
+    /// died mid-flight, e.g. a panicked unlock whose mutex guard was recovered),
+    /// roll that stale transaction back and retry once, so one failed attempt
+    /// cannot wedge every subsequent one.
     pub fn begin_transaction(&mut self) -> Result<()> {
-        self.connection()?.execute("BEGIN TRANSACTION", [])?;
+        let conn = self.connection()?;
+        if conn.execute("BEGIN TRANSACTION", []).is_err() {
+            let _ = conn.execute("ROLLBACK", []);
+            conn.execute("BEGIN TRANSACTION", [])?;
+        }
         Ok(())
     }
 
@@ -115,6 +133,23 @@ mod tests {
 
         // Checkpoint should succeed even on fresh database
         db.checkpoint().unwrap();
+    }
+
+    #[test]
+    fn test_begin_transaction_recovers_from_stale_transaction() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        let mut db = Database::create(&db_path).unwrap();
+
+        // Simulate a previous operation that died mid-transaction without
+        // rolling back (e.g. a panicked unlock).
+        db.begin_transaction().unwrap();
+
+        // A fresh begin must not fail: it rolls the stale transaction back
+        // and starts a new one.
+        db.begin_transaction().unwrap();
+        db.commit_transaction().unwrap();
     }
 
     #[test]

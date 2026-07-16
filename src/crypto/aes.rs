@@ -109,6 +109,47 @@ pub fn decrypt(
     }
 }
 
+/// Pre-derived legacy key material (normal + iOS-workaround variant).
+///
+/// Bulk operations (the one-time v5->v6 migration) decrypt every blob in the
+/// vault with the same password and iteration count. Deriving the key per
+/// record repeats the whole MD5 iteration chain each time, and the per-record
+/// iOS fallback in [`decrypt`] pays a failed AES pass on every blob when the
+/// vault was written with the workaround key. This derives both variants once
+/// and remembers which one decrypted the previous blob, trying that variant
+/// first for the next one. Decryption results are identical to [`decrypt`].
+pub struct PreparedLegacyKey {
+    key: [u8; KEY_LENGTH],
+    ios_key: [u8; KEY_LENGTH],
+    prefer_ios: bool,
+}
+
+impl PreparedLegacyKey {
+    pub fn new(password: &str, hash: Option<&str>, re_encryption_count: u32) -> Self {
+        let key = prepare_key(password, hash, re_encryption_count);
+        let mut ios_key = key;
+        ios_key[0] = 0;
+        Self { key, ios_key, prefer_ios: false }
+    }
+
+    /// Decrypt a legacy blob, trying the last-successful key variant first.
+    pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<String, String> {
+        let (first, second) = if self.prefer_ios {
+            (&self.ios_key, &self.key)
+        } else {
+            (&self.key, &self.ios_key)
+        };
+        match decrypt_with_key(ciphertext, first) {
+            Ok(plaintext) => Ok(plaintext),
+            Err(_) => {
+                let plaintext = decrypt_with_key(ciphertext, second)?;
+                self.prefer_ios = !self.prefer_ios;
+                Ok(plaintext)
+            }
+        }
+    }
+}
+
 /// Internal decryption with a specific key
 fn decrypt_with_key(ciphertext: &[u8], key: &[u8; KEY_LENGTH]) -> Result<String, String> {
     if ciphertext.is_empty() {
@@ -237,6 +278,66 @@ mod tests {
 
         let result = decrypt(&encrypted, "wrong_password", 0, None);
         assert!(result.is_err());
+    }
+
+    /// Encrypt with an explicit key, bypassing prepare_key — used to fabricate
+    /// ciphertext written under the iOS-workaround key variant.
+    fn encrypt_with_raw_key(plaintext: &str, key: &[u8; KEY_LENGTH]) -> Vec<u8> {
+        let md5_checksum = md5_hex(plaintext);
+        let full_text = format!("{}{}", md5_checksum, plaintext);
+        let data = full_text.as_bytes();
+        let padded_len = ((data.len() / 16) + 1) * 16;
+        let mut buffer = vec![0u8; padded_len];
+        buffer[..data.len()].copy_from_slice(data);
+        let encryptor = Aes256CbcEnc::new(key.into(), &ZERO_IV.into());
+        encryptor
+            .encrypt_padded::<Pkcs7>(&mut buffer, data.len())
+            .unwrap()
+            .to_vec()
+    }
+
+    #[test]
+    fn test_prepared_key_matches_decrypt() {
+        let password = "TestPassword123!";
+        for count in [0u32, 2, 200] {
+            let plaintext = format!("record at count {count}");
+            let encrypted = encrypt(&plaintext, password, count, None).unwrap();
+            let mut prepared = PreparedLegacyKey::new(password, None, count);
+            assert_eq!(prepared.decrypt(&encrypted).unwrap(), plaintext);
+            // Same result as the one-shot path.
+            assert_eq!(
+                decrypt(&encrypted, password, count, None).unwrap(),
+                plaintext
+            );
+        }
+    }
+
+    #[test]
+    fn test_prepared_key_ios_variant_and_preference() {
+        let password = "TestPassword123!";
+        let mut ios_key = prepare_key(password, None, 0);
+        ios_key[0] = 0;
+
+        let ios_blob_1 = encrypt_with_raw_key("ios record one", &ios_key);
+        let ios_blob_2 = encrypt_with_raw_key("ios record two", &ios_key);
+        let normal_blob = encrypt("normal record", password, 0, None).unwrap();
+
+        let mut prepared = PreparedLegacyKey::new(password, None, 0);
+        // First iOS blob decrypts via the fallback and flips the preference...
+        assert_eq!(prepared.decrypt(&ios_blob_1).unwrap(), "ios record one");
+        assert!(prepared.prefer_ios);
+        // ...so the second one hits the iOS variant on the first try.
+        assert_eq!(prepared.decrypt(&ios_blob_2).unwrap(), "ios record two");
+        // A normal blob still decrypts (and flips the preference back).
+        assert_eq!(prepared.decrypt(&normal_blob).unwrap(), "normal record");
+        assert!(!prepared.prefer_ios);
+    }
+
+    #[test]
+    fn test_prepared_key_wrong_password_fails() {
+        let encrypted = encrypt("secret", "correct_password", 0, None).unwrap();
+        let mut prepared = PreparedLegacyKey::new("wrong_password", None, 0);
+        assert!(prepared.decrypt(&encrypted).is_err());
     }
 
     #[test]

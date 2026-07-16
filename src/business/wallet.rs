@@ -431,7 +431,11 @@ impl Wallet {
             (queries::get_all_item_blobs(conn)?, queries::get_all_field_blobs(conn)?)
         };
 
-        // 4. Re-encrypt everything inside a single transaction.
+        // 4. Re-encrypt everything inside a single transaction. The legacy key
+        // pair is derived once for the whole vault instead of per record (same
+        // password + iteration count everywhere, identical decrypt results).
+        let mut legacy_key = crypto::legacy::PreparedLegacyKey::new(password, None, enc_count);
+
         let db = self.db.as_mut()
             .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
         db.begin_transaction()?;
@@ -441,7 +445,7 @@ impl Wallet {
             queries::ensure_crypto_table(conn)?;
 
             for (item_id, blob, deleted) in &item_blobs {
-                match crypto::legacy::decrypt(blob, password, enc_count, None) {
+                match legacy_key.decrypt(blob) {
                     Ok(plaintext) => {
                         let new_blob = crypto::aead::seal(&dek, plaintext.as_bytes())
                             .map_err(WalletError::EncryptionError)?;
@@ -465,7 +469,7 @@ impl Wallet {
             }
 
             for (item_id, field_id, blob, deleted) in &field_blobs {
-                match crypto::legacy::decrypt(blob, password, enc_count, None) {
+                match legacy_key.decrypt(blob) {
                     Ok(plaintext) => {
                         let new_blob = crypto::aead::seal(&dek, plaintext.as_bytes())
                             .map_err(WalletError::EncryptionError)?;
@@ -859,6 +863,105 @@ pub(crate) mod tests {
         // Root item must still be readable post-migration.
         let conn = wallet.db.as_ref().unwrap().connection().unwrap();
         assert!(queries::get_crypto_record(conn).unwrap().is_some());
+    }
+
+    /// Fabricates a legacy (v5) vault containing real data: a folder, an item
+    /// inside it, and a field — every blob re-encrypted with the legacy scheme
+    /// at the given count, crypto record dropped, version set to 5. This is
+    /// the closest analogue of a real Xamarin 5.x database the migration sees.
+    fn create_legacy_vault_with_data(encryption_count: u32) -> (TempDir, std::path::PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_path_buf();
+        let password = "TestPassword123";
+
+        let mut wallet = Wallet::create(&path, password, "en").unwrap();
+        let folder_id = wallet.add_item("Legacy Folder", "folder", true, None).unwrap();
+        let item_id = wallet
+            .add_item("Legacy Item", "document", false, Some(&folder_id))
+            .unwrap();
+        wallet.add_field(&item_id, "PASS", "legacy_secret", None).unwrap();
+
+        // Re-encrypt every blob (root included) with the legacy scheme.
+        let (item_blobs, field_blobs) = {
+            let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+            (
+                queries::get_all_item_blobs(conn).unwrap(),
+                queries::get_all_field_blobs(conn).unwrap(),
+            )
+        };
+        for (id, blob, _) in &item_blobs {
+            let plaintext = wallet.dec_value(blob).unwrap();
+            let legacy = crypto::legacy::encrypt(&plaintext, password, encryption_count, None).unwrap();
+            let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+            conn.execute(
+                "UPDATE nswallet_items SET name = ? WHERE item_id = ?",
+                rusqlite::params![legacy, id],
+            ).unwrap();
+        }
+        for (iid, fid, blob, _) in &field_blobs {
+            let plaintext = wallet.dec_value(blob).unwrap();
+            let legacy = crypto::legacy::encrypt(&plaintext, password, encryption_count, None).unwrap();
+            let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+            conn.execute(
+                "UPDATE nswallet_fields SET value = ? WHERE item_id = ? AND field_id = ?",
+                rusqlite::params![legacy, iid, fid],
+            ).unwrap();
+        }
+
+        let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+        conn.execute("DROP TABLE nswallet_crypto", []).unwrap();
+        conn.execute(
+            "UPDATE nswallet_properties SET version = '5', email = ?",
+            rusqlite::params![encryption_count.to_string()],
+        ).unwrap();
+
+        drop(wallet);
+        (temp_dir, path)
+    }
+
+    /// End-to-end v5→v6 migration over a vault with real data (exercises the
+    /// PreparedLegacyKey bulk path): unlock with the correct password must
+    /// migrate every item and field intact and leave a pre-v6 snapshot behind.
+    #[test]
+    fn test_unlock_migrates_full_legacy_vault() {
+        for count in [0u32, 200] {
+            let (_temp, path) = create_legacy_vault_with_data(count);
+
+            let mut wallet = Wallet::open(&path).unwrap();
+            // Wrong password first: rejected, nothing mutated.
+            assert!(!wallet.unlock("WrongPassword").unwrap());
+
+            assert!(wallet.unlock("TestPassword123").unwrap());
+
+            // All data survived the migration.
+            let (item_count, legacy_item_id) = {
+                let items = wallet.get_items().unwrap();
+                let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+                assert!(names.contains(&"Legacy Folder"), "count={count}");
+                assert!(names.contains(&"Legacy Item"), "count={count}");
+                let item = items.iter().find(|i| i.name == "Legacy Item").unwrap();
+                (items.len(), item.item_id.clone())
+            };
+            {
+                let fields = wallet.get_fields_by_item(&legacy_item_id).unwrap();
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].value, "legacy_secret");
+            }
+
+            // Vault is now v6 with a crypto record and a pre-v6 snapshot.
+            assert_eq!(wallet.get_properties().unwrap().version, DB_VERSION);
+            {
+                let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+                assert!(queries::get_crypto_record(conn).unwrap().is_some());
+            }
+            assert!(path.join(PRE_V6_BACKUP_FILENAME).exists());
+
+            // Reopen + unlock again: now takes the fast v6 path.
+            drop(wallet);
+            let mut wallet = Wallet::open(&path).unwrap();
+            assert!(wallet.unlock("TestPassword123").unwrap());
+            assert_eq!(wallet.get_items().unwrap().len(), item_count);
+        }
     }
 
     #[test]
