@@ -213,15 +213,17 @@ pub fn hard_delete_field(conn: &Connection, item_id: &str, field_id: &str) -> Re
 }
 
 /// A raw item name blob row for migration: `(item_id, name, deleted)`.
-pub type ItemBlobRow = (String, Vec<u8>, bool);
+pub type ItemBlobRow = (String, Option<Vec<u8>>, bool);
 
 /// A raw field value blob row for migration: `(item_id, field_id, value, deleted)`.
-pub type FieldBlobRow = (String, String, Vec<u8>, bool);
+pub type FieldBlobRow = (String, String, Option<Vec<u8>>, bool);
 
 /// Every item name blob `(item_id, name, deleted)` for ALL rows, including the
 /// root item and soft-deleted items. Used by the v5->v6 re-encryption pass; the
 /// `deleted` flag lets the migration treat undecryptable active vs deleted rows
-/// differently.
+/// differently. The blob is `Option` because real legacy databases can carry
+/// SQL NULL blobs (the old sqlite-net layer wrote and read them happily);
+/// a NULL must not fail the whole read.
 pub fn get_all_item_blobs(conn: &Connection) -> Result<Vec<ItemBlobRow>> {
     let mut stmt = conn.prepare("SELECT item_id, name, deleted FROM nswallet_items")?;
     let rows = stmt.query_map([], |row| {
@@ -232,12 +234,54 @@ pub fn get_all_item_blobs(conn: &Connection) -> Result<Vec<ItemBlobRow>> {
 
 /// Every field value blob `(item_id, field_id, value, deleted)` for ALL rows,
 /// including soft-deleted fields. Used by the v5->v6 re-encryption pass.
+/// NULL-safe like [`get_all_item_blobs`].
 pub fn get_all_field_blobs(conn: &Connection) -> Result<Vec<FieldBlobRow>> {
     let mut stmt = conn.prepare("SELECT item_id, field_id, value, deleted FROM nswallet_fields")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)? != 0))
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Create the quarantine table used by the v5->v6 migration for ACTIVE
+/// records whose blob cannot be decrypted under any candidate key. The
+/// original encrypted blob is preserved verbatim so no byte of user data is
+/// ever destroyed; the row is then removed from the live table so the
+/// migrated vault contains only v6-readable records.
+pub fn ensure_quarantine_table(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS nswallet_quarantine (
+            record_type TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            field_id TEXT,
+            blob BLOB,
+            quarantined_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Preserve an undecryptable record's original blob in the quarantine table.
+pub fn insert_quarantine(
+    conn: &Connection,
+    record_type: &str,
+    item_id: &str,
+    field_id: Option<&str>,
+    blob: Option<&[u8]>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO nswallet_quarantine (record_type, item_id, field_id, blob, quarantined_at)
+         VALUES (?, ?, ?, ?, ?)",
+        rusqlite::params![
+            record_type,
+            item_id,
+            field_id,
+            blob,
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        ],
+    )?;
+    Ok(())
 }
 
 // ============================================================================

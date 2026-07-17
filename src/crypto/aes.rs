@@ -109,44 +109,138 @@ pub fn decrypt(
     }
 }
 
-/// Pre-derived legacy key material (normal + iOS-workaround variant).
+/// Key-derivation modes the original C# app effectively used over its life.
 ///
-/// Bulk operations (the one-time v5->v6 migration) decrypt every blob in the
-/// vault with the same password and iteration count. Deriving the key per
-/// record repeats the whole MD5 iteration chain each time, and the per-record
-/// iOS fallback in [`decrypt`] pays a failed AES pass on every blob when the
-/// vault was written with the workaround key. This derives both variants once
-/// and remembers which one decrypted the previous blob, trying that variant
-/// first for the next one. Decryption results are identical to [`decrypt`].
-pub struct PreparedLegacyKey {
-    key: [u8; KEY_LENGTH],
-    ios_key: [u8; KEY_LENGTH],
+/// The C# `prepareKey(password, hash, count)` had three outcomes, because
+/// every caller passed the password itself as `hash`:
+/// - count == 0: padded/doubled password truncated to 32 chars, no MD5
+///   (the only path the 5.x app's ENCRYPT callers ever used — they hardcoded
+///   count 0, and a non-empty `hash` suppressed the MD5 chain anyway);
+/// - count > 0 with empty hash: the MD5-iterated chain (never reached by the
+///   5.x callers, but possibly by older app generations that wrote the data);
+/// - count > 0 with non-empty hash: `key = hash` — i.e. the RAW password's
+///   first 32 UTF-8 bytes (the path the 5.x app used at DECRYPT time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyKeyMode {
+    /// Padded/truncated password, no MD5 iterations (count treated as 0).
+    NoChain,
+    /// Padded/truncated password + MD5^count chain.
+    Md5Chain,
+    /// Raw password bytes, first 32 UTF-8 bytes, zero-padded when shorter.
+    RawPassword,
+}
+
+impl LegacyKeyMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LegacyKeyMode::NoChain => "no_chain",
+            LegacyKeyMode::Md5Chain => "md5_chain",
+            LegacyKeyMode::RawPassword => "raw_password",
+        }
+    }
+}
+
+/// First 32 UTF-8 bytes of the raw password, zero-padded (the C# `key = hash`
+/// path; C# threw for shorter passwords, zero-padding just makes the attempt
+/// harmless).
+fn raw_password_key(password: &str) -> [u8; KEY_LENGTH] {
+    let bytes = password.as_bytes();
+    let mut key = [0u8; KEY_LENGTH];
+    let n = bytes.len().min(KEY_LENGTH);
+    key[..n].copy_from_slice(&bytes[..n]);
+    key
+}
+
+/// All plausible legacy key candidates for one vault, each with its
+/// iOS-workaround variant (first byte zeroed), tried in order until the
+/// MD5-checksum validation inside [`decrypt_with_key`] passes. The chain
+/// remembers the last successful candidate/variant and tries it first for
+/// the next blob, so bulk migration pays no repeated derivation or failed
+/// AES passes once the vault's real mode is known.
+///
+/// For `re_encryption_count == 0` all three C# modes collapse into one key,
+/// so the chain holds a single candidate and behaves exactly like the plain
+/// [`decrypt`] — zero change for the healthy majority of vaults.
+pub struct LegacyKeyChain {
+    /// (mode, normal key, iOS-workaround key)
+    candidates: Vec<(LegacyKeyMode, [u8; KEY_LENGTH], [u8; KEY_LENGTH])>,
+    /// Index of the candidate that decrypted the previous blob.
+    preferred: usize,
+    /// Whether the preferred candidate succeeded via its iOS variant.
     prefer_ios: bool,
 }
 
-impl PreparedLegacyKey {
-    pub fn new(password: &str, hash: Option<&str>, re_encryption_count: u32) -> Self {
-        let key = prepare_key(password, hash, re_encryption_count);
-        let mut ios_key = key;
-        ios_key[0] = 0;
-        Self { key, ios_key, prefer_ios: false }
+impl LegacyKeyChain {
+    pub fn new(password: &str, re_encryption_count: u32) -> Self {
+        let ios = |key: [u8; KEY_LENGTH]| {
+            let mut k = key;
+            k[0] = 0;
+            k
+        };
+
+        let mut candidates = Vec::with_capacity(3);
+        if re_encryption_count == 0 {
+            let key = prepare_key(password, None, 0);
+            candidates.push((LegacyKeyMode::NoChain, key, ios(key)));
+        } else {
+            // Chain first: matches what this crate has always tried, so any
+            // vault that unlocked before keeps unlocking via the same key.
+            let chained = prepare_key(password, None, re_encryption_count);
+            candidates.push((LegacyKeyMode::Md5Chain, chained, ios(chained)));
+            // What the 5.x app actually WROTE with (count hardcoded to 0).
+            let plain = prepare_key(password, None, 0);
+            candidates.push((LegacyKeyMode::NoChain, plain, ios(plain)));
+            // What the 5.x app DECRYPTED with when count > 0 (`key = hash`).
+            let raw = raw_password_key(password);
+            candidates.push((LegacyKeyMode::RawPassword, raw, ios(raw)));
+        }
+
+        Self { candidates, preferred: 0, prefer_ios: false }
     }
 
-    /// Decrypt a legacy blob, trying the last-successful key variant first.
+    /// The mode of the candidate that decrypted the most recent blob.
+    pub fn preferred_mode(&self) -> LegacyKeyMode {
+        self.candidates[self.preferred].0
+    }
+
+    /// Decrypt a legacy blob, trying the last-successful candidate/variant
+    /// first, then every remaining candidate (normal then iOS variant).
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<String, String> {
-        let (first, second) = if self.prefer_ios {
-            (&self.ios_key, &self.key)
-        } else {
-            (&self.key, &self.ios_key)
-        };
-        match decrypt_with_key(ciphertext, first) {
-            Ok(plaintext) => Ok(plaintext),
-            Err(_) => {
-                let plaintext = decrypt_with_key(ciphertext, second)?;
-                self.prefer_ios = !self.prefer_ios;
-                Ok(plaintext)
+        // Preferred candidate, preferred variant first.
+        let (_, key, ios_key) = &self.candidates[self.preferred];
+        let (first, second) = if self.prefer_ios { (ios_key, key) } else { (key, ios_key) };
+        if let Ok(plaintext) = decrypt_with_key(ciphertext, first) {
+            return Ok(plaintext);
+        }
+        if let Ok(plaintext) = decrypt_with_key(ciphertext, second) {
+            self.prefer_ios = !self.prefer_ios;
+            return Ok(plaintext);
+        }
+
+        // Remaining candidates in declaration order.
+        let mut last_err = String::from("no key candidate matched");
+        for (idx, (_, key, ios_key)) in self.candidates.iter().enumerate() {
+            if idx == self.preferred {
+                continue;
+            }
+            match decrypt_with_key(ciphertext, key) {
+                Ok(plaintext) => {
+                    self.preferred = idx;
+                    self.prefer_ios = false;
+                    return Ok(plaintext);
+                }
+                Err(e) => last_err = e,
+            }
+            match decrypt_with_key(ciphertext, ios_key) {
+                Ok(plaintext) => {
+                    self.preferred = idx;
+                    self.prefer_ios = true;
+                    return Ok(plaintext);
+                }
+                Err(e) => last_err = e,
             }
         }
+        Err(last_err)
     }
 }
 
@@ -297,23 +391,36 @@ mod tests {
     }
 
     #[test]
-    fn test_prepared_key_matches_decrypt() {
+    fn test_key_chain_matches_decrypt_for_md5_chain_data() {
+        // Synthetic vaults whose data really was written with the MD5 chain
+        // must keep decrypting exactly as before (first candidate wins).
         let password = "TestPassword123!";
         for count in [0u32, 2, 200] {
             let plaintext = format!("record at count {count}");
             let encrypted = encrypt(&plaintext, password, count, None).unwrap();
-            let mut prepared = PreparedLegacyKey::new(password, None, count);
-            assert_eq!(prepared.decrypt(&encrypted).unwrap(), plaintext);
+            let mut chain = LegacyKeyChain::new(password, count);
+            assert_eq!(chain.decrypt(&encrypted).unwrap(), plaintext);
+            let expected_mode = if count == 0 {
+                LegacyKeyMode::NoChain
+            } else {
+                LegacyKeyMode::Md5Chain
+            };
+            assert_eq!(chain.preferred_mode(), expected_mode);
             // Same result as the one-shot path.
-            assert_eq!(
-                decrypt(&encrypted, password, count, None).unwrap(),
-                plaintext
-            );
+            assert_eq!(decrypt(&encrypted, password, count, None).unwrap(), plaintext);
         }
     }
 
     #[test]
-    fn test_prepared_key_ios_variant_and_preference() {
+    fn test_key_chain_count0_has_single_candidate() {
+        let chain = LegacyKeyChain::new("TestPassword123!", 0);
+        assert_eq!(chain.candidates.len(), 1);
+        let chain200 = LegacyKeyChain::new("TestPassword123!", 200);
+        assert_eq!(chain200.candidates.len(), 3);
+    }
+
+    #[test]
+    fn test_key_chain_ios_variant_and_preference() {
         let password = "TestPassword123!";
         let mut ios_key = prepare_key(password, None, 0);
         ios_key[0] = 0;
@@ -322,22 +429,72 @@ mod tests {
         let ios_blob_2 = encrypt_with_raw_key("ios record two", &ios_key);
         let normal_blob = encrypt("normal record", password, 0, None).unwrap();
 
-        let mut prepared = PreparedLegacyKey::new(password, None, 0);
+        let mut chain = LegacyKeyChain::new(password, 0);
         // First iOS blob decrypts via the fallback and flips the preference...
-        assert_eq!(prepared.decrypt(&ios_blob_1).unwrap(), "ios record one");
-        assert!(prepared.prefer_ios);
+        assert_eq!(chain.decrypt(&ios_blob_1).unwrap(), "ios record one");
+        assert!(chain.prefer_ios);
         // ...so the second one hits the iOS variant on the first try.
-        assert_eq!(prepared.decrypt(&ios_blob_2).unwrap(), "ios record two");
+        assert_eq!(chain.decrypt(&ios_blob_2).unwrap(), "ios record two");
         // A normal blob still decrypts (and flips the preference back).
-        assert_eq!(prepared.decrypt(&normal_blob).unwrap(), "normal record");
-        assert!(!prepared.prefer_ios);
+        assert_eq!(chain.decrypt(&normal_blob).unwrap(), "normal record");
+        assert!(!chain.prefer_ios);
     }
 
     #[test]
-    fn test_prepared_key_wrong_password_fails() {
+    fn test_key_chain_no_chain_fallback() {
+        // The realistic 5.x scenario: email column says 200, but the app's
+        // encrypt callers hardcoded count 0, so the data was written with
+        // the un-chained key. The chain must fall back and remember it.
+        let password = "TestPassword123!";
+        let blob_1 = encrypt("written with count 0", password, 0, None).unwrap();
+        let blob_2 = encrypt("second record", password, 0, None).unwrap();
+
+        // The one-shot legacy decrypt (pre-chain behavior) fails here.
+        assert!(decrypt(&blob_1, password, 200, None).is_err());
+
+        let mut chain = LegacyKeyChain::new(password, 200);
+        assert_eq!(chain.decrypt(&blob_1).unwrap(), "written with count 0");
+        assert_eq!(chain.preferred_mode(), LegacyKeyMode::NoChain);
+        // Preference sticks: second record hits the right key immediately.
+        assert_eq!(chain.decrypt(&blob_2).unwrap(), "second record");
+    }
+
+    #[test]
+    fn test_key_chain_raw_password_fallback() {
+        // The C# `key = hash` decrypt path: raw password bytes as the key.
+        // A short non-ASCII password makes this key genuinely different from
+        // the padded/truncated derivations.
+        let password = "пароль12"; // 8 chars, 14 UTF-8 bytes
+        let raw = raw_password_key(password);
+        assert_ne!(raw, prepare_key(password, None, 0));
+
+        let blob = encrypt_with_raw_key("raw key record", &raw);
+        assert!(decrypt(&blob, password, 200, None).is_err());
+
+        let mut chain = LegacyKeyChain::new(password, 200);
+        assert_eq!(chain.decrypt(&blob).unwrap(), "raw key record");
+        assert_eq!(chain.preferred_mode(), LegacyKeyMode::RawPassword);
+    }
+
+    #[test]
+    fn test_key_chain_mixed_modes_in_one_vault() {
+        let password = "TestPassword123!";
+        let chained_blob = encrypt("md5 chained", password, 200, None).unwrap();
+        let plain_blob = encrypt("plain", password, 0, None).unwrap();
+
+        let mut chain = LegacyKeyChain::new(password, 200);
+        assert_eq!(chain.decrypt(&plain_blob).unwrap(), "plain");
+        assert_eq!(chain.decrypt(&chained_blob).unwrap(), "md5 chained");
+        assert_eq!(chain.decrypt(&plain_blob).unwrap(), "plain");
+    }
+
+    #[test]
+    fn test_key_chain_wrong_password_fails() {
         let encrypted = encrypt("secret", "correct_password", 0, None).unwrap();
-        let mut prepared = PreparedLegacyKey::new("wrong_password", None, 0);
-        assert!(prepared.decrypt(&encrypted).is_err());
+        assert!(LegacyKeyChain::new("wrong_password", 0).decrypt(&encrypted).is_err());
+        // Even with all three candidates active, a wrong password never
+        // passes the MD5 checksum.
+        assert!(LegacyKeyChain::new("wrong_password", 200).decrypt(&encrypted).is_err());
     }
 
     #[test]

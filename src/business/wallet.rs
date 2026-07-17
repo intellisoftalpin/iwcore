@@ -32,6 +32,25 @@ pub(crate) struct Unlocked {
     dek: Zeroizing<[u8; DEK_LEN]>,
 }
 
+/// Outcome of the one-time v5->v6 migration, kept in memory after a
+/// successful legacy unlock so the app can log it (support diagnostics).
+/// Never persisted; contains no secrets.
+#[derive(Debug, Clone)]
+pub struct MigrationSummary {
+    /// Which legacy key derivation verified the vault ("no_chain",
+    /// "md5_chain" or "raw_password").
+    pub key_mode: String,
+    pub items_migrated: u32,
+    pub fields_migrated: u32,
+    /// ACTIVE records whose blob decrypted under no candidate key; their
+    /// original blobs are preserved in `nswallet_quarantine`.
+    pub items_quarantined: u32,
+    pub fields_quarantined: u32,
+    /// Soft-deleted undecryptable records purged (pre-existing dead history).
+    pub deleted_purged: u32,
+    pub duration_ms: u64,
+}
+
 /// Draw `n` cryptographically random bytes from the OS CSPRNG.
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut v = vec![0u8; n];
@@ -73,6 +92,8 @@ pub struct Wallet {
     pub(crate) fields_cache: Option<Vec<IWField>>,
     /// Cached labels
     pub(crate) labels_cache: Option<HashMap<String, IWLabel>>,
+    /// Outcome of the v5->v6 migration, when this session performed one.
+    pub(crate) last_migration_summary: Option<MigrationSummary>,
 }
 
 impl Wallet {
@@ -111,6 +132,7 @@ impl Wallet {
             items_cache: None,
             fields_cache: None,
             labels_cache: None,
+            last_migration_summary: None,
         })
     }
 
@@ -130,6 +152,7 @@ impl Wallet {
             items_cache: None,
             fields_cache: None,
             labels_cache: None,
+            last_migration_summary: None,
         };
 
         wallet.init_new_database(password, lang)?;
@@ -213,19 +236,30 @@ impl Wallet {
                 None => Ok(false),
             }
         } else {
-            // Legacy v5 vault: verify against the root item, then migrate.
+            // Legacy v5 vault: verify against the root item using the full
+            // candidate-key chain (the C# app effectively used up to three
+            // different key derivations over its life), then migrate with
+            // the chain that verified.
             let Some(encrypted_name) = root_blob else {
                 return Err(WalletError::DatabaseError("Root item not found".to_string()));
             };
-            if crypto::legacy::decrypt(&encrypted_name, password, self.encryption_count, None).is_err() {
+            let mut key_chain =
+                crypto::legacy::LegacyKeyChain::new(password, self.encryption_count);
+            if key_chain.decrypt(&encrypted_name).is_err() {
                 return Ok(false);
             }
             // Password verified. Perform the one-time migration (sets the DEK).
-            self.migrate_v5_to_v6(password)?;
+            self.migrate_v5_to_v6(password, key_chain)?;
             self.clear_caches();
             self.add_system_labels()?;
             Ok(true)
         }
+    }
+
+    /// Outcome of the v5->v6 migration when this wallet session performed
+    /// one; `None` for vaults that were already v6 at unlock.
+    pub fn last_migration_summary(&self) -> Option<&MigrationSummary> {
+        self.last_migration_summary.as_ref()
     }
 
     /// Derive the KEK from `password` using the record's stored params and try
@@ -311,7 +345,8 @@ impl Wallet {
                 return Err(WalletError::DatabaseError("Root item not found".to_string()));
             };
             let encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()));
-            Ok(crypto::legacy::decrypt(&encrypted_name, password, encryption_count, None).is_ok())
+            let mut key_chain = crypto::legacy::LegacyKeyChain::new(password, encryption_count);
+            Ok(key_chain.decrypt(&encrypted_name).is_ok())
         }
     }
 
@@ -397,16 +432,30 @@ impl Wallet {
     }
 
     /// One-time v5->v6 crypto migration. Precondition: the password has already
-    /// been verified against the legacy root item.
+    /// been verified against the legacy root item via `legacy_key` (the chain
+    /// carries the candidate that matched, so per-record decryption starts
+    /// from the verified derivation and falls back through the others for
+    /// vaults with a mixed key history).
     ///
     /// Sequence (see `iwcore-hardening.md`): checkpoint, write a kept pre-v6
     /// snapshot, then in a single transaction generate fresh key material,
     /// re-encrypt every item name and field value (active, deleted, and root)
     /// from the legacy scheme to the DEK AEAD scheme, write the crypto record,
-    /// and bump the version to 6. Any undecryptable blob aborts the whole
-    /// migration (rollback to intact v5). On success the DEK is held in memory.
-    fn migrate_v5_to_v6(&mut self, password: &str) -> Result<()> {
-        let enc_count = self.encryption_count;
+    /// and bump the version to 6.
+    ///
+    /// Tolerance rules (deliberately mirroring what the 5.x app survived):
+    /// NULL/empty blobs migrate as empty values; an ACTIVE record that fails
+    /// every candidate key is quarantined (original blob preserved in
+    /// `nswallet_quarantine`, row removed from the live table) instead of
+    /// aborting the whole migration; undecryptable SOFT-DELETED records are
+    /// purged as before. Only an undecryptable root aborts. On success the
+    /// DEK is held in memory and a [`MigrationSummary`] is recorded.
+    fn migrate_v5_to_v6(
+        &mut self,
+        password: &str,
+        mut legacy_key: crypto::legacy::LegacyKeyChain,
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
 
         // 1. Flush WAL so the live file is self-contained, then snapshot it.
         self.db.as_ref()
@@ -431,10 +480,18 @@ impl Wallet {
             (queries::get_all_item_blobs(conn)?, queries::get_all_field_blobs(conn)?)
         };
 
-        // 4. Re-encrypt everything inside a single transaction. The legacy key
-        // pair is derived once for the whole vault instead of per record (same
-        // password + iteration count everywhere, identical decrypt results).
-        let mut legacy_key = crypto::legacy::PreparedLegacyKey::new(password, None, enc_count);
+        // 4. Re-encrypt everything inside a single transaction.
+        let mut summary = MigrationSummary {
+            key_mode: String::new(),
+            items_migrated: 0,
+            fields_migrated: 0,
+            items_quarantined: 0,
+            fields_quarantined: 0,
+            deleted_purged: 0,
+            duration_ms: 0,
+        };
+        let mut quarantined_items: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         let db = self.db.as_mut()
             .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
@@ -443,45 +500,82 @@ impl Wallet {
         let result = (|| -> Result<()> {
             let conn = db.connection()?;
             queries::ensure_crypto_table(conn)?;
+            queries::ensure_quarantine_table(conn)?;
 
             for (item_id, blob, deleted) in &item_blobs {
-                match legacy_key.decrypt(blob) {
-                    Ok(plaintext) => {
+                // NULL/empty blobs exist in real legacy databases (the old
+                // sqlite-net layer wrote and read them without complaint);
+                // migrate them as empty names rather than failing.
+                let decrypted: Option<String> = match blob.as_deref() {
+                    None => Some(String::new()),
+                    Some([]) => Some(String::new()),
+                    Some(bytes) => legacy_key.decrypt(bytes).ok(),
+                };
+                match decrypted {
+                    Some(plaintext) => {
                         let new_blob = crypto::aead::seal(&dek, plaintext.as_bytes())
                             .map_err(WalletError::EncryptionError)?;
                         queries::update_item_name_only(conn, item_id, &new_blob)?;
+                        summary.items_migrated += 1;
                     }
-                    Err(e) => {
-                        // An undecryptable ACTIVE record is real corruption: abort
-                        // and roll back to intact v5. An undecryptable SOFT-DELETED
-                        // record is pre-existing dead history that is unreadable
-                        // under the master password (the app never surfaced it), so
-                        // there is nothing to preserve: purge the row.
+                    None if item_id.as_str() == ROOT_ID => {
+                        // Cannot happen (the chain verified the root before
+                        // migration), kept as a hard abort out of caution.
+                        return Err(WalletError::DecryptionError(
+                            "root item undecryptable".to_string(),
+                        ));
+                    }
+                    None => {
                         if *deleted {
+                            // Pre-existing dead history unreadable under the
+                            // master password; nothing to preserve.
                             queries::hard_delete_item(conn, item_id)?;
+                            summary.deleted_purged += 1;
                         } else {
-                            return Err(WalletError::DecryptionError(
-                                format!("active item {item_id}: {e}"),
-                            ));
+                            queries::insert_quarantine(
+                                conn, "item", item_id, None, blob.as_deref(),
+                            )?;
+                            queries::hard_delete_item(conn, item_id)?;
+                            quarantined_items.insert(item_id.clone());
+                            summary.items_quarantined += 1;
                         }
                     }
                 }
             }
 
             for (item_id, field_id, blob, deleted) in &field_blobs {
-                match legacy_key.decrypt(blob) {
-                    Ok(plaintext) => {
+                if quarantined_items.contains(item_id) {
+                    // Parent item was quarantined: preserve this field's blob
+                    // alongside it and remove the orphan row.
+                    queries::insert_quarantine(
+                        conn, "field", item_id, Some(field_id), blob.as_deref(),
+                    )?;
+                    queries::hard_delete_field(conn, item_id, field_id)?;
+                    summary.fields_quarantined += 1;
+                    continue;
+                }
+                let decrypted: Option<String> = match blob.as_deref() {
+                    None => Some(String::new()),
+                    Some([]) => Some(String::new()),
+                    Some(bytes) => legacy_key.decrypt(bytes).ok(),
+                };
+                match decrypted {
+                    Some(plaintext) => {
                         let new_blob = crypto::aead::seal(&dek, plaintext.as_bytes())
                             .map_err(WalletError::EncryptionError)?;
                         queries::update_field_value_only(conn, item_id, field_id, &new_blob)?;
+                        summary.fields_migrated += 1;
                     }
-                    Err(e) => {
+                    None => {
                         if *deleted {
                             queries::hard_delete_field(conn, item_id, field_id)?;
+                            summary.deleted_purged += 1;
                         } else {
-                            return Err(WalletError::DecryptionError(
-                                format!("active field {item_id}/{field_id}: {e}"),
-                            ));
+                            queries::insert_quarantine(
+                                conn, "field", item_id, Some(field_id), blob.as_deref(),
+                            )?;
+                            queries::hard_delete_field(conn, item_id, field_id)?;
+                            summary.fields_quarantined += 1;
                         }
                     }
                 }
@@ -515,7 +609,11 @@ impl Wallet {
         // on an otherwise-successful, already-committed v6 migration.
         let _ = self.db.as_ref().unwrap().checkpoint();
 
-        // 6. Hold the DEK: the vault is now unlocked under v6.
+        // 6. Hold the DEK: the vault is now unlocked under v6. Record the
+        // outcome for the app's diagnostics log.
+        summary.key_mode = legacy_key.preferred_mode().as_str().to_string();
+        summary.duration_ms = started.elapsed().as_millis() as u64;
+        self.last_migration_summary = Some(summary);
         self.unlocked = Some(Unlocked { dek: Zeroizing::new(dek) });
         Ok(())
     }
@@ -870,6 +968,21 @@ pub(crate) mod tests {
     /// at the given count, crypto record dropped, version set to 5. This is
     /// the closest analogue of a real Xamarin 5.x database the migration sees.
     fn create_legacy_vault_with_data(encryption_count: u32) -> (TempDir, std::path::PathBuf) {
+        create_legacy_vault_with_data_and_email(
+            encryption_count,
+            &encryption_count.to_string(),
+        )
+    }
+
+    /// Like [`create_legacy_vault_with_data`], but the `email` column (the
+    /// count the app READS at unlock) is set independently from the count the
+    /// data was WRITTEN with — reproducing real 5.x vaults whose encrypt
+    /// callers hardcoded count 0 regardless of the stored value.
+    fn create_legacy_vault_with_data_and_email(
+        data_count: u32,
+        email_value: &str,
+    ) -> (TempDir, std::path::PathBuf) {
+        let encryption_count = data_count;
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_path_buf();
         let password = "TestPassword123";
@@ -890,7 +1003,7 @@ pub(crate) mod tests {
             )
         };
         for (id, blob, _) in &item_blobs {
-            let plaintext = wallet.dec_value(blob).unwrap();
+            let plaintext = wallet.dec_value(blob.as_deref().unwrap()).unwrap();
             let legacy = crypto::legacy::encrypt(&plaintext, password, encryption_count, None).unwrap();
             let conn = wallet.db.as_ref().unwrap().connection().unwrap();
             conn.execute(
@@ -899,7 +1012,7 @@ pub(crate) mod tests {
             ).unwrap();
         }
         for (iid, fid, blob, _) in &field_blobs {
-            let plaintext = wallet.dec_value(blob).unwrap();
+            let plaintext = wallet.dec_value(blob.as_deref().unwrap()).unwrap();
             let legacy = crypto::legacy::encrypt(&plaintext, password, encryption_count, None).unwrap();
             let conn = wallet.db.as_ref().unwrap().connection().unwrap();
             conn.execute(
@@ -912,7 +1025,7 @@ pub(crate) mod tests {
         conn.execute("DROP TABLE nswallet_crypto", []).unwrap();
         conn.execute(
             "UPDATE nswallet_properties SET version = '5', email = ?",
-            rusqlite::params![encryption_count.to_string()],
+            rusqlite::params![email_value],
         ).unwrap();
 
         drop(wallet);
@@ -920,7 +1033,7 @@ pub(crate) mod tests {
     }
 
     /// End-to-end v5→v6 migration over a vault with real data (exercises the
-    /// PreparedLegacyKey bulk path): unlock with the correct password must
+    /// LegacyKeyChain bulk path): unlock with the correct password must
     /// migrate every item and field intact and leave a pre-v6 snapshot behind.
     #[test]
     fn test_unlock_migrates_full_legacy_vault() {
@@ -962,6 +1075,156 @@ pub(crate) mod tests {
             assert!(wallet.unlock("TestPassword123").unwrap());
             assert_eq!(wallet.get_items().unwrap().len(), item_count);
         }
+    }
+
+    /// The realistic broken-user scenario from production: the `email` column
+    /// says 200, but every blob was written with count-0 keys (the 5.x app's
+    /// encrypt callers hardcoded 0). Before the key chain this vault rejected
+    /// the correct password; now it must unlock via the no-chain candidate.
+    #[test]
+    fn test_unlock_email200_vault_written_with_count0_keys() {
+        let (_temp, path) = create_legacy_vault_with_data_and_email(0, "200");
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(!wallet.unlock("WrongPassword").unwrap());
+        assert!(wallet.unlock("TestPassword123").unwrap());
+
+        let summary = wallet.last_migration_summary().unwrap().clone();
+        assert_eq!(summary.key_mode, "no_chain");
+        assert_eq!(summary.items_quarantined, 0);
+        assert_eq!(summary.fields_quarantined, 0);
+
+        let (item_count, legacy_item_id) = {
+            let items = wallet.get_items().unwrap();
+            let item = items.iter().find(|i| i.name == "Legacy Item").unwrap();
+            (items.len(), item.item_id.clone())
+        };
+        assert!(item_count >= 2);
+        let fields = wallet.get_fields_by_item(&legacy_item_id).unwrap();
+        assert_eq!(fields[0].value, "legacy_secret");
+    }
+
+    /// An undecryptable ACTIVE field must be quarantined (original blob
+    /// preserved), not abort the whole migration.
+    #[test]
+    fn test_migration_quarantines_undecryptable_active_field() {
+        use rusqlite::Connection;
+        let (_temp, path) = create_legacy_vault_with_data(0);
+
+        // Corrupt one active field with random bytes no key can decrypt.
+        let garbage: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04,
+                                    0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C];
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO nswallet_fields (item_id, field_id, type, value, sort_weight, change_timestamp, deleted)
+                 SELECT item_id, 'CORRUPT01', 'PASS', ?, 99, change_timestamp, 0
+                 FROM nswallet_fields LIMIT 1",
+                rusqlite::params![garbage],
+            ).unwrap();
+        }
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock("TestPassword123").unwrap());
+
+        let summary = wallet.last_migration_summary().unwrap().clone();
+        assert_eq!(summary.fields_quarantined, 1);
+        assert_eq!(summary.items_quarantined, 0);
+
+        // The good field survived with its value intact.
+        let items = wallet.get_items().unwrap();
+        let item_id = items.iter().find(|i| i.name == "Legacy Item").unwrap().item_id.clone();
+        let fields = wallet.get_fields_by_item(&item_id).unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].value, "legacy_secret");
+
+        // The original corrupt blob is preserved verbatim in quarantine.
+        let conn = Connection::open(&db_path).unwrap();
+        let (qtype, qblob): (String, Vec<u8>) = conn.query_row(
+            "SELECT record_type, blob FROM nswallet_quarantine",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(qtype, "field");
+        assert_eq!(qblob, garbage);
+    }
+
+    /// An undecryptable ACTIVE item is quarantined together with its fields
+    /// (even decryptable ones), and everything else migrates.
+    #[test]
+    fn test_migration_quarantines_item_and_cascades_fields() {
+        use rusqlite::Connection;
+        let (_temp, path) = create_legacy_vault_with_data(0);
+
+        let garbage: Vec<u8> = (0u8..48).map(|b| b.wrapping_mul(37).wrapping_add(11)).collect();
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE nswallet_items SET name = ? WHERE item_id =
+                   (SELECT item_id FROM nswallet_fields LIMIT 1)",
+                rusqlite::params![garbage],
+            ).unwrap();
+        }
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock("TestPassword123").unwrap());
+
+        let summary = wallet.last_migration_summary().unwrap().clone();
+        assert_eq!(summary.items_quarantined, 1);
+        assert_eq!(summary.fields_quarantined, 1); // cascade
+
+        // The corrupted item is gone from the live list; the folder remains.
+        let items = wallet.get_items().unwrap();
+        assert!(items.iter().any(|i| i.name == "Legacy Folder"));
+        assert!(!items.iter().any(|i| i.name == "Legacy Item"));
+
+        // Both original blobs preserved.
+        let conn = Connection::open(&db_path).unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nswallet_quarantine", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    /// NULL and zero-length blobs (real legacy databases have them) migrate
+    /// as empty values instead of failing the whole migration.
+    #[test]
+    fn test_migration_tolerates_null_and_empty_blobs() {
+        use rusqlite::Connection;
+        let (_temp, path) = create_legacy_vault_with_data(0);
+
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO nswallet_fields (item_id, field_id, type, value, sort_weight, change_timestamp, deleted)
+                 SELECT item_id, 'NULLVAL01', 'NOTE', NULL, 98, change_timestamp, 0
+                 FROM nswallet_fields LIMIT 1",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO nswallet_fields (item_id, field_id, type, value, sort_weight, change_timestamp, deleted)
+                 SELECT item_id, 'EMPTYVAL1', 'NOTE', X'', 97, change_timestamp, 0
+                 FROM nswallet_fields LIMIT 1",
+                [],
+            ).unwrap();
+        }
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock("TestPassword123").unwrap());
+
+        let summary = wallet.last_migration_summary().unwrap().clone();
+        assert_eq!(summary.fields_quarantined, 0);
+        assert_eq!(summary.items_quarantined, 0);
+
+        let items = wallet.get_items().unwrap();
+        let item_id = items.iter().find(|i| i.name == "Legacy Item").unwrap().item_id.clone();
+        let fields = wallet.get_fields_by_item(&item_id).unwrap();
+        assert_eq!(fields.len(), 3);
+        let empty_values = fields.iter().filter(|f| f.value.is_empty()).count();
+        assert_eq!(empty_values, 2);
     }
 
     #[test]

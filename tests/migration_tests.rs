@@ -5,7 +5,8 @@
 //! - golden snapshot equivalence (the user must see no difference);
 //! - migration markers (version 6, crypto record, AEAD blobs, kept pre-v6 backup);
 //! - idempotency, wrong-password-no-mutation, crash/rollback;
-//! - undecryptable soft-deleted records are purged (active corruption aborts);
+//! - undecryptable soft-deleted records are purged; undecryptable ACTIVE
+//!   records are quarantined (blob preserved) and the migration completes;
 //! - change_password is a cheap DEK re-wrap (data blobs unchanged);
 //! - backups restore and migrate in both directions;
 //! - stored KDF params are honoured (future-hardening path).
@@ -300,16 +301,83 @@ fn wrong_password_does_not_migrate_or_mutate() {
 // ── E. crash/rollback + purge policy ────────────────────────────────────────
 
 #[test]
-fn corrupt_active_record_aborts_and_rolls_back() {
+fn corrupt_active_item_is_quarantined_and_migration_succeeds() {
+    // Since 0.2.6 an undecryptable ACTIVE record no longer aborts the whole
+    // migration (that locked users out of every other record): it is
+    // quarantined with its original blob preserved, and the vault migrates.
     let (_t, folder) = fresh_real_vault();
     let db = folder.join("nswallet.dat");
 
-    // Corrupt one ACTIVE, non-root item's blob so it cannot be decrypted.
-    {
+    // Corrupt one ACTIVE, non-root item that has fields (cascade coverage).
+    let garbage = vec![0u8; 48];
+    let victim: String = {
         let conn = Connection::open(&db).unwrap();
         let victim: String = conn
             .query_row(
-                "SELECT item_id FROM nswallet_items WHERE deleted = 0 AND item_id != '__ROOT__' LIMIT 1",
+                "SELECT i.item_id FROM nswallet_items i
+                 JOIN nswallet_fields f ON f.item_id = i.item_id
+                 WHERE i.deleted = 0 AND i.item_id != '__ROOT__' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE nswallet_items SET name = ? WHERE item_id = ?",
+            rusqlite::params![garbage, victim],
+        )
+        .unwrap();
+        victim
+    };
+
+    let mut wallet = Wallet::open(&folder).unwrap();
+    assert!(
+        wallet.unlock(TEST_PASSWORD).unwrap(),
+        "active corruption must not block the unlock anymore"
+    );
+
+    // Fully migrated.
+    let summary = wallet.last_migration_summary().unwrap().clone();
+    assert_eq!(summary.items_quarantined, 1);
+    assert!(summary.fields_quarantined >= 1, "victim's fields must cascade into quarantine");
+    drop(wallet);
+    assert_eq!(db_version(&db), "6");
+    assert!(crypto_table_exists(&db));
+
+    // The victim is out of the live tables but its original bytes are kept.
+    let conn = Connection::open(&db).unwrap();
+    let live: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nswallet_items WHERE item_id = ?",
+            rusqlite::params![victim],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 0);
+    let preserved: Vec<u8> = conn
+        .query_row(
+            "SELECT blob FROM nswallet_quarantine WHERE record_type = 'item' AND item_id = ?",
+            rusqlite::params![victim],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(preserved, garbage, "original blob must be preserved verbatim");
+}
+
+#[test]
+fn corrupt_record_migration_keeps_all_other_data() {
+    // Data-equivalence guarantee of the quarantine path: everything except
+    // the corrupted item (and its fields) survives the migration bit-exact.
+    let (_t, folder) = fresh_real_vault();
+    let db = folder.join("nswallet.dat");
+    let mut before = legacy_snapshot(&db, TEST_PASSWORD);
+
+    let victim: String = {
+        let conn = Connection::open(&db).unwrap();
+        let victim: String = conn
+            .query_row(
+                "SELECT i.item_id FROM nswallet_items i
+                 JOIN nswallet_fields f ON f.item_id = i.item_id
+                 WHERE i.deleted = 0 AND i.item_id != '__ROOT__' LIMIT 1",
                 [],
                 |r| r.get(0),
             )
@@ -319,79 +387,23 @@ fn corrupt_active_record_aborts_and_rolls_back() {
             rusqlite::params![vec![0u8; 48], victim],
         )
         .unwrap();
-    }
-
-    let mut wallet = Wallet::open(&folder).unwrap();
-    // Password is correct (root still decrypts), but an active record is broken:
-    // migration must abort with an error.
-    assert!(wallet.unlock(TEST_PASSWORD).is_err(), "active corruption must abort migration");
-    drop(wallet);
-
-    // Rolled back: still v5-era, no crypto record.
-    assert_ne!(db_version(&db), "6");
-    assert!(!crypto_table_exists(&db), "aborted migration must roll back the crypto record");
-}
-
-#[test]
-fn failed_migration_rolls_back_to_working_v5_and_recovers_on_retry() {
-    // Simulates a transient mid-migration failure: the re-encryption aborts part
-    // way, the transaction rolls back, the vault stays a fully-working v5, and a
-    // later retry (once the fault clears) migrates cleanly with no data lost.
-    let (_t, folder) = fresh_real_vault();
-    let db = folder.join("nswallet.dat");
-    let before = legacy_snapshot(&db, TEST_PASSWORD);
-
-    // Stash an active, non-root item's valid blob, then corrupt it so the
-    // migration aborts mid-pass.
-    let (victim, original_blob): (String, Vec<u8>) = {
-        let conn = Connection::open(&db).unwrap();
-        conn.query_row(
-            "SELECT item_id, name FROM nswallet_items WHERE deleted = 0 AND item_id != '__ROOT__' LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap()
+        victim
     };
-    {
-        let conn = Connection::open(&db).unwrap();
-        conn.execute(
-            "UPDATE nswallet_items SET name = ? WHERE item_id = ?",
-            rusqlite::params![vec![0u8; 48], victim],
-        )
-        .unwrap();
-    }
 
-    // Attempt 1: migration aborts and rolls back.
-    {
-        let mut wallet = Wallet::open(&folder).unwrap();
-        assert!(wallet.unlock(TEST_PASSWORD).is_err(), "mid-migration failure must abort");
-    }
-    assert_ne!(db_version(&db), "6", "must not be v6 after a failed migration");
-    assert!(!crypto_table_exists(&db), "crypto record must have rolled back");
+    // Expected outcome: the before-snapshot minus the victim and every one of
+    // its fields (active or deleted — the cascade removes them all).
+    before.active_items.remove(&victim);
+    before.deleted_items.remove(&victim);
+    before.active_fields.retain(|(iid, _), _| iid != &victim);
+    before.deleted_fields.retain(|(iid, _), _| iid != &victim);
 
-    // The vault is still a working v5: the password verifies via the legacy
-    // path (read-only, no migration), and a wrong password is still rejected.
-    {
-        let wallet = Wallet::open(&folder).unwrap();
-        assert!(wallet.check_password(TEST_PASSWORD).unwrap(), "v5 vault must still verify");
-        assert!(!wallet.check_password("wrong").unwrap());
-    }
-
-    // Clear the transient fault (restore the original blob) and retry.
-    {
-        let conn = Connection::open(&db).unwrap();
-        conn.execute(
-            "UPDATE nswallet_items SET name = ? WHERE item_id = ?",
-            rusqlite::params![original_blob, victim],
-        )
-        .unwrap();
-    }
-
-    // Attempt 2: migrates cleanly, all readable data intact.
     let mut wallet = Wallet::open(&folder).unwrap();
-    assert!(wallet.unlock(TEST_PASSWORD).unwrap(), "retry must migrate cleanly");
-    assert_eq!(db_version(&db), "6");
-    assert_eq!(before, api_snapshot(&mut wallet), "no data lost across a failed + retried migration");
+    assert!(wallet.unlock(TEST_PASSWORD).unwrap());
+    assert_eq!(
+        before,
+        api_snapshot(&mut wallet),
+        "all records except the quarantined one must survive unchanged"
+    );
 }
 
 #[test]
