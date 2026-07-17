@@ -217,19 +217,17 @@ impl LegacyKeyChain {
             return Ok(plaintext);
         }
 
-        // Remaining candidates in declaration order.
+        // Remaining candidates in declaration order. Only the final failure
+        // message survives; the per-variant errors carry no extra signal.
         let mut last_err = String::from("no key candidate matched");
         for (idx, (_, key, ios_key)) in self.candidates.iter().enumerate() {
             if idx == self.preferred {
                 continue;
             }
-            match decrypt_with_key(ciphertext, key) {
-                Ok(plaintext) => {
-                    self.preferred = idx;
-                    self.prefer_ios = false;
-                    return Ok(plaintext);
-                }
-                Err(e) => last_err = e,
+            if let Ok(plaintext) = decrypt_with_key(ciphertext, key) {
+                self.preferred = idx;
+                self.prefer_ios = false;
+                return Ok(plaintext);
             }
             match decrypt_with_key(ciphertext, ios_key) {
                 Ok(plaintext) => {
