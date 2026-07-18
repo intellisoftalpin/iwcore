@@ -1679,6 +1679,102 @@ pub(crate) mod tests {
         assert_eq!(restored.field_type, "NOTE", "NULL metadata falls back to NOTE");
     }
 
+    /// The Nirav regression: a fully migrated, crypto-healthy v6 vault with a
+    /// NULL icon on one row. One NULL cosmetic column used to fail the whole
+    /// item listing (blank main screen, broken About).
+    #[test]
+    fn test_v6_vault_with_null_icon_and_folder_lists_fine() {
+        use rusqlite::Connection;
+        let (mut wallet, _temp) = create_test_wallet();
+        let a = wallet.add_item("Alpha", "document", false, None).unwrap();
+        wallet.add_item("Beta", "folder", true, None).unwrap();
+        wallet.add_field(&a, "PASS", "secret", None).unwrap();
+
+        let db_path = wallet.database_path();
+        drop(wallet);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE nswallet_items SET icon = NULL, folder = NULL WHERE name IS NOT NULL AND item_id != '__ROOT__'",
+                [],
+            ).unwrap();
+        }
+
+        let mut wallet = Wallet::open(db_path.parent().unwrap()).unwrap();
+        assert!(wallet.unlock("TestPassword123").unwrap());
+
+        let items = wallet.get_items().unwrap();
+        let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"Alpha"));
+        assert!(names.contains(&"Beta"));
+        // NULL folder defaults to non-folder; NULL icon to empty string.
+        assert!(items.iter().all(|i| !i.folder || i.item_id == "__ROOT__"));
+
+        // get_item (the About screen's getRootItem path) works too.
+        assert!(wallet.get_item(&a).unwrap().is_some());
+        // Stats keep counting the rows.
+        let stats = wallet.get_database_stats().unwrap();
+        assert_eq!(stats.total_items, 2);
+    }
+
+    /// A legacy vault riddled with every NULL an ancient writer could leave:
+    /// NULL icon, folder, deleted, field type, sort_weight, lang, plus a NULL
+    /// item name and a NULL field value. Must migrate and list completely.
+    #[test]
+    fn test_null_riddled_legacy_vault_migrates_and_lists() {
+        use rusqlite::Connection;
+        let (_temp, path) = create_legacy_vault_with_data(0);
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE nswallet_items SET icon = NULL, folder = NULL WHERE item_id != '__ROOT__'",
+                [],
+            ).unwrap();
+            conn.execute(
+                "UPDATE nswallet_items SET deleted = NULL WHERE item_id != '__ROOT__'",
+                [],
+            ).unwrap();
+            conn.execute(
+                "UPDATE nswallet_fields SET type = NULL, sort_weight = NULL, deleted = NULL",
+                [],
+            ).unwrap();
+            conn.execute("UPDATE nswallet_properties SET lang = NULL", []).unwrap();
+            // One extra active item with a NULL name and one field with a
+            // NULL value (legal in ancient databases).
+            conn.execute(
+                "INSERT INTO nswallet_items (item_id, parent_id, name, icon, folder, deleted)
+                 VALUES ('NULLNAME', '__ROOT__', NULL, NULL, NULL, NULL)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO nswallet_fields (item_id, field_id, type, value, deleted, sort_weight)
+                 VALUES ('NULLNAME', 'NV01', NULL, NULL, NULL, NULL)",
+                [],
+            ).unwrap();
+        }
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock("TestPassword123").unwrap());
+        let summary = wallet.last_migration_summary().unwrap().clone();
+        assert_eq!(summary.items_quarantined + summary.fields_quarantined, 0);
+
+        // Everything lists: the named items, the NULL-name item (empty name),
+        // and the NULL-value field (empty value, NOTE type).
+        let items = wallet.get_items().unwrap();
+        assert!(items.iter().any(|i| i.name == "Legacy Item"));
+        assert!(items.iter().any(|i| i.item_id == "NULLNAME" && i.name.is_empty()));
+
+        let null_fields = wallet.get_fields_by_item("NULLNAME").unwrap();
+        assert_eq!(null_fields.len(), 1);
+        assert_eq!(null_fields[0].value, "");
+        assert_eq!(null_fields[0].field_type, "NOTE");
+
+        // Properties readable despite NULL lang.
+        let props = wallet.get_properties().unwrap();
+        assert_eq!(props.lang, "en");
+    }
+
     #[test]
     fn test_compact_items() {
         let (mut wallet, _temp) = create_test_wallet();

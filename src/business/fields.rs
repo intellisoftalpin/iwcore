@@ -84,7 +84,13 @@ impl Wallet {
         let mut fields = Vec::with_capacity(raw_fields.len());
 
         for raw in raw_fields {
-            let value = self.dec_value(&raw.value_encrypted)?;
+            // NULL value columns arrive as empty blobs (COALESCE in the
+            // query); they carry no ciphertext, so the value is empty.
+            let value = if raw.value_encrypted.is_empty() {
+                String::new()
+            } else {
+                self.dec_value(&raw.value_encrypted)?
+            };
 
             let label = labels.get(&raw.field_type);
             let (label_name, icon, value_type) = match label {

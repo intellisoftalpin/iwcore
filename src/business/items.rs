@@ -63,7 +63,13 @@ impl Wallet {
         let mut items = Vec::with_capacity(raw_items.len());
 
         for raw in raw_items {
-            let name = self.dec_value(&raw.name_encrypted)?;
+            // NULL name columns arrive as empty blobs (COALESCE in the query);
+            // they carry no ciphertext, so the name is simply empty.
+            let name = if raw.name_encrypted.is_empty() {
+                String::new()
+            } else {
+                self.dec_value(&raw.name_encrypted)?
+            };
 
             items.push(IWItem {
                 item_id: raw.item_id,

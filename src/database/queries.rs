@@ -53,8 +53,11 @@ pub fn has_properties(conn: &Connection) -> Result<bool> {
 
 /// Get all properties from the database
 pub fn get_properties(conn: &Connection) -> Result<Option<RawProperties>> {
+    // COALESCE: ancient app generations left lang/version as SQL NULL, and a
+    // read error inside this closure is mapped to Ok(None) below, which would
+    // make a perfectly valid vault look like it has no properties row at all.
     let result = conn.query_row(
-        "SELECT database_id, lang, version, email, sync_timestamp, update_timestamp
+        "SELECT database_id, COALESCE(lang, 'en'), COALESCE(version, '4'), email, sync_timestamp, update_timestamp
          FROM nswallet_properties LIMIT 1",
         [],
         |row| {
@@ -225,7 +228,8 @@ pub type FieldBlobRow = (String, String, Option<Vec<u8>>, bool);
 /// SQL NULL blobs (the old sqlite-net layer wrote and read them happily);
 /// a NULL must not fail the whole read.
 pub fn get_all_item_blobs(conn: &Connection) -> Result<Vec<ItemBlobRow>> {
-    let mut stmt = conn.prepare("SELECT item_id, name, deleted FROM nswallet_items")?;
+    let mut stmt =
+        conn.prepare("SELECT item_id, name, COALESCE(deleted, 0) FROM nswallet_items")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0))
     })?;
@@ -236,7 +240,8 @@ pub fn get_all_item_blobs(conn: &Connection) -> Result<Vec<ItemBlobRow>> {
 /// including soft-deleted fields. Used by the v5->v6 re-encryption pass.
 /// NULL-safe like [`get_all_item_blobs`].
 pub fn get_all_field_blobs(conn: &Connection) -> Result<Vec<FieldBlobRow>> {
-    let mut stmt = conn.prepare("SELECT item_id, field_id, value, deleted FROM nswallet_fields")?;
+    let mut stmt = conn
+        .prepare("SELECT item_id, field_id, value, COALESCE(deleted, 0) FROM nswallet_fields")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)? != 0))
     })?;
@@ -483,7 +488,7 @@ pub fn get_sample_blobs(conn: &Connection, limit: usize) -> Result<Vec<Vec<u8>>>
     {
         let mut stmt = conn.prepare(
             "SELECT name FROM nswallet_items
-             WHERE deleted = 0 AND item_id != ? AND name IS NOT NULL AND length(name) > 0
+             WHERE COALESCE(deleted, 0) = 0 AND item_id != ? AND name IS NOT NULL AND length(name) > 0
              LIMIT ?",
         )?;
         let rows = stmt.query_map(
@@ -498,7 +503,7 @@ pub fn get_sample_blobs(conn: &Connection, limit: usize) -> Result<Vec<Vec<u8>>>
         let remaining = limit - out.len();
         let mut stmt = conn.prepare(
             "SELECT value FROM nswallet_fields
-             WHERE deleted = 0 AND value IS NOT NULL AND length(value) > 0
+             WHERE COALESCE(deleted, 0) = 0 AND value IS NOT NULL AND length(value) > 0
              LIMIT ?",
         )?;
         let rows = stmt.query_map([remaining as i64], |row| row.get::<_, Vec<u8>>(0))?;
@@ -515,9 +520,14 @@ pub fn get_sample_blobs(conn: &Connection, limit: usize) -> Result<Vec<Vec<u8>>>
 
 /// Get all items from database (encrypted)
 pub fn get_all_items_raw(conn: &Connection) -> Result<Vec<RawItem>> {
+    // COALESCE everywhere: rows written by 15-year-old app generations can
+    // carry NULL in icon/folder/name/deleted. One such row must not fail the
+    // whole listing (a single NULL icon used to blank the entire main screen).
+    // NULL deleted counts as active, matching the original C# app.
     let mut stmt = conn.prepare(
-        "SELECT item_id, parent_id, name, icon, folder, create_timestamp, change_timestamp, deleted
-         FROM nswallet_items WHERE deleted = 0"
+        "SELECT item_id, parent_id, COALESCE(name, X''), COALESCE(icon, ''), COALESCE(folder, 0),
+                create_timestamp, change_timestamp, COALESCE(deleted, 0)
+         FROM nswallet_items WHERE COALESCE(deleted, 0) = 0"
     )?;
 
     let items = stmt.query_map([], |row| {
@@ -536,14 +546,16 @@ pub fn get_all_items_raw(conn: &Connection) -> Result<Vec<RawItem>> {
     items.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-/// Get root item (encrypted name)
+/// Get root item (encrypted name). A root row with a NULL/empty name is
+/// treated as missing (`None`): it cannot verify any password, and the
+/// rootless self-healing path then rebuilds it during migration.
 pub fn get_root_item_raw(conn: &Connection) -> Result<Option<Vec<u8>>> {
     let result = conn.query_row(
         "SELECT name FROM nswallet_items WHERE item_id = '__ROOT__'",
         [],
-        |row| row.get(0),
+        |row| row.get::<_, Option<Vec<u8>>>(0),
     );
-    Ok(result.ok())
+    Ok(result.ok().flatten().filter(|b| !b.is_empty()))
 }
 
 /// Check if root item exists
@@ -638,7 +650,8 @@ pub fn delete_item(conn: &Connection, item_id: &str) -> Result<()> {
 /// Get all soft-deleted items from database (encrypted)
 pub fn get_deleted_items_raw(conn: &Connection) -> Result<Vec<RawItem>> {
     let mut stmt = conn.prepare(
-        "SELECT item_id, parent_id, name, COALESCE(icon, ''), folder, create_timestamp, change_timestamp, deleted
+        "SELECT item_id, parent_id, COALESCE(name, X''), COALESCE(icon, ''), COALESCE(folder, 0),
+                create_timestamp, change_timestamp, deleted
          FROM nswallet_items WHERE deleted = 1"
     )?;
 
@@ -711,9 +724,12 @@ pub fn update_item_name_only(conn: &Connection, item_id: &str, name_encrypted: &
 
 /// Get all fields from database (encrypted)
 pub fn get_all_fields_raw(conn: &Connection) -> Result<Vec<RawField>> {
+    // COALESCE: see get_all_items_raw. NULL type falls back to the generic
+    // NOTE label so the field stays visible; NULL value reads as empty.
     let mut stmt = conn.prepare(
-        "SELECT item_id, field_id, type, value, change_timestamp, deleted, sort_weight
-         FROM nswallet_fields WHERE deleted = 0"
+        "SELECT item_id, field_id, COALESCE(type, 'NOTE'), COALESCE(value, X''),
+                change_timestamp, COALESCE(deleted, 0), COALESCE(sort_weight, 0)
+         FROM nswallet_fields WHERE COALESCE(deleted, 0) = 0"
     )?;
 
     let fields = stmt.query_map([], |row| {
@@ -793,7 +809,8 @@ pub fn update_field_value_only(conn: &Connection, item_id: &str, field_id: &str,
 /// Get all soft-deleted fields from database (encrypted)
 pub fn get_deleted_fields_raw(conn: &Connection) -> Result<Vec<RawField>> {
     let mut stmt = conn.prepare(
-        "SELECT item_id, field_id, type, value, change_timestamp, deleted, sort_weight
+        "SELECT item_id, field_id, COALESCE(type, 'NOTE'), COALESCE(value, X''),
+                change_timestamp, deleted, COALESCE(sort_weight, 0)
          FROM nswallet_fields WHERE deleted = 1"
     )?;
 
@@ -901,28 +918,30 @@ pub struct DatabaseStats {
 
 /// Get database statistics (counts of items, fields, labels, deleted records)
 pub fn get_database_stats(conn: &Connection) -> Result<DatabaseStats> {
+    // COALESCE keeps rows with NULL deleted/folder/system (written by ancient
+    // app generations) counted the same way the listing queries surface them.
     let total_items: u32 = conn.query_row(
-        "SELECT COUNT(*) FROM nswallet_items WHERE deleted = 0 AND item_id != '__ROOT__' AND folder = 0",
+        "SELECT COUNT(*) FROM nswallet_items WHERE COALESCE(deleted, 0) = 0 AND item_id != '__ROOT__' AND COALESCE(folder, 0) = 0",
         [],
         |row| row.get(0),
     )?;
     let total_folders: u32 = conn.query_row(
-        "SELECT COUNT(*) FROM nswallet_items WHERE deleted = 0 AND item_id != '__ROOT__' AND folder = 1",
+        "SELECT COUNT(*) FROM nswallet_items WHERE COALESCE(deleted, 0) = 0 AND item_id != '__ROOT__' AND COALESCE(folder, 0) = 1",
         [],
         |row| row.get(0),
     )?;
     let total_fields: u32 = conn.query_row(
-        "SELECT COUNT(*) FROM nswallet_fields WHERE deleted = 0",
+        "SELECT COUNT(*) FROM nswallet_fields WHERE COALESCE(deleted, 0) = 0",
         [],
         |row| row.get(0),
     )?;
     let total_labels: u32 = conn.query_row(
-        "SELECT COUNT(*) FROM nswallet_labels WHERE deleted = 0",
+        "SELECT COUNT(*) FROM nswallet_labels WHERE COALESCE(deleted, 0) = 0",
         [],
         |row| row.get(0),
     )?;
     let custom_labels: u32 = conn.query_row(
-        "SELECT COUNT(*) FROM nswallet_labels WHERE deleted = 0 AND system = 0",
+        "SELECT COUNT(*) FROM nswallet_labels WHERE COALESCE(deleted, 0) = 0 AND COALESCE(system, 0) = 0",
         [],
         |row| row.get(0),
     )?;
@@ -952,8 +971,9 @@ pub fn get_database_stats(conn: &Connection) -> Result<DatabaseStats> {
 /// Get a single active field's raw data by field_id
 pub fn get_field_raw_by_id(conn: &Connection, field_id: &str) -> Result<Option<RawField>> {
     let result = conn.query_row(
-        "SELECT item_id, field_id, type, value, change_timestamp, deleted, sort_weight
-         FROM nswallet_fields WHERE field_id = ? AND deleted = 0",
+        "SELECT item_id, field_id, COALESCE(type, 'NOTE'), COALESCE(value, X''),
+                change_timestamp, COALESCE(deleted, 0), COALESCE(sort_weight, 0)
+         FROM nswallet_fields WHERE field_id = ? AND COALESCE(deleted, 0) = 0",
         params![field_id],
         |row| {
             Ok(RawField {
@@ -997,9 +1017,10 @@ pub fn get_max_field_weight(conn: &Connection, item_id: &str) -> Result<i32> {
 /// Get all labels from database (with usage count)
 pub fn get_all_labels(conn: &Connection) -> Result<Vec<RawLabel>> {
     let mut stmt = conn.prepare(
-        "SELECT l.field_type, l.label_name, l.value_type, l.icon, l.system, l.change_timestamp, l.deleted,
-                COALESCE((SELECT COUNT(*) FROM nswallet_fields f WHERE f.type = l.field_type AND f.deleted = 0), 0) as usage
-         FROM nswallet_labels l WHERE l.deleted = 0"
+        "SELECT l.field_type, COALESCE(l.label_name, ''), COALESCE(l.value_type, 'text'),
+                COALESCE(l.icon, ''), COALESCE(l.system, 0), l.change_timestamp, COALESCE(l.deleted, 0),
+                COALESCE((SELECT COUNT(*) FROM nswallet_fields f WHERE f.type = l.field_type AND COALESCE(f.deleted, 0) = 0), 0) as usage
+         FROM nswallet_labels l WHERE COALESCE(l.deleted, 0) = 0"
     )?;
 
     let labels = stmt.query_map([], |row| {
