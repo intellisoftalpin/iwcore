@@ -248,6 +248,12 @@ pub fn get_all_field_blobs(conn: &Connection) -> Result<Vec<FieldBlobRow>> {
 /// original encrypted blob is preserved verbatim so no byte of user data is
 /// ever destroyed; the row is then removed from the live table so the
 /// migrated vault contains only v6-readable records.
+///
+/// Since 0.2.8 the table also snapshots the row's structural metadata
+/// (parent, icon, type, timestamps) so a later recovery can restore the
+/// record fully. Tables created by 0.2.6/0.2.7 lack those columns; they are
+/// added in place, and recovery treats their NULL metadata with safe
+/// defaults.
 pub fn ensure_quarantine_table(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS nswallet_quarantine (
@@ -255,33 +261,252 @@ pub fn ensure_quarantine_table(conn: &Connection) -> Result<()> {
             item_id TEXT NOT NULL,
             field_id TEXT,
             blob BLOB,
+            parent_id TEXT,
+            icon TEXT,
+            folder INTEGER,
+            field_type TEXT,
+            sort_weight INTEGER,
+            create_timestamp TEXT,
+            change_timestamp TEXT,
             quarantined_at TEXT NOT NULL
         )",
         [],
     )?;
+
+    // Upgrade a 0.2.6/0.2.7-era table in place.
+    let mut existing: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(nswallet_quarantine)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for r in rows {
+            existing.push(r?);
+        }
+    }
+    for (col, ty) in [
+        ("parent_id", "TEXT"),
+        ("icon", "TEXT"),
+        ("folder", "INTEGER"),
+        ("field_type", "TEXT"),
+        ("sort_weight", "INTEGER"),
+        ("create_timestamp", "TEXT"),
+        ("change_timestamp", "TEXT"),
+    ] {
+        if !existing.iter().any(|c| c == col) {
+            conn.execute(
+                &format!("ALTER TABLE nswallet_quarantine ADD COLUMN {col} {ty}"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
-/// Preserve an undecryptable record's original blob in the quarantine table.
-pub fn insert_quarantine(
+fn quarantine_now() -> String {
+    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Quarantine an item: snapshot its blob AND structural metadata from the
+/// live row so recovery can rebuild it completely. Caller hard-deletes the
+/// live row afterwards.
+pub fn quarantine_item(conn: &Connection, item_id: &str, blob: Option<&[u8]>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO nswallet_quarantine
+            (record_type, item_id, field_id, blob, parent_id, icon, folder,
+             create_timestamp, change_timestamp, quarantined_at)
+         SELECT 'item', item_id, NULL, ?, parent_id, icon, folder,
+                create_timestamp, change_timestamp, ?
+         FROM nswallet_items WHERE item_id = ?",
+        rusqlite::params![blob, quarantine_now(), item_id],
+    )?;
+    Ok(())
+}
+
+/// Quarantine a field with its metadata. Caller hard-deletes the live row.
+pub fn quarantine_field(
     conn: &Connection,
-    record_type: &str,
     item_id: &str,
-    field_id: Option<&str>,
+    field_id: &str,
     blob: Option<&[u8]>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO nswallet_quarantine (record_type, item_id, field_id, blob, quarantined_at)
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO nswallet_quarantine
+            (record_type, item_id, field_id, blob, field_type, sort_weight,
+             change_timestamp, quarantined_at)
+         SELECT 'field', item_id, field_id, ?, type, sort_weight,
+                change_timestamp, ?
+         FROM nswallet_fields WHERE item_id = ? AND field_id = ?",
+        rusqlite::params![blob, quarantine_now(), item_id, field_id],
+    )?;
+    Ok(())
+}
+
+/// Number of quarantined records; 0 when the table does not exist yet.
+pub fn quarantine_count(conn: &Connection) -> Result<u32> {
+    let exists: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='nswallet_quarantine'",
+        [],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(0);
+    }
+    conn.query_row("SELECT COUNT(*) FROM nswallet_quarantine", [], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+/// One quarantined record, as needed by recovery.
+pub struct QuarantineRow {
+    pub rowid: i64,
+    pub record_type: String,
+    pub item_id: String,
+    pub field_id: Option<String>,
+    pub blob: Option<Vec<u8>>,
+    pub parent_id: Option<String>,
+    pub icon: Option<String>,
+    pub folder: Option<i64>,
+    pub field_type: Option<String>,
+    pub sort_weight: Option<i64>,
+    pub create_timestamp: Option<String>,
+    pub change_timestamp: Option<String>,
+}
+
+/// All quarantined records, items first (so recovered fields can find their
+/// recovered parents within one pass).
+pub fn get_quarantine_rows(conn: &Connection) -> Result<Vec<QuarantineRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT rowid, record_type, item_id, field_id, blob, parent_id, icon,
+                folder, field_type, sort_weight, create_timestamp, change_timestamp
+         FROM nswallet_quarantine
+         ORDER BY CASE record_type WHEN 'item' THEN 0 ELSE 1 END",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(QuarantineRow {
+            rowid: row.get(0)?,
+            record_type: row.get(1)?,
+            item_id: row.get(2)?,
+            field_id: row.get(3)?,
+            blob: row.get(4)?,
+            parent_id: row.get(5)?,
+            icon: row.get(6)?,
+            folder: row.get(7)?,
+            field_type: row.get(8)?,
+            sort_weight: row.get(9)?,
+            create_timestamp: row.get(10)?,
+            change_timestamp: row.get(11)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Remove a recovered record from quarantine (same transaction as the
+/// restore of its live row).
+pub fn delete_quarantine_row(conn: &Connection, rowid: i64) -> Result<()> {
+    conn.execute("DELETE FROM nswallet_quarantine WHERE rowid = ?", [rowid])?;
+    Ok(())
+}
+
+/// Whether a live item row with this id exists (any deleted state).
+pub fn item_row_exists(conn: &Connection, item_id: &str) -> Result<bool> {
+    let n: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM nswallet_items WHERE item_id = ?",
+        [item_id],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Whether a live field row with this key exists (any deleted state).
+pub fn field_row_exists(conn: &Connection, item_id: &str, field_id: &str) -> Result<bool> {
+    let n: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM nswallet_fields WHERE item_id = ? AND field_id = ?",
+        [item_id, field_id],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Restore a quarantined item into the live table with a freshly encrypted
+/// name blob. NULL metadata (0.2.6/0.2.7 quarantine rows) falls back to
+/// root-parented, non-folder, default icon, current timestamps.
+pub fn restore_quarantined_item(
+    conn: &Connection,
+    row: &QuarantineRow,
+    new_name_blob: &[u8],
+) -> Result<()> {
+    let now = quarantine_now();
+    conn.execute(
+        "INSERT INTO nswallet_items
+            (item_id, parent_id, name, icon, folder, create_timestamp, change_timestamp, deleted)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
         rusqlite::params![
-            record_type,
-            item_id,
-            field_id,
-            blob,
-            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            row.item_id,
+            row.parent_id.as_deref().unwrap_or(crate::ROOT_ID),
+            new_name_blob,
+            row.icon.as_deref().unwrap_or(""),
+            row.folder.unwrap_or(0),
+            row.create_timestamp.as_deref().unwrap_or(&now),
+            row.change_timestamp.as_deref().unwrap_or(&now),
         ],
     )?;
     Ok(())
+}
+
+/// Restore a quarantined field into the live table with a freshly encrypted
+/// value blob. NULL metadata falls back to a NOTE field with default weight.
+pub fn restore_quarantined_field(
+    conn: &Connection,
+    row: &QuarantineRow,
+    new_value_blob: &[u8],
+) -> Result<()> {
+    let now = quarantine_now();
+    conn.execute(
+        "INSERT INTO nswallet_fields
+            (item_id, field_id, type, value, sort_weight, change_timestamp, deleted)
+         VALUES (?, ?, ?, ?, ?, ?, 0)",
+        rusqlite::params![
+            row.item_id,
+            row.field_id,
+            row.field_type.as_deref().unwrap_or("NOTE"),
+            new_value_blob,
+            row.sort_weight.unwrap_or(0),
+            row.change_timestamp.as_deref().unwrap_or(&now),
+        ],
+    )?;
+    Ok(())
+}
+
+/// A sample of active encrypted blobs (items first, then fields) used to
+/// verify a password against the DATA when the root record is missing.
+/// NULL/empty blobs are excluded: they cannot verify anything.
+pub fn get_sample_blobs(conn: &Connection, limit: usize) -> Result<Vec<Vec<u8>>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT name FROM nswallet_items
+             WHERE deleted = 0 AND item_id != ? AND name IS NOT NULL AND length(name) > 0
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![crate::ROOT_ID, limit as i64],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        for r in rows {
+            out.push(r?);
+        }
+    }
+    if out.len() < limit {
+        let remaining = limit - out.len();
+        let mut stmt = conn.prepare(
+            "SELECT value FROM nswallet_fields
+             WHERE deleted = 0 AND value IS NOT NULL AND length(value) > 0
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map([remaining as i64], |row| row.get::<_, Vec<u8>>(0))?;
+        for r in rows {
+            out.push(r?);
+        }
+    }
+    Ok(out)
 }
 
 // ============================================================================
@@ -340,13 +565,28 @@ pub fn create_item(
     icon: &str,
     folder: bool,
 ) -> Result<()> {
+    create_item_no_checkpoint(conn, item_id, parent_id, name_encrypted, icon, folder)?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+
+/// Like [`create_item`] but without the trailing WAL checkpoint, for use
+/// inside an open transaction (a checkpoint there fails with
+/// "database table is locked").
+pub fn create_item_no_checkpoint(
+    conn: &Connection,
+    item_id: &str,
+    parent_id: &str,
+    name_encrypted: &[u8],
+    icon: &str,
+    folder: bool,
+) -> Result<()> {
     let now = now_timestamp();
     conn.execute(
         "INSERT INTO nswallet_items (item_id, parent_id, name, icon, folder, create_timestamp, change_timestamp, deleted)
          VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
         params![item_id, parent_id, name_encrypted, icon, folder as i32, now, now],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
     Ok(())
 }
 
@@ -625,6 +865,13 @@ pub fn purge_deleted(conn: &Connection) -> Result<(u32, u32)> {
         "DELETE FROM nswallet_labels WHERE deleted = 1",
         [],
     )?;
+
+    // Physically erase the purged records and return the freed pages to the
+    // filesystem. Without this the DELETEs only unlink the rows: the file
+    // never shrinks and the encrypted blobs linger in free pages, which is
+    // weaker than the "permanently purge" this feature promises. VACUUM must
+    // run outside a transaction, which holds here.
+    conn.execute_batch("VACUUM")?;
 
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
 

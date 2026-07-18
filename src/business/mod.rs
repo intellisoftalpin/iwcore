@@ -10,4 +10,4 @@ pub mod labels;
 pub mod search;
 pub mod export;
 
-pub use wallet::{MigrationSummary, Wallet};
+pub use wallet::{MigrationSummary, RecoveryResult, Wallet};

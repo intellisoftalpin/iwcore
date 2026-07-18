@@ -48,7 +48,25 @@ pub struct MigrationSummary {
     pub fields_quarantined: u32,
     /// Soft-deleted undecryptable records purged (pre-existing dead history).
     pub deleted_purged: u32,
+    /// Records decrypted per key derivation (forensics for support logs).
+    pub mode_no_chain: u32,
+    pub mode_md5_chain: u32,
+    pub mode_raw_password: u32,
+    /// Whether the missing root record was synthesized during this migration.
+    pub root_created: bool,
     pub duration_ms: u64,
+}
+
+/// Outcome of one quarantine recovery pass.
+#[derive(Debug, Clone)]
+pub struct RecoveryResult {
+    pub recovered_items: u32,
+    pub recovered_fields: u32,
+    /// Decryptable fields whose parent item is not in the live tables; they
+    /// stay quarantined until the parent is recovered or re-created.
+    pub waiting_for_parent: u32,
+    /// Records that did not decrypt under this password (still quarantined).
+    pub remaining: u32,
 }
 
 /// Draw `n` cryptographically random bytes from the OS CSPRNG.
@@ -236,30 +254,169 @@ impl Wallet {
                 None => Ok(false),
             }
         } else {
-            // Legacy v5 vault: verify against the root item using the full
-            // candidate-key chain (the C# app effectively used up to three
-            // different key derivations over its life), then migrate with
-            // the chain that verified.
-            let Some(encrypted_name) = root_blob else {
-                return Err(WalletError::DatabaseError("Root item not found".to_string()));
-            };
+            // Legacy v5 vault: verify the password using the full
+            // candidate-key chain (the C# app effectively used several key
+            // derivations over its life), then migrate with the chain that
+            // verified.
             let mut key_chain =
                 crypto::legacy::LegacyKeyChain::new(password, self.encryption_count);
-            if key_chain.decrypt(&encrypted_name).is_err() {
-                return Ok(false);
-            }
+            let create_root = match &root_blob {
+                Some(encrypted_name) => {
+                    if key_chain.decrypt(encrypted_name).is_err() {
+                        return Ok(false);
+                    }
+                    false
+                }
+                None => {
+                    // Old apps could lose the root record while keeping every
+                    // item and field (their login silently re-created it).
+                    // Verify the password against the DATA itself; the
+                    // migration then synthesizes the missing root.
+                    if !self.verify_password_against_sample(&mut key_chain)? {
+                        return Ok(false);
+                    }
+                    true
+                }
+            };
             // Password verified. Perform the one-time migration (sets the DEK).
-            self.migrate_v5_to_v6(password, key_chain)?;
+            self.migrate_v5_to_v6(password, key_chain, create_root)?;
             self.clear_caches();
             self.add_system_labels()?;
             Ok(true)
         }
     }
 
+    /// Verify a password against a sample of active data blobs (used when the
+    /// root record is missing). Returns Ok(true) when any sampled record
+    /// decrypts (checksum-validated, so a false positive is practically
+    /// impossible), Ok(false) for a wrong password. A vault with no sampled
+    /// data cannot verify any password and errors out: it also has nothing
+    /// to lose, so the caller-facing flow treats it like a broken database
+    /// rather than accepting an arbitrary password.
+    fn verify_password_against_sample(
+        &self,
+        key_chain: &mut crypto::legacy::LegacyKeyChain,
+    ) -> Result<bool> {
+        let samples = {
+            let conn = self.db.as_ref()
+                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+                .connection()?;
+            queries::get_sample_blobs(conn, 20)?
+        };
+        if samples.is_empty() {
+            return Err(WalletError::DatabaseError(
+                "Legacy vault has no root record and no data to verify a password against"
+                    .to_string(),
+            ));
+        }
+        Ok(samples.iter().any(|blob| key_chain.decrypt(blob).is_ok()))
+    }
+
     /// Outcome of the v5->v6 migration when this wallet session performed
     /// one; `None` for vaults that were already v6 at unlock.
     pub fn last_migration_summary(&self) -> Option<&MigrationSummary> {
         self.last_migration_summary.as_ref()
+    }
+
+    /// Number of quarantined records (0 when none / no quarantine table).
+    pub fn quarantine_count(&self) -> Result<u32> {
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+        queries::quarantine_count(conn)
+    }
+
+    /// Try to recover quarantined records with `password` (which may differ
+    /// from the vault's master password: old-app flows could re-create the
+    /// root under a new password while the data stayed under the previous
+    /// one). Every record that decrypts under the full candidate-key matrix
+    /// is re-encrypted under the vault DEK and restored into the live
+    /// tables; its quarantine row is removed in the same transaction.
+    ///
+    /// Ordering is orphan-safe: items restore before fields, and a field
+    /// whose parent item is absent from the live tables stays quarantined
+    /// (`waiting_for_parent`) until the parent exists. A wrong password is a
+    /// strict no-op. Repeatable any number of times.
+    pub fn recover_quarantined(&mut self, password: &str) -> Result<RecoveryResult> {
+        self.ensure_unlocked()?;
+        let dek = *self.dek()?;
+        let mut chain = crypto::legacy::LegacyKeyChain::new(password, self.encryption_count);
+
+        let rows = {
+            let conn = self.db.as_ref()
+                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+                .connection()?;
+            queries::ensure_quarantine_table(conn)?;
+            queries::get_quarantine_rows(conn)?
+        };
+
+        let mut result = RecoveryResult {
+            recovered_items: 0,
+            recovered_fields: 0,
+            waiting_for_parent: 0,
+            remaining: 0,
+        };
+        if rows.is_empty() {
+            return Ok(result);
+        }
+
+        let db = self.db.as_mut()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
+        db.begin_transaction()?;
+
+        let pass = (|| -> Result<()> {
+            let conn = db.connection()?;
+            // `get_quarantine_rows` orders items before fields, so a field's
+            // parent recovered in this same pass is already live.
+            for row in &rows {
+                let Some(blob) = row.blob.as_deref().filter(|b| !b.is_empty()) else {
+                    result.remaining += 1;
+                    continue;
+                };
+                let Ok(plaintext) = chain.decrypt(blob) else {
+                    result.remaining += 1;
+                    continue;
+                };
+                let new_blob = crypto::aead::seal(&dek, plaintext.as_bytes())
+                    .map_err(WalletError::EncryptionError)?;
+
+                if row.record_type == "item" {
+                    if queries::item_row_exists(conn, &row.item_id)? {
+                        // A live row already occupies this id; leave the
+                        // quarantine copy untouched rather than guessing.
+                        result.remaining += 1;
+                    } else {
+                        queries::restore_quarantined_item(conn, row, &new_blob)?;
+                        queries::delete_quarantine_row(conn, row.rowid)?;
+                        result.recovered_items += 1;
+                    }
+                } else {
+                    let field_id = row.field_id.as_deref().unwrap_or("");
+                    if !queries::item_row_exists(conn, &row.item_id)? {
+                        result.waiting_for_parent += 1;
+                    } else if queries::field_row_exists(conn, &row.item_id, field_id)? {
+                        result.remaining += 1;
+                    } else {
+                        queries::restore_quarantined_field(conn, row, &new_blob)?;
+                        queries::delete_quarantine_row(conn, row.rowid)?;
+                        result.recovered_fields += 1;
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        match pass {
+            Ok(()) => db.commit_transaction()?,
+            Err(e) => {
+                db.rollback_transaction()?;
+                return Err(e);
+            }
+        }
+
+        let _ = self.db.as_ref().unwrap().checkpoint();
+        self.clear_caches();
+        Ok(result)
     }
 
     /// Derive the KEK from `password` using the record's stored params and try
@@ -341,12 +498,13 @@ impl Wallet {
         if let Some(rec) = crypto_rec {
             Ok(self.unwrap_with_password(&rec, password).is_some())
         } else {
-            let Some(encrypted_name) = root_blob else {
-                return Err(WalletError::DatabaseError("Root item not found".to_string()));
-            };
             let encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()));
             let mut key_chain = crypto::legacy::LegacyKeyChain::new(password, encryption_count);
-            Ok(key_chain.decrypt(&encrypted_name).is_ok())
+            match &root_blob {
+                Some(encrypted_name) => Ok(key_chain.decrypt(encrypted_name).is_ok()),
+                // Rootless legacy vault: verify against the data, like unlock.
+                None => self.verify_password_against_sample(&mut key_chain),
+            }
         }
     }
 
@@ -454,6 +612,7 @@ impl Wallet {
         &mut self,
         password: &str,
         mut legacy_key: crypto::legacy::LegacyKeyChain,
+        create_root: bool,
     ) -> Result<()> {
         let started = std::time::Instant::now();
 
@@ -488,6 +647,10 @@ impl Wallet {
             items_quarantined: 0,
             fields_quarantined: 0,
             deleted_purged: 0,
+            mode_no_chain: 0,
+            mode_md5_chain: 0,
+            mode_raw_password: 0,
+            root_created: create_root,
             duration_ms: 0,
         };
         let mut quarantined_items: std::collections::HashSet<String> =
@@ -502,6 +665,16 @@ impl Wallet {
             queries::ensure_crypto_table(conn)?;
             queries::ensure_quarantine_table(conn)?;
 
+            // Tallies which derivation decrypted each record (forensics).
+            let count_mode = |summary: &mut MigrationSummary,
+                                  mode: crypto::legacy::LegacyKeyMode| {
+                match mode {
+                    crypto::legacy::LegacyKeyMode::NoChain => summary.mode_no_chain += 1,
+                    crypto::legacy::LegacyKeyMode::Md5Chain => summary.mode_md5_chain += 1,
+                    crypto::legacy::LegacyKeyMode::RawPassword => summary.mode_raw_password += 1,
+                }
+            };
+
             for (item_id, blob, deleted) in &item_blobs {
                 // NULL/empty blobs exist in real legacy databases (the old
                 // sqlite-net layer wrote and read them without complaint);
@@ -509,7 +682,13 @@ impl Wallet {
                 let decrypted: Option<String> = match blob.as_deref() {
                     None => Some(String::new()),
                     Some([]) => Some(String::new()),
-                    Some(bytes) => legacy_key.decrypt(bytes).ok(),
+                    Some(bytes) => match legacy_key.decrypt(bytes) {
+                        Ok(plaintext) => {
+                            count_mode(&mut summary, legacy_key.preferred_mode());
+                            Some(plaintext)
+                        }
+                        Err(_) => None,
+                    },
                 };
                 match decrypted {
                     Some(plaintext) => {
@@ -532,9 +711,7 @@ impl Wallet {
                             queries::hard_delete_item(conn, item_id)?;
                             summary.deleted_purged += 1;
                         } else {
-                            queries::insert_quarantine(
-                                conn, "item", item_id, None, blob.as_deref(),
-                            )?;
+                            queries::quarantine_item(conn, item_id, blob.as_deref())?;
                             queries::hard_delete_item(conn, item_id)?;
                             quarantined_items.insert(item_id.clone());
                             summary.items_quarantined += 1;
@@ -547,9 +724,7 @@ impl Wallet {
                 if quarantined_items.contains(item_id) {
                     // Parent item was quarantined: preserve this field's blob
                     // alongside it and remove the orphan row.
-                    queries::insert_quarantine(
-                        conn, "field", item_id, Some(field_id), blob.as_deref(),
-                    )?;
+                    queries::quarantine_field(conn, item_id, field_id, blob.as_deref())?;
                     queries::hard_delete_field(conn, item_id, field_id)?;
                     summary.fields_quarantined += 1;
                     continue;
@@ -557,7 +732,13 @@ impl Wallet {
                 let decrypted: Option<String> = match blob.as_deref() {
                     None => Some(String::new()),
                     Some([]) => Some(String::new()),
-                    Some(bytes) => legacy_key.decrypt(bytes).ok(),
+                    Some(bytes) => match legacy_key.decrypt(bytes) {
+                        Ok(plaintext) => {
+                            count_mode(&mut summary, legacy_key.preferred_mode());
+                            Some(plaintext)
+                        }
+                        Err(_) => None,
+                    },
                 };
                 match decrypted {
                     Some(plaintext) => {
@@ -571,14 +752,24 @@ impl Wallet {
                             queries::hard_delete_field(conn, item_id, field_id)?;
                             summary.deleted_purged += 1;
                         } else {
-                            queries::insert_quarantine(
-                                conn, "field", item_id, Some(field_id), blob.as_deref(),
-                            )?;
+                            queries::quarantine_field(conn, item_id, field_id, blob.as_deref())?;
                             queries::hard_delete_field(conn, item_id, field_id)?;
                             summary.fields_quarantined += 1;
                         }
                     }
                 }
+            }
+
+            // Synthesize the missing root record (rootless legacy vaults:
+            // the password was verified against the data instead). Content
+            // is a fresh random string, exactly like a newly created vault.
+            if create_root {
+                let root_data = crate::utils::generate_id(32);
+                let root_blob = crypto::aead::seal(&dek, root_data.as_bytes())
+                    .map_err(WalletError::EncryptionError)?;
+                queries::create_item_no_checkpoint(
+                    conn, ROOT_ID, ROOT_PARENT_ID, &root_blob, "", true,
+                )?;
             }
 
             queries::set_crypto_record(conn, &CryptoRecord {
@@ -1227,6 +1418,267 @@ pub(crate) mod tests {
         assert_eq!(empty_values, 2);
     }
 
+    /// Case 1+2: rootless legacy vault. Wrong password cleanly rejected;
+    /// correct password verifies against the data, migration synthesizes the
+    /// root, everything visible.
+    #[test]
+    fn test_unlock_rootless_vault() {
+        use rusqlite::Connection;
+        let (_temp, path) = create_legacy_vault_with_data(0);
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute("DELETE FROM nswallet_items WHERE item_id = '__ROOT__'", []).unwrap();
+        }
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(!wallet.unlock("WrongPassword").unwrap(), "wrong password must be rejected");
+        assert!(!wallet.is_unlocked());
+
+        assert!(wallet.unlock("TestPassword123").unwrap(), "data-verified unlock must succeed");
+        let summary = wallet.last_migration_summary().unwrap().clone();
+        assert!(summary.root_created);
+        assert_eq!(summary.items_quarantined, 0);
+        assert_eq!(summary.fields_quarantined, 0);
+
+        // Root exists again; data intact; fast v6 path on reopen.
+        {
+            let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+            assert!(queries::get_root_item_raw(conn).unwrap().is_some());
+        }
+        let items = wallet.get_items().unwrap();
+        assert!(items.iter().any(|i| i.name == "Legacy Item"));
+        drop(wallet);
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock("TestPassword123").unwrap());
+    }
+
+    /// Case 17: rootless AND empty vault: nothing to verify against, so the
+    /// unlock errors instead of accepting an arbitrary password.
+    #[test]
+    fn test_empty_rootless_vault_errors() {
+        use rusqlite::Connection;
+        let (_temp, path) = create_legacy_vault_with_data(0);
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute("DELETE FROM nswallet_items", []).unwrap();
+            conn.execute("DELETE FROM nswallet_fields", []).unwrap();
+        }
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock("AnyPassword123").is_err());
+    }
+
+    /// Case 5: email says 0 but the data was written with the historical
+    /// default MD5-chain (200): the extra candidate recovers everything
+    /// automatically, nothing quarantined.
+    #[test]
+    fn test_unlock_email0_vault_written_with_chain200_keys() {
+        let (_temp, path) = create_legacy_vault_with_data_and_email(200, "0");
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(!wallet.unlock("WrongPassword").unwrap());
+        assert!(wallet.unlock("TestPassword123").unwrap());
+
+        let summary = wallet.last_migration_summary().unwrap().clone();
+        assert_eq!(summary.items_quarantined + summary.fields_quarantined, 0);
+        assert!(summary.mode_md5_chain > 0, "default-count chain must have decrypted records");
+
+        let items = wallet.get_items().unwrap();
+        assert!(items.iter().any(|i| i.name == "Legacy Item"));
+    }
+
+    /// Case 6: one vault mixing chain-200 and count-0 records under a single
+    /// password: fully automatic, quarantine empty, both modes counted.
+    #[test]
+    fn test_unlock_vault_with_mixed_derivations() {
+        use rusqlite::Connection;
+        let password = "TestPassword123";
+        let (_temp, path) = create_legacy_vault_with_data_and_email(0, "0");
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        {
+            // Rewrite one field with the chain-200 derivation.
+            let conn = Connection::open(&db_path).unwrap();
+            let chained = crypto::legacy::encrypt("legacy_secret", password, 200, None).unwrap();
+            conn.execute(
+                "UPDATE nswallet_fields SET value = ?",
+                rusqlite::params![chained],
+            ).unwrap();
+        }
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password).unwrap());
+        let summary = wallet.last_migration_summary().unwrap().clone();
+        assert_eq!(summary.items_quarantined + summary.fields_quarantined, 0);
+        assert!(summary.mode_no_chain > 0);
+        assert!(summary.mode_md5_chain > 0);
+
+        let items = wallet.get_items().unwrap();
+        let item_id = items.iter().find(|i| i.name == "Legacy Item").unwrap().item_id.clone();
+        let fields = wallet.get_fields_by_item(&item_id).unwrap();
+        assert_eq!(fields[0].value, "legacy_secret");
+    }
+
+    /// Cases 7-9: the old-app hidden root re-creation replay. Root under
+    /// password B, data under password A: unlock with B succeeds and
+    /// quarantines the data; recovery with a wrong password is a no-op;
+    /// recovery with A restores everything; a second pass changes nothing.
+    #[test]
+    fn test_password_mixed_vault_quarantine_and_recovery() {
+        use rusqlite::Connection;
+        let password_a = "TestPassword123";
+        let password_b = "CompletelyOther456";
+        let (_temp, path) = create_legacy_vault_with_data(0);
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        {
+            // Replay CreateOnlyRootItem: fresh root under password B.
+            let conn = Connection::open(&db_path).unwrap();
+            let new_root = crypto::legacy::encrypt("recreated-root", password_b, 0, None).unwrap();
+            conn.execute(
+                "UPDATE nswallet_items SET name = ? WHERE item_id = '__ROOT__'",
+                rusqlite::params![new_root],
+            ).unwrap();
+        }
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password_b).unwrap(), "unlock verifies against the recreated root");
+        let summary = wallet.last_migration_summary().unwrap().clone();
+        assert_eq!(summary.items_quarantined, 2, "folder and item under A are quarantined");
+        assert_eq!(summary.fields_quarantined, 1);
+        assert_eq!(wallet.quarantine_count().unwrap(), 3);
+
+        // Wrong password: strict no-op.
+        let noop = wallet.recover_quarantined("StillWrong789").unwrap();
+        assert_eq!(noop.recovered_items + noop.recovered_fields, 0);
+        assert_eq!(noop.remaining, 3);
+        assert_eq!(wallet.quarantine_count().unwrap(), 3);
+
+        // Correct old password: full recovery.
+        let rec = wallet.recover_quarantined(password_a).unwrap();
+        assert_eq!(rec.recovered_items, 2);
+        assert_eq!(rec.recovered_fields, 1);
+        assert_eq!(rec.waiting_for_parent, 0);
+        assert_eq!(rec.remaining, 0);
+        assert_eq!(wallet.quarantine_count().unwrap(), 0);
+
+        let items = wallet.get_items().unwrap();
+        let item_id = items.iter().find(|i| i.name == "Legacy Item").unwrap().item_id.clone();
+        assert!(items.iter().any(|i| i.name == "Legacy Folder" && i.folder));
+        let fields = wallet.get_fields_by_item(&item_id).unwrap();
+        assert_eq!(fields[0].value, "legacy_secret");
+
+        // Idempotence.
+        let again = wallet.recover_quarantined(password_a).unwrap();
+        assert_eq!(again.recovered_items + again.recovered_fields + again.remaining, 0);
+
+        // The recovered vault is a perfectly normal v6: reopen + unlock with
+        // the vault password (B) works, data still there.
+        drop(wallet);
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password_b).unwrap());
+        assert!(wallet.get_items().unwrap().iter().any(|i| i.name == "Legacy Item"));
+    }
+
+    /// Case 16: orphan safety. A quarantined field whose parent item was
+    /// deleted after migration stays quarantined as waiting-for-parent.
+    #[test]
+    fn test_recovery_orphan_safety() {
+        use rusqlite::Connection;
+        let password_a = "TestPassword123";
+        let password_b = "CompletelyOther456";
+        let (_temp, path) = create_legacy_vault_with_data(0);
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        let item_id: String = {
+            // Only the FIELD is under password B; its item stays under A.
+            let conn = Connection::open(&db_path).unwrap();
+            let foreign = crypto::legacy::encrypt("foreign_value", password_b, 0, None).unwrap();
+            conn.execute("UPDATE nswallet_fields SET value = ?", rusqlite::params![foreign]).unwrap();
+            conn.query_row("SELECT item_id FROM nswallet_fields LIMIT 1", [], |r| r.get(0)).unwrap()
+        };
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password_a).unwrap());
+        assert_eq!(wallet.quarantine_count().unwrap(), 1);
+
+        // User deletes the parent item and purges it.
+        wallet.delete_item(&item_id).unwrap();
+        wallet.compact().unwrap();
+
+        let rec = wallet.recover_quarantined(password_b).unwrap();
+        assert_eq!(rec.recovered_fields, 0);
+        assert_eq!(rec.waiting_for_parent, 1);
+        assert_eq!(wallet.quarantine_count().unwrap(), 1, "field must stay preserved");
+    }
+
+    /// Case 15: compact/VACUUM never touches the quarantine.
+    #[test]
+    fn test_compact_preserves_quarantine() {
+        use rusqlite::Connection;
+        let password_b = "CompletelyOther456";
+        let (_temp, path) = create_legacy_vault_with_data(0);
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let foreign = crypto::legacy::encrypt("foreign_value", password_b, 0, None).unwrap();
+            conn.execute("UPDATE nswallet_fields SET value = ?", rusqlite::params![foreign]).unwrap();
+        }
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock("TestPassword123").unwrap());
+        assert_eq!(wallet.quarantine_count().unwrap(), 1);
+
+        wallet.compact().unwrap();
+        assert_eq!(wallet.quarantine_count().unwrap(), 1);
+    }
+
+    /// A quarantine table created by 0.2.6/0.2.7 (no metadata columns) is
+    /// upgraded in place, and its rows recover with safe defaults.
+    #[test]
+    fn test_recovery_from_old_schema_quarantine() {
+        use rusqlite::Connection;
+        let password = "TestPassword123";
+        let (_temp, path) = create_legacy_vault_with_data(0);
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password).unwrap());
+        let existing_item = wallet.get_items().unwrap()
+            .iter().find(|i| i.name == "Legacy Item").unwrap().item_id.clone();
+        drop(wallet);
+
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        {
+            // Fabricate the 0.2.6-era table with a field row lacking metadata.
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute("DROP TABLE IF EXISTS nswallet_quarantine", []).unwrap();
+            conn.execute(
+                "CREATE TABLE nswallet_quarantine (
+                    record_type TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    field_id TEXT,
+                    blob BLOB,
+                    quarantined_at TEXT NOT NULL
+                )",
+                [],
+            ).unwrap();
+            let blob = crypto::legacy::encrypt("old quarantine value", password, 0, None).unwrap();
+            conn.execute(
+                "INSERT INTO nswallet_quarantine (record_type, item_id, field_id, blob, quarantined_at)
+                 VALUES ('field', ?, 'OLDQF001', ?, '2026-07-01 00:00:00')",
+                rusqlite::params![existing_item, blob],
+            ).unwrap();
+        }
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password).unwrap());
+        let rec = wallet.recover_quarantined(password).unwrap();
+        assert_eq!(rec.recovered_fields, 1);
+        assert_eq!(wallet.quarantine_count().unwrap(), 0);
+
+        let fields = wallet.get_fields_by_item(&existing_item).unwrap();
+        let restored = fields.iter().find(|f| f.value == "old quarantine value").unwrap();
+        assert_eq!(restored.field_type, "NOTE", "NULL metadata falls back to NOTE");
+    }
+
     #[test]
     fn test_compact_items() {
         let (mut wallet, _temp) = create_test_wallet();
@@ -1312,6 +1764,39 @@ pub(crate) mod tests {
         let fields = wallet.get_fields_by_item(&item1).unwrap();
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].value, "keep@test.com");
+    }
+
+    /// Compact must VACUUM: after purging a bulky deleted record the file
+    /// itself shrinks, so the freed pages (and the encrypted blobs in them)
+    /// are physically gone, not just unlinked.
+    #[test]
+    fn test_compact_vacuums_and_shrinks_file() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let db_path = wallet.database_path();
+
+        // ~200 KB of field data spread over a few records.
+        let big_value = "x".repeat(50 * 1024);
+        let item_id = wallet.add_item("Bulky", "document", false, None).unwrap();
+        for _ in 0..4 {
+            wallet.add_field(&item_id, "NOTE", &big_value, None).unwrap();
+        }
+        wallet.db.as_ref().unwrap().checkpoint().unwrap();
+        let size_with_data = std::fs::metadata(&db_path).unwrap().len();
+        assert!(size_with_data > 200 * 1024);
+
+        wallet.delete_item(&item_id).unwrap();
+        wallet.compact().unwrap();
+
+        let size_after_compact = std::fs::metadata(&db_path).unwrap().len();
+        assert!(
+            size_after_compact < size_with_data / 2,
+            "compact must shrink the file (before: {size_with_data}, after: {size_after_compact})"
+        );
+
+        // The vault stays fully functional after the VACUUM.
+        wallet.lock();
+        assert!(wallet.unlock("TestPassword123").unwrap());
+        assert!(wallet.get_items().unwrap().iter().all(|i| i.name != "Bulky"));
     }
 
     #[test]

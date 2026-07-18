@@ -171,6 +171,12 @@ pub struct LegacyKeyChain {
 }
 
 impl LegacyKeyChain {
+    /// The historical default iteration count of the C# app (`// 200` in its
+    /// model). Tried as an extra MD5-chain candidate even when the stored
+    /// count differs, because real vaults exist whose `email` column was
+    /// lost, zeroed, or rewritten while the data kept the old derivation.
+    const DEFAULT_HISTORICAL_COUNT: u32 = 200;
+
     pub fn new(password: &str, re_encryption_count: u32) -> Self {
         let ios = |key: [u8; KEY_LENGTH]| {
             let mut k = key;
@@ -178,22 +184,27 @@ impl LegacyKeyChain {
             k
         };
 
-        let mut candidates = Vec::with_capacity(3);
-        if re_encryption_count == 0 {
-            let key = prepare_key(password, None, 0);
-            candidates.push((LegacyKeyMode::NoChain, key, ios(key)));
-        } else {
-            // Chain first: matches what this crate has always tried, so any
-            // vault that unlocked before keeps unlocking via the same key.
+        let mut candidates = Vec::with_capacity(4);
+        if re_encryption_count > 0 {
+            // Chain-with-stored-count first: matches what this crate has
+            // always tried, so any vault that unlocked before keeps
+            // unlocking via the same key on the first attempt.
             let chained = prepare_key(password, None, re_encryption_count);
             candidates.push((LegacyKeyMode::Md5Chain, chained, ios(chained)));
-            // What the 5.x app actually WROTE with (count hardcoded to 0).
-            let plain = prepare_key(password, None, 0);
-            candidates.push((LegacyKeyMode::NoChain, plain, ios(plain)));
-            // What the 5.x app DECRYPTED with when count > 0 (`key = hash`).
-            let raw = raw_password_key(password);
-            candidates.push((LegacyKeyMode::RawPassword, raw, ios(raw)));
         }
+        // What the 5.x app actually WROTE with (count hardcoded to 0). For
+        // count == 0 vaults this is the first and usually only attempt.
+        let plain = prepare_key(password, None, 0);
+        candidates.push((LegacyKeyMode::NoChain, plain, ios(plain)));
+        // The historical default chain, unless it is already covered above.
+        if re_encryption_count != Self::DEFAULT_HISTORICAL_COUNT {
+            let default_chained =
+                prepare_key(password, None, Self::DEFAULT_HISTORICAL_COUNT);
+            candidates.push((LegacyKeyMode::Md5Chain, default_chained, ios(default_chained)));
+        }
+        // What the 5.x app DECRYPTED with when count > 0 (`key = hash`).
+        let raw = raw_password_key(password);
+        candidates.push((LegacyKeyMode::RawPassword, raw, ios(raw)));
 
         Self { candidates, preferred: 0, prefer_ios: false }
     }
@@ -410,11 +421,33 @@ mod tests {
     }
 
     #[test]
-    fn test_key_chain_count0_has_single_candidate() {
+    fn test_key_chain_candidate_sets() {
+        // count 0: no-chain first (the healthy fast path), then the
+        // historical default chain and the raw key as fallbacks.
         let chain = LegacyKeyChain::new("TestPassword123!", 0);
-        assert_eq!(chain.candidates.len(), 1);
+        assert_eq!(chain.candidates.len(), 3);
+        assert_eq!(chain.candidates[0].0, LegacyKeyMode::NoChain);
+        // count == historical default: no duplicate chain candidate.
         let chain200 = LegacyKeyChain::new("TestPassword123!", 200);
         assert_eq!(chain200.candidates.len(), 3);
+        assert_eq!(chain200.candidates[0].0, LegacyKeyMode::Md5Chain);
+        // other count: stored chain + no-chain + default chain + raw.
+        let chain33 = LegacyKeyChain::new("TestPassword123!", 33);
+        assert_eq!(chain33.candidates.len(), 4);
+    }
+
+    #[test]
+    fn test_key_chain_default_count_fallback() {
+        // Vault whose email column reads 0/NULL but whose data was written
+        // with the historical default MD5 chain (200): the extra candidate
+        // must recover it.
+        let password = "TestPassword123!";
+        let blob = encrypt("chained under 200", password, 200, None).unwrap();
+        assert!(decrypt(&blob, password, 0, None).is_err());
+
+        let mut chain = LegacyKeyChain::new(password, 0);
+        assert_eq!(chain.decrypt(&blob).unwrap(), "chained under 200");
+        assert_eq!(chain.preferred_mode(), LegacyKeyMode::Md5Chain);
     }
 
     #[test]
