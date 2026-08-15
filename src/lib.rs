@@ -36,6 +36,7 @@ pub mod crypto;
 pub mod database;
 pub mod business;
 pub mod backup;
+pub mod autofill;
 pub mod localization;
 pub mod utils;
 pub mod error;

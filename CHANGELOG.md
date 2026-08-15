@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.3.0
+
+### Features
+
+- New `autofill` module: everything a platform autofill provider (the iOS
+  AutoFill extension, and later the Android `AutofillService`) needs, without
+  ever letting that provider open the vault.
+
+  - `autofill::index` builds a sealed snapshot of the vault's login entries.
+    Sealed as a single ChaCha20-Poly1305 blob with the plaintext header
+    authenticated as AAD, and padded to a 4 KiB boundary so the file size does
+    not disclose the entry count. Only entries that have a password, and only
+    the identity, password and link fields: notes, seed phrases, card numbers,
+    PINs and security answers are never copied.
+  - `autofill::journal` carries logins created inside the provider until the app
+    drains them. Records are dual-wrapped: to an app-only P-256 public key, and
+    under the shared index key. The first guarantees the app can always drain,
+    even after the index key is rotated or invalidated; the second lets the
+    provider show a login it just created. Records are independently sealed and
+    framed, so a torn write costs at most the last one.
+  - `autofill::identity` classifies a login identity into exactly one of `MAIL`,
+    `USER` or `ACNT`, and the index resolves the same three in that priority on
+    the way out, so an entry round-trips unchanged.
+  - `autofill::domain` normalizes free-text `LINK` values into comparable hosts
+    and precomputes registrable domains against a curated public suffix list, so
+    the provider needs no suffix list of its own. Includes a hand-rolled RFC 3492
+    punycode encoder rather than a dependency on the full IDNA crate chain.
+  - `Wallet::build_autofill_index` and `Wallet::drain_autofill_journal` tie it to
+    the vault. The plaintext credential set never leaves Rust: callers pass keys
+    in and get sealed bytes out.
+
+- Drained logins become ordinary items with ordinary field types. No schema
+  change, no new field type, no marker column, so older builds and the CLI read
+  them without knowing autofill exists.
+
+### Dependencies
+
+- Added `p256`, `hkdf` and `sha2` for the journal's ECDH key wrapping. The
+  construction (P-256 ECDH, HKDF-SHA256, ChaCha20-Poly1305 with a 96-bit nonce)
+  is deliberately limited to what Apple's CryptoKit exposes natively, so the iOS
+  extension needs no Rust and no third-party crypto of its own.
+
+### Compatibility
+
+- Purely additive. No change to the vault format, the schema, `open`, `unlock`
+  or `change_password`.
+
 ## 0.2.4
 
 ### Bug fixes
