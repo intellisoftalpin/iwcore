@@ -180,6 +180,38 @@ pub fn open_with_index_key(journal: &[u8], index_key: &[u8; KEY_LEN]) -> Vec<Pen
     })
 }
 
+/// Count the framed records in a journal without opening any of them.
+///
+/// The provider needs this at save time, where it must decide whether the cap
+/// has been reached but holds no key it is willing to use: on Android
+/// `onSaveRequest` runs with no authentication at all. Walking the length
+/// prefixes needs no key and reveals nothing beyond how many records are there,
+/// which the provider is about to be told anyway.
+///
+/// Stops at the first truncated frame, matching what the readers do, so a torn
+/// final write is not counted.
+pub fn count_records(journal: &[u8]) -> usize {
+    let mut count = 0usize;
+    let mut cursor = 0usize;
+
+    while cursor + 4 <= journal.len() {
+        let len = u32::from_le_bytes([
+            journal[cursor],
+            journal[cursor + 1],
+            journal[cursor + 2],
+            journal[cursor + 3],
+        ]) as usize;
+        cursor += 4;
+        if len == 0 || cursor + len > journal.len() {
+            break;
+        }
+        cursor += len;
+        count += 1;
+    }
+
+    count
+}
+
 /// Whether the provider may stage another record.
 pub fn can_accept(current_len: usize, current_records: usize) -> bool {
     current_records < MAX_RECORDS && current_len < MAX_BYTES
@@ -522,5 +554,30 @@ mod tests {
 
         r.identity_value = "a@bkv.me".into();
         assert_eq!(r.identity_kind(), IdentityKind::Mail, "classifier decides");
+    }
+
+    #[test]
+    fn records_are_counted_without_a_key() {
+        let keys = generate_keys().unwrap();
+        let mut journal = Vec::new();
+        assert_eq!(count_records(&journal), 0);
+
+        for i in 0..3 {
+            let sealed = seal_record(
+                &record(&format!("r{i}")),
+                &keys.journal_public,
+                &keys.index_key,
+            )
+            .unwrap();
+            journal.extend_from_slice(&sealed);
+            assert_eq!(count_records(&journal), i + 1);
+        }
+
+        // A torn final write is not counted, matching what the readers do.
+        let whole = count_records(&journal);
+        journal.truncate(journal.len() - 8);
+        assert_eq!(count_records(&journal), whole - 1);
+
+        assert_eq!(count_records(b"not a journal at all"), 0);
     }
 }

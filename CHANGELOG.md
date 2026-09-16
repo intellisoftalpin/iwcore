@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.4.0
+
+### Features
+
+- `Wallet::drain_autofill_journal` now reconciles staged records against the
+  vault before importing them.
+
+  A provider that cannot open the vault cannot know whether the login it just
+  captured is new. The Android `AutofillService` is handed a password by the
+  system with no authentication at all, so it cannot read the index at that
+  moment and stages every capture as a `Create`. The drain is the only place
+  with the whole vault open, so it is the place that decides:
+
+  - a create naming a login the vault already holds, with the same password, is
+    dropped;
+  - a create naming a login the vault already holds, with a different password,
+    becomes a password update on that item, with the previous value moved into
+    `OLDP`;
+  - anything else is imported into the `AutoFill` folder as before.
+
+  "Already holds" means a `LINK` resolving to the same host or the same
+  registrable domain, **and** the same identity value ignoring ASCII case.
+  Looser match tiers are deliberately rejected: importing a duplicate is
+  recoverable, overwriting the password of an entry that only loosely matched is
+  not.
+
+### Fixes
+
+- Draining the same journal twice no longer imports the login twice. Records
+  were deduplicated by `record_id` within a single journal only, so a crash
+  between writing to the vault and deleting the journal produced a duplicate on
+  the next drain, which the documentation already claimed could not happen.
+  Reconciliation closes it.
+
+### API
+
+- `DrainSummary` gains `unchanged`, the count of records dropped because the
+  vault already held them. Additive; existing fields are unchanged.
+- `autofill::journal::count_records` counts the framed records in a journal
+  without opening any of them. The provider needs the count to enforce the cap
+  at save time, where on Android it holds no key it is willing to use.
+
+No format change. The index layout, the journal framing, the key hierarchy and
+everything the iOS extension reads or writes are byte-identical to 0.3.0.
+
 ## 0.3.0
 
 ### Features
