@@ -16,6 +16,8 @@
 //!   automatic backup, never touching existing items);
 //! - [`export`]: the whole vault, losslessly.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+
 pub mod export;
 pub mod import;
 pub(crate) mod text;

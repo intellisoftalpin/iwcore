@@ -1,5 +1,98 @@
 # Changelog
 
+## 0.5.0
+
+### Features
+
+- **Passkeys** (new module `passkey`): IntelliWallet as a WebAuthn
+  authenticator, platform neutral, for the iOS and Android providers.
+  - A passkey is stored as a `PKEY` field on a login item (new system label,
+    value type `pass`, so apps older than passkey support mask it). The value is
+    a CXF-shaped JSON record; unknown fields survive round trips.
+  - `sign::register` / `sign::assert`: ES256 only, attestation `none` with the
+    IntelliWallet AAGUID `a2117fe2-e236-40fa-9481-ca437bd8b94e`, sign counter 0,
+    flags UP, BE, BS always and UV only when the user was verified; keys,
+    credential ids and PRF secrets from the OS random generator; deterministic
+    DER signatures; `excludeCredentials` honoured.
+  - `prf`: the WebAuthn PRF extension (`hmac-secret`), from raw inputs or
+    pre-hashed salts. Every new passkey gets PRF secrets; imported ones keep
+    theirs. The output is frozen by golden vectors.
+  - `json`: Android's WebAuthn creation / request JSON (untrusted, bounded and
+    validated), `clientDataJSON`, and the `PublicKeyCredential` response JSON.
+  - `origin`: rpId against a browser origin with the full Public Suffix List,
+    `android:apk-key-hash:` origins, `assetlinks.json` (`get_login_creds` only).
+  - `Wallet::list_passkeys`, `Wallet::passkey_summary`.
+  - `testdata/passkey-vectors.json`: every byte pinned, for the Swift
+    implementation too. Verified externally against Yubico's `fido2` server.
+- **AutoFill**: index format 2 carries passkeys (format 1 still opens); the
+  journal accepts `PendingOp::CreatePasskey` records (binary framing unchanged,
+  so every existing journal still reads); the drain applies staged passkeys
+  (replace the same account's passkey with the old one kept in the trash,
+  attach to the matching login, or a new item) and runs in one transaction.
+- **CXF import and export** (new module `cxf`, FIDO Credential Exchange Format
+  1.0): `Wallet::preview_cxf`, `Wallet::import_cxf` (automatic backup, one
+  transaction, never modifies existing items, duplicate-free) and
+  `Wallet::export_cxf` (whole vault or chosen folders, lossless). All 17 CXF
+  credential types are mapped.
+- `backup::inspect_backup_in`: a backup's date, entry count and passkey count,
+  without its password.
+
+### Security
+
+- Dependencies upgraded; `cargo audit` goes from 10 vulnerabilities and 19
+  warnings to none: `crypto-bigint` / `ctutils` timing fixes
+  (RUSTSEC-2026-0387, -0385) for P-256, `zip` 9 with Deflate only (removes the
+  zstd chain), `genpdf` (unmaintained, vulnerable `lopdf`) replaced by
+  `printpdf`, yanked crates replaced.
+- Restore streams the database with a 2 GiB cap (a crafted backup can no
+  longer exhaust memory) and replaces it atomically (a failure no longer leaves
+  a truncated database); stale `-wal` / `-shm` files are removed.
+- `Debug` of `IWField`, `FieldValueUsage`, `IndexEntry`, `PendingRecord` and
+  every new secret-holding type prints `[redacted]` instead of secrets.
+- A passkey's private key and PRF secrets never leave through `get_fields`,
+  `get_fields_by_item`, `get_deleted_fields`, `search` or the exports.
+- Long-lived secrets (data key, KDF salts, AutoFill keys, passkey keys) come
+  from the OS random generator directly (`crypto::rng`).
+- CI: `cargo deny` and `cargo audit` jobs, required for a release.
+
+### Fixes
+
+- `Wallet::move_item` refuses to move an item into itself or a descendant,
+  which detached that subtree.
+- CSV and PDF exports no longer loop forever on a vault with a parent cycle.
+- PDF export: a card taller than a page continues on the next page instead of
+  being clipped; files are about five times smaller.
+
+### API (breaking)
+
+- `WalletError` gains `InvalidInput`, `NotSupported`, `PasskeyExcluded`.
+- `autofill::PendingOp` gains `CreatePasskey`; `PendingRecord` gains `passkey`.
+- `autofill::DrainSummary` gains `passkeys_added`, `passkeys_replaced`.
+- `autofill::index::FORMAT_VERSION` is 2; new `build_with_passkeys`, `open_all`,
+  `IndexContents`, `PasskeyIndexEntry`.
+- `crypto::dek::generate_dek` returns `Result<Zeroizing<[u8; 32]>>`;
+  `autofill::crypto::random_key` and `random_bytes` return `Result`.
+- `add_field`, `update_field` and `copy_field` refuse the `PKEY` type;
+  `copy_item` skips passkeys; for a `PKEY` field, the public field API returns a
+  secret-free summary as the value.
+- A backup compressed with anything but Deflate or Stored is refused.
+
+### Tests
+
+- Backups written by iwcore 0.1.3, 0.1.27, 0.2.0, 0.2.9, 0.3.0 and 0.4.0
+  restore unchanged, field by field, and each then works with passkeys; CSV,
+  JSON and XML exports are pinned to golden files.
+- Property-based tests, fuzz targets (`fuzz/`, not published) for every
+  untrusted parser, mutation testing on the new modules.
+
+### Dependencies
+
+- New: `base64` 0.23.1, `hmac` 0.13.0, `psl` 2.1.245, `printpdf` 0.12.8
+  (default features off). Dev: `ciborium`, `coset`, `proptest`.
+- Removed: `genpdf`.
+- Apps should refresh their lockfile so the fixed `crypto-bigint` and `ctutils`
+  are picked up (iwcore does not ship a lockfile).
+
 ## 0.4.0
 
 ### Features

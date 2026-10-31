@@ -16,7 +16,7 @@
 //!
 //! # Limitation, stated plainly
 //!
-//! [`PUBLIC_SUFFIXES`] is a **curated subset** of the Mozilla Public Suffix
+//! `PUBLIC_SUFFIXES` is a **curated subset** of the Mozilla Public Suffix
 //! List, not the full list, chosen to keep a published library free of a large
 //! generated data table. Hosts under a multi-label suffix that is not listed
 //! fall back to last-two-labels, which can be too permissive. Exact-host

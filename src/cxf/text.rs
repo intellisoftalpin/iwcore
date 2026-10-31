@@ -226,15 +226,15 @@ fn unpct(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
+    while let Some(&b) = bytes.get(i) {
+        if b == b'%'
             && let Some(v) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())
         {
             out.push(v);
             i += 3;
             continue;
         }
-        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        out.push(if b == b'+' { b' ' } else { b });
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()

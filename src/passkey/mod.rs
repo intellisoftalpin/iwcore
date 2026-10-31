@@ -17,6 +17,8 @@
 //! Choices fixed for every passkey IntelliWallet creates: ES256 only, attestation
 //! `none`, sign counter always 0, backup eligible and backed up (`BE`, `BS`).
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+
 pub(crate) mod b64;
 pub mod record;
 pub mod webauthn;

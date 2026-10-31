@@ -607,25 +607,32 @@ impl Wallet {
         let mut used = vec![false; plan.folders.len()];
         for (i, item) in plan.items.iter().enumerate() {
             if keep.contains(&i) {
+                // Parents always come before their children in the plan, so
+                // this walk ends; it is bounded by the folder count regardless.
                 let mut f = Some(item.folder);
-                while let Some(idx) = f {
-                    used[idx] = true;
-                    f = plan.folders[idx].parent;
+                for _ in 0..=plan.folders.len() {
+                    let Some(idx) = f else { break };
+                    if let Some(slot) = used.get_mut(idx) {
+                        *slot = true;
+                    }
+                    f = plan.folders.get(idx).and_then(|x| x.parent);
                 }
             }
         }
         let mut folder_ids: Vec<Option<String>> = vec![None; plan.folders.len()];
         let mut top = Vec::new();
         for (idx, folder) in plan.folders.iter().enumerate() {
-            if !used[idx] {
+            if !used.get(idx).copied().unwrap_or(false) {
                 continue;
             }
-            let parent = folder.parent.and_then(|p| folder_ids[p].clone());
+            let parent = folder.parent.and_then(|p| folder_ids.get(p).cloned().flatten());
             let id = self.add_item(&folder.name, "folder", true, parent.as_deref())?;
             if folder.parent.is_none() {
                 top.push(id.clone());
             }
-            folder_ids[idx] = Some(id);
+            if let Some(slot) = folder_ids.get_mut(idx) {
+                *slot = Some(id);
+            }
         }
 
         let mut label_ids: HashMap<(String, &'static str), String> = HashMap::new();
@@ -643,7 +650,7 @@ impl Wallet {
             if !keep.contains(&i) {
                 continue;
             }
-            let parent = folder_ids[item.folder].clone();
+            let parent = folder_ids.get(item.folder).cloned().flatten();
             let item_id = self.add_item(&item.title, "document", false, parent.as_deref())?;
             for (weight, f) in item.fields.iter().enumerate() {
                 let field_type = match &f.kind {

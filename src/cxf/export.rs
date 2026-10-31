@@ -86,7 +86,10 @@ impl Wallet {
         let mut custom: Vec<Value> = Vec::new();
         let mut urls: Vec<String> = Vec::new();
         let mut used: HashSet<usize> = HashSet::new();
-        let find = |code: &str, used: &HashSet<usize>| fields.iter().position(|f| f.field_type == code).filter(|i| !used.contains(i));
+        let find = |code: &str, used: &HashSet<usize>| {
+            fields.iter().enumerate().find(|(i, f)| f.field_type == code && !used.contains(i)).map(|(i, _)| i)
+        };
+        let value = |i: usize| fields.get(i).map(|f| f.value.as_str()).unwrap_or_default();
 
         // One login: the first identity and the first password.
         let identity = ["USER", "MAIL", "ACNT"].iter().find_map(|c| find(c, &used));
@@ -95,11 +98,11 @@ impl Wallet {
             let mut cred = Map::new();
             cred.insert("type".into(), "basic-auth".into());
             if let Some(i) = identity {
-                cred.insert("username".into(), ef("string", &fields[i].value));
+                cred.insert("username".into(), ef("string", value(i)));
                 used.insert(i);
             }
             if let Some(i) = password {
-                cred.insert("password".into(), ef("concealed-string", &fields[i].value));
+                cred.insert("password".into(), ef("concealed-string", value(i)));
                 used.insert(i);
             }
             credentials.push(Value::Object(cred));
@@ -109,18 +112,18 @@ impl Wallet {
         if let Some(card) = find("CARD", &used) {
             let mut cred = Map::new();
             cred.insert("type".into(), "credit-card".into());
-            cred.insert("number".into(), ef("concealed-string", &fields[card].value));
+            cred.insert("number".into(), ef("concealed-string", value(card)));
             used.insert(card);
             for (code, member, kind) in [("NAME", "fullName", "string"), ("CVVC", "verificationNumber", "concealed-string"), ("PINC", "pin", "concealed-string")] {
                 if let Some(i) = find(code, &used) {
-                    cred.insert(member.into(), ef(kind, &fields[i].value));
+                    cred.insert(member.into(), ef(kind, value(i)));
                     used.insert(i);
                 }
             }
             if let Some(i) = find("EXPD", &used)
-                && let Some(iso) = text::vault_date_to_iso(&fields[i].value)
+                && let Some(iso) = text::vault_date_to_iso(value(i))
             {
-                cred.insert("expiryDate".into(), ef("year-month", &iso[..7]));
+                cred.insert("expiryDate".into(), ef("year-month", iso.get(..7).unwrap_or(&iso)));
                 used.insert(i);
             }
             credentials.push(Value::Object(cred));
@@ -156,11 +159,13 @@ impl Wallet {
                             "type": "totp", "secret": t.secret, "period": t.period, "digits": t.digits,
                             "algorithm": t.algorithm.to_ascii_lowercase(),
                         });
-                        if let Some(i) = t.issuer {
-                            cred["issuer"] = i.into();
-                        }
-                        if let Some(a) = t.account {
-                            cred["username"] = a.into();
+                        if let Some(obj) = cred.as_object_mut() {
+                            if let Some(i) = t.issuer {
+                                obj.insert("issuer".into(), i.into());
+                            }
+                            if let Some(a) = t.account {
+                                obj.insert("username".into(), a.into());
+                            }
                         }
                         credentials.push(cred);
                     }

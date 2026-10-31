@@ -1,0 +1,52 @@
+[package]
+name = "iwcore-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+iwcore = { path = ".." }
+tempfile = "3.27"
+
+# Not part of the iwcore workspace; run with `cargo +nightly fuzz run <target>`.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "cxf_preview"
+path = "fuzz_targets/cxf_preview.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "passkey_request"
+path = "fuzz_targets/passkey_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "passkey_record"
+path = "fuzz_targets/passkey_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "assetlinks"
+path = "fuzz_targets/assetlinks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal"
+path = "fuzz_targets/journal.rs"
+test = false
+doc = false
+bench = false

@@ -20,6 +20,8 @@ The core is **open by design**: anyone can audit exactly how IntelliWallet prote
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Usage](#opening-an-existing-wallet)
+- [Passkeys](#passkeys)
+- [Credential Exchange (CXF)](#credential-exchange-cxf)
 - [Field Types](#field-types)
 - [Supported Languages](#supported-languages)
 - [License](#license)
@@ -29,7 +31,9 @@ The core is **open by design**: anyone can audit exactly how IntelliWallet prote
 - **Authenticated Encryption** - XChaCha20-Poly1305 (AEAD) over a per-vault Data Encryption Key, wrapped by an Argon2id-derived key; unique nonce per value and built-in tamper detection
 - **SQLite Storage** - Reliable database storage with full ACID compliance
 - **Hierarchical Organization** - Organize items in folders with drag-and-drop support
-- **Custom Field Types** - 20 built-in field types (email, password, credit card, etc.) plus custom labels
+- **Passkeys** - A complete WebAuthn authenticator core (ES256): registration, sign-in, the PRF extension, Android's WebAuthn JSON and origin checks, stored in the vault and usable from platform autofill providers
+- **Credential Exchange (CXF)** - Import and export of the whole vault in the FIDO Credential Exchange Format 1.0, to move in from and out to other password managers
+- **Custom Field Types** - 23 built-in field types (email, password, credit card, passkey, etc.) plus custom labels
 - **Delete & Restore** - Soft-delete with full undo capability for items and fields
 - **Backup & Restore** - ZIP-based backup with versioning, auto-cleanup, and integrity verification
 - **Multi-language Support** - 11 languages included
@@ -66,7 +70,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-iwcore = "0.2.2"
+iwcore = "0.5"
 ```
 
 Or use cargo:
@@ -226,6 +230,60 @@ backup_mgr.cleanup_auto_backups(3, 30)?;
 Backups carry the database version, so newer backups are correctly rejected by older
 versions, while newer versions can read and migrate older backups on restore.
 
+## Passkeys
+
+A passkey is stored as a `PKEY` field on a login item. Its private key and PRF
+secrets never leave through the public field API: `get_fields` and friends show
+a secret-free summary, and exports print `Passkey · <site> · <user>`.
+
+```rust
+use iwcore::passkey::{json, sign};
+
+// A site asks to create a passkey (Android hands over WebAuthn JSON):
+let options = json::CreationOptions::parse(&request_json)?;
+let registration = sign::register(&sign::RegisterInput {
+    rp_id: "example.com",
+    user_name: &options.user_name,
+    user_display_name: &options.user_display_name,
+    user_handle: &options.user_id,
+    exclude_credentials: &options.exclude_credentials,
+    held_credential_ids: &held,   // ids the vault already holds
+    user_verified: true,          // after a biometric / passcode check
+    now: unix_seconds,
+})?;
+
+// Sign in:
+let assertion = sign::assert(&registration.record, "example.com", &client_data_hash, true)?;
+
+// What the app may show:
+for p in wallet.list_passkeys()? {
+    println!("{} · {}", p.rp_id, p.user_name);
+}
+```
+
+Fixed choices: ES256 only, attestation `none` with IntelliWallet's AAGUID
+`a2117fe2-e236-40fa-9481-ca437bd8b94e`, sign counter 0, backup eligible and
+backed up. PRF (`hmac-secret`) is answered from secrets created with every
+passkey and kept through every import and export. The exact bytes are pinned by
+`testdata/passkey-vectors.json`.
+
+## Credential Exchange (CXF)
+
+```rust
+use iwcore::cxf::{export::ExportOptions, import::ImportOptions};
+
+// Moving in: preview first (writes nothing), then import.
+let preview = wallet.preview_cxf(&payload)?;
+let report = wallet.import_cxf(&payload, &ImportOptions { backup_folder: backups.into() })?;
+
+// Moving out: the whole vault, losslessly.
+let cxf = wallet.export_cxf(&ExportOptions::default())?;
+```
+
+An import takes an automatic backup, writes everything in one transaction,
+never modifies existing items, and skips duplicates, so importing the same data
+twice adds nothing.
+
 ## Custom Labels
 
 ```rust
@@ -242,7 +300,7 @@ wallet.delete_label("CUST")?;
 
 ## Field Types
 
-iwcore supports 20 built-in field types:
+iwcore supports 23 built-in field types:
 
 | Code | Name | Value Type |
 |------|------|------------|
@@ -266,6 +324,9 @@ iwcore supports 20 built-in field types:
 | SANS | Secret Answer | text |
 | 2FAC | 2FA | text |
 | SEED | Seed Phrase | text |
+| CVVC | CVV | password |
+| WIFI | Wi-Fi Password | password |
+| PKEY | Passkey | password (masked; see [Passkeys](#passkeys)) |
 
 ## Supported Languages
 

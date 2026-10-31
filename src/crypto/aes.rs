@@ -153,7 +153,7 @@ fn raw_password_key(password: &str) -> [u8; KEY_LENGTH] {
 
 /// All plausible legacy key candidates for one vault, each with its
 /// iOS-workaround variant (first byte zeroed), tried in order until the
-/// MD5-checksum validation inside [`decrypt_with_key`] passes. The chain
+/// MD5-checksum validation inside `decrypt_with_key` passes. The chain
 /// remembers the last successful candidate/variant and tries it first for
 /// the next blob, so bulk migration pays no repeated derivation or failed
 /// AES passes once the vault's real mode is known.
