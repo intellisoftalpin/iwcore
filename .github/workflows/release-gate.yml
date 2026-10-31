@@ -24,6 +24,18 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check against the latest release on crates.io
         uses: obi1kenobi/cargo-semver-checks-action@v2
+      # In 0.x a minor bump may break the API, so the check above accepts every
+      # change. Evaluating as a patch-level (non-breaking) release lists each
+      # breaking change for the CHANGELOG; informational, never fails the gate.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: List breaking changes for the CHANGELOG
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo semver-checks check-release --release-type minor 2>&1 | tee semver.txt || true
+          { echo '### Breaking changes against the last release'; echo '```'; cat semver.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   docs-and-package:
     name: Docs and packaging

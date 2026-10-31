@@ -64,10 +64,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: RustSec advisories
-        uses: rustsec/audit-check@v2.0.0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      # A library commits no Cargo.lock: resolve the dependencies an app
+      # would get today, then audit that.
+      - name: Resolve dependencies
+        run: cargo generate-lockfile
+      - name: RustSec advisories
+        run: cargo audit
 
   coverage:
     name: Coverage
