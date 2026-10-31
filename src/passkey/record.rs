@@ -313,13 +313,11 @@ impl PasskeyRecord {
     }
 
     /// `fido2Extensions` as stored, for export.
-    #[allow(dead_code)] // used by the CXF export (Stage C.14)
     pub(crate) fn fido2_extensions(&self) -> Option<&Map<String, Value>> {
         self.fido2_extensions.as_ref()
     }
 
     /// PKCS#8 DER of the private key, for export only.
-    #[allow(dead_code)] // used by the CXF export (Stage C.14)
     pub(crate) fn pkcs8(&self) -> &[u8] {
         &self.key
     }
