@@ -1,0 +1,38 @@
+# cargo-deny policy for iwcore: a published crate that holds passwords and
+# private keys. `cargo deny check` runs in CI on every push and pull request.
+
+[graph]
+all-features = true
+
+[advisories]
+# Any RustSec advisory (vulnerability, unsound, unmaintained) or yanked crate
+# fails the check. An exception goes in `ignore` with its reason, never silently.
+version = 2
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
