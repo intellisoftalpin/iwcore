@@ -39,7 +39,9 @@ thiserror = "2.0.21"
 # Backups are only ever written with Deflate, so only Deflate is compiled in:
 # the default features would pull in zstd, bzip2, lzma and xz for nothing.
 zip = { version = "9.2.0", default-features = false, features = ["deflate"] }
-genpdf = "0.2"
+# PDF export. Default features off: they add an HTML/CSS layout engine that the
+# card layout in `export::pdf` does not need.
+printpdf = { version = "0.12.8", default-features = false }
 uuid = { version = "1.29.0", features = ["v4"] }
 rand = "0.10.3"
 tempfile = "3.27"
