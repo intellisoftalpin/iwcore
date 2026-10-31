@@ -250,6 +250,48 @@ mod tests {
         assert!(parse(&doc(json!([{"id": "a", "username": "", "email": "", "items": [], "collections": [c]}]))).is_err());
     }
 
+    /// A payload of exactly 64 MiB is read; one byte more is refused.
+    #[test]
+    fn payload_size_limit_is_inclusive() {
+        let mut at_limit = doc(json!([]));
+        at_limit.push_str(&" ".repeat(PAYLOAD_MAX - at_limit.len()));
+        assert!(parse(&at_limit).is_ok());
+        at_limit.push(' ');
+        assert!(parse(&at_limit).is_err());
+    }
+
+    /// Items are counted across accounts; exactly the limit is read.
+    #[test]
+    fn item_limit_is_inclusive_and_spans_accounts() {
+        let accounts = |n: usize| {
+            let first = vec![json!({}); n / 2];
+            let second = vec![json!({}); n - n / 2];
+            json!([{"id": "a", "items": first}, {"id": "b", "items": second}])
+        };
+        let h = parse(&doc(accounts(ITEMS_MAX))).unwrap();
+        assert_eq!(h.accounts.iter().map(|a| a.items.len()).sum::<usize>(), ITEMS_MAX);
+        assert!(parse(&doc(accounts(ITEMS_MAX + 1))).is_err());
+    }
+
+    /// Collections nested exactly to the limit are read.
+    #[test]
+    fn collection_depth_limit_is_inclusive() {
+        let mut c = json!({"title": "deep"});
+        for _ in 1..COLLECTION_DEPTH_MAX {
+            c = json!({"title": "deep", "subCollections": [c]});
+        }
+        let h = parse(&doc(json!([{"id": "a", "collections": [c.clone()]}]))).unwrap();
+        let mut depth = 0;
+        let mut level = h.accounts[0].collections.first();
+        while let Some(col) = level {
+            depth += 1;
+            level = col.sub.first();
+        }
+        assert_eq!(depth, COLLECTION_DEPTH_MAX);
+        let deeper = json!({"title": "deep", "subCollections": [c]});
+        assert!(parse(&doc(json!([{"id": "a", "collections": [deeper]}]))).is_err());
+    }
+
     #[test]
     fn links_to_other_accounts_are_ignored() {
         let h = parse(&doc(json!([{"id": "a", "username": "u", "email": "", "items": [],

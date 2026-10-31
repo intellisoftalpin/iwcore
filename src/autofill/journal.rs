@@ -586,6 +586,16 @@ mod tests {
     }
 
     #[test]
+    fn read_u16_reads_the_two_bytes_at_the_offset() {
+        for at in 0..6 {
+            let mut buf = vec![0xaa; at];
+            buf.extend_from_slice(&0x1234u16.to_le_bytes());
+            assert_eq!(read_u16(&buf, at), Some(0x1234), "offset {at}");
+            assert_eq!(read_u16(&buf[..buf.len() - 1], at), None, "offset {at}, one byte short");
+        }
+    }
+
+    #[test]
     fn records_are_counted_without_a_key() {
         let keys = generate_keys().unwrap();
         let mut journal = Vec::new();

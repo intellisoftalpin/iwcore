@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 use iwcore::cxf::export::ExportOptions;
-use iwcore::cxf::import::ImportOptions;
+use iwcore::cxf::import::{ImportOptions, KindCounts};
 use iwcore::passkey::sign::{self, RegisterInput};
 use iwcore::passkey::{prf, PasskeyRecord, FIELD_PASSKEY};
 use iwcore::{WalletError, Wallet};
@@ -250,6 +250,9 @@ fn unusable_passkeys_are_skipped_with_a_reason_and_no_secret() {
     let r = w.import_cxf(&payload(vec![json!({"id": "a", "title": "Bad", "credentials": bad})], vec![]), &opts(&t)).unwrap();
     assert_eq!(r.preview.skipped.len(), 4);
     assert!(r.preview.skipped[0].reason.contains("only P-256"));
+    for s in &r.preview.skipped[1..3] {
+        assert!(s.reason.starts_with("passkey is not usable: "), "{}", s.reason);
+    }
     for s in &r.preview.skipped {
         assert!(!s.reason.contains(&b64(&ed)));
     }
@@ -395,4 +398,272 @@ fn export_of_chosen_folders_only() {
     assert_eq!(v["accounts"][0]["collections"][0]["title"], "A");
     assert_eq!(v["accounts"][0]["collections"][0]["subCollections"][0]["title"], "A1");
     assert!(w.export_cxf(&ExportOptions { folder_ids: Some(vec!["nope".into()]) }).is_err());
+}
+
+/// The CXF credential each vault field type is written as.
+#[test]
+fn export_writes_each_field_type_as_its_credential() {
+    let (_t, mut w) = wallet();
+    let login = w.add_item("Login", "web", false, None).unwrap();
+    for (ty, v) in [("USER", "u1"), ("USER", "u2"), ("PASS", "p1"), ("LINK", "https://a.example")] {
+        w.add_field(&login, ty, v, None).unwrap();
+    }
+    let pw_only = w.add_item("Password only", "web", false, None).unwrap();
+    w.add_field(&pw_only, "PASS", "p2", None).unwrap();
+    let misc = w.add_item("Misc", "document", false, None).unwrap();
+    for (ty, v) in [
+        ("2FAC", "JBSWY3DPEHPK3PXP"), ("2FAC", "not a secret!"), ("NOTE", "a note"),
+        ("WIFI", "WIFI:S:open;T:nopass;P:;;"), ("WIFI", "WIFI:S:old;T:WEP;P:wep-key;H:true;;"),
+        ("WIFI", "WIFI:S:home;T:WPA;P:wpa-key;;"), ("ADDR", "Main St 1"),
+        ("OLDP", "old-pw"), ("SQUE", "Pet?"), ("DATE", "20260101"), ("DATE", "someday"),
+    ] {
+        w.add_field(&misc, ty, v, None).unwrap();
+    }
+
+    let doc = w.export_cxf(&ExportOptions::default()).unwrap();
+    let v: Value = serde_json::from_str(&doc).unwrap();
+    let items = v["accounts"][0]["items"].as_array().unwrap().clone();
+    let item = |title: &str| items.iter().find(|i| i["title"] == title).unwrap().clone();
+    let creds = |title: &str, ty: &str| -> Vec<Value> {
+        item(title)["credentials"].as_array().unwrap().iter().filter(|c| c["type"] == ty).cloned().collect()
+    };
+    let custom = |title: &str| creds(title, "custom-fields").first().map(|c| c["fields"].as_array().unwrap().clone()).unwrap_or_default();
+    let has_custom = |title: &str, kind: &str, value: &str| custom(title).iter().any(|f| f["fieldType"] == kind && f["value"] == value);
+
+    let basic = creds("Login", "basic-auth");
+    assert_eq!(basic.len(), 1);
+    assert_eq!(basic[0]["username"], json!({"fieldType": "string", "value": "u1"}), "the first identity");
+    assert_eq!(basic[0]["password"], json!({"fieldType": "concealed-string", "value": "p1"}));
+    assert!(has_custom("Login", "string", "u2"), "the second identity is kept");
+    assert_eq!(item("Login")["scope"]["urls"], json!(["https://a.example"]));
+    assert!(custom("Login").iter().all(|f| f["value"] != "https://a.example"));
+
+    let basic = creds("Password only", "basic-auth");
+    assert_eq!(basic.len(), 1, "a password alone is a login");
+    assert!(basic[0].get("username").is_none());
+
+    let totp = creds("Misc", "totp");
+    assert_eq!(totp.len(), 1);
+    assert_eq!((totp[0]["secret"].as_str(), totp[0]["digits"].as_u64(), totp[0]["algorithm"].as_str()), (Some("JBSWY3DPEHPK3PXP"), Some(6), Some("sha1")));
+    assert!(has_custom("Misc", "concealed-string", "not a secret!"), "an unreadable 2FA value is kept, concealed");
+    assert_eq!(creds("Misc", "note"), vec![json!({"type": "note", "content": {"fieldType": "string", "value": "a note"}})]);
+    let wifi: Vec<(Value, Value, Value, Value)> = creds("Misc", "wifi").iter()
+        .map(|c| (c["ssid"]["value"].clone(), c["networkSecurityType"]["value"].clone(), c["passphrase"]["value"].clone(), c["hidden"]["value"].clone()))
+        .collect();
+    assert_eq!(wifi, vec![
+        (json!("open"), json!("unsecured"), json!(""), json!("false")),
+        (json!("old"), json!("wep"), json!("wep-key"), json!("true")),
+        (json!("home"), json!("wpa2-personal"), json!("wpa-key"), json!("false")),
+    ]);
+    assert_eq!(creds("Misc", "address"), vec![json!({"type": "address", "streetAddress": {"fieldType": "string", "value": "Main St 1"}})]);
+    assert!(has_custom("Misc", "concealed-string", "old-pw"));
+    assert!(has_custom("Misc", "string", "Pet?"));
+    assert!(has_custom("Misc", "date", "2026-01-01"));
+    assert!(has_custom("Misc", "string", "someday"), "a date that does not parse stays text");
+    assert_eq!(custom("Misc").len(), 5);
+}
+
+/// Folders become collections: only real folders, nested to the CXF limit.
+#[test]
+fn export_collections_mirror_the_folder_tree() {
+    let (_t, mut w) = wallet();
+    let top = w.add_item("Top", "folder", true, None).unwrap();
+    let inner = w.add_item("Inner", "folder", true, Some(&top)).unwrap();
+    let note = w.add_item("Note", "document", false, Some(&top)).unwrap();
+    w.add_field(&note, "NOTE", "x", None).unwrap();
+    w.add_item("Loose", "document", false, None).unwrap();
+
+    let doc = w.export_cxf(&ExportOptions::default()).unwrap();
+    let v: Value = serde_json::from_str(&doc).unwrap();
+    let cols = v["accounts"][0]["collections"].as_array().unwrap();
+    assert_eq!(cols.len(), 1, "one collection per top-level folder, none for the root");
+    assert_eq!(cols[0]["title"], "Top");
+    assert_eq!(cols[0]["items"], json!([{"item": b64(note.as_bytes())}]), "subfolders are not linked as items");
+    assert_eq!(cols[0]["subCollections"][0]["id"], b64(inner.as_bytes()));
+
+    // A chain one deeper than CXF allows is cut at the limit.
+    let (_t, mut w) = wallet();
+    let mut parent: Option<String> = None;
+    for n in 0..=iwcore::cxf::COLLECTION_DEPTH_MAX {
+        parent = Some(w.add_item(&format!("L{n}"), "folder", true, parent.as_deref()).unwrap());
+    }
+    let doc = w.export_cxf(&ExportOptions::default()).unwrap();
+    let v: Value = serde_json::from_str(&doc).unwrap();
+    let mut c = &v["accounts"][0]["collections"][0];
+    let mut depth = 1;
+    while let Some(sub) = c.get("subCollections") {
+        c = &sub[0];
+        depth += 1;
+    }
+    assert_eq!(depth, iwcore::cxf::COLLECTION_DEPTH_MAX);
+    let (t2, mut fresh) = wallet();
+    fresh.import_cxf(&doc, &opts(&t2)).unwrap();
+}
+
+/// A chosen folder takes everything below it, whatever the row order.
+#[test]
+fn export_scope_reaches_every_level() {
+    let (_t, mut w) = wallet();
+    // Rows are created child first, then moved under their parents.
+    let deep = w.add_item("Deep", "document", false, None).unwrap();
+    w.add_field(&deep, "NOTE", "deep", None).unwrap();
+    let mid = w.add_item("Mid", "folder", true, None).unwrap();
+    let top = w.add_item("Top", "folder", true, None).unwrap();
+    w.move_item(&deep, &mid).unwrap();
+    w.move_item(&mid, &top).unwrap();
+
+    let doc = w.export_cxf(&ExportOptions { folder_ids: Some(vec![top]) }).unwrap();
+    assert!(doc.contains("Deep"), "two levels below the chosen folder");
+}
+
+/// The import folder is named after the exporter, the export date and, when
+/// there are several, the account.
+#[test]
+fn import_folder_names() {
+    let names = |doc: Value| -> Vec<String> {
+        let (t, mut w) = wallet();
+        w.import_cxf(&doc.to_string(), &opts(&t)).unwrap();
+        let mut n: Vec<String> = w.get_items().unwrap().iter().filter(|i| i.name.starts_with("Imported from")).map(|i| i.name.clone()).collect();
+        n.sort();
+        n
+    };
+    let note = |id: &str| json!({"id": id, "title": id, "credentials": [{"type": "note", "content": ef("string", id)}]});
+    let account = |user: &str, email: &str, item: &str| json!({"id": item, "username": user, "email": email, "collections": [], "items": [note(item)]});
+    let doc = |ts: u64, accounts: Vec<Value>| json!({"version": {"major": 1, "minor": 0}, "exporterRpId": "o.example",
+        "exporterDisplayName": "Other", "timestamp": ts, "accounts": accounts});
+
+    assert_eq!(names(doc(1_790_000_000, vec![account("me", "", "aQ")])), vec!["Imported from Other 2026-09-21".to_string()]);
+    assert_eq!(names(doc(1_790_000_000, vec![account("me", "", "aQ"), account("", "you@example.com", "aR"), account("", "", "aS")])), vec![
+        "Imported from Other 2026-09-21 (account 3)".to_string(),
+        "Imported from Other 2026-09-21 (me)".to_string(),
+        "Imported from Other 2026-09-21 (you@example.com)".to_string(),
+    ]);
+    // No timestamp: the date of the import.
+    let undated = names(doc(0, vec![account("me", "", "aQ")]));
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    assert_eq!(undated, vec![format!("Imported from Other {today}")]);
+}
+
+/// The preview names the exporter and the folder the import lands in, and
+/// counts every credential by kind.
+#[test]
+fn preview_reports_exporter_destination_and_exact_counts() {
+    let (_t, mut w) = wallet();
+    let (items, _) = rich_items();
+    let preview = w.preview_cxf(&payload(items, vec![])).unwrap();
+    assert_eq!(preview.exporter, "Other Manager");
+    assert_eq!(preview.destination_folders, vec!["Imported from Other Manager 2026-09-21".to_string()]);
+    assert_eq!(preview.counts, KindCounts { logins: 2, passkeys: 1, totp: 1, notes: 2, cards: 1, wifi: 1, other: 8 });
+
+    let twice: Vec<Value> = rich_items().0.into_iter().chain(rich_items().0.into_iter().map(|mut i| {
+        i["title"] = json!(format!("{} 2", i["title"].as_str().unwrap()));
+        i
+    })).collect();
+    let preview = w.preview_cxf(&payload(twice, vec![])).unwrap();
+    assert_eq!(preview.counts, KindCounts { logins: 4, passkeys: 2, totp: 2, notes: 4, cards: 2, wifi: 2, other: 16 });
+}
+
+/// Each Wi-Fi security type maps to its own `WIFI:` type.
+#[test]
+fn wifi_security_types_map_one_to_one() {
+    let (t, mut w) = wallet();
+    let wifi = |title: &str, sec: &str| json!({"id": title, "title": title, "credentials": [{"type": "wifi", "ssid": ef("string", title),
+        "networkSecurityType": ef("wifi-network-security-type", sec), "passphrase": ef("concealed-string", "k")}]});
+    w.import_cxf(&payload(vec![wifi("Open", "unsecured"), wifi("Old", "wep"), wifi("Home", "wpa2-personal")], vec![]), &opts(&t)).unwrap();
+    assert!(has(&fields_of(&mut w, "Open"), "WIFI", "WIFI:T:nopass;S:Open;P:k;H:false;;"));
+    assert!(has(&fields_of(&mut w, "Old"), "WIFI", "WIFI:T:WEP;S:Old;P:k;H:false;;"));
+    assert!(has(&fields_of(&mut w, "Home"), "WIFI", "WIFI:T:WPA;S:Home;P:k;H:false;;"));
+}
+
+/// A `custom-fields` credential of exactly 256 fields is read; one more is skipped.
+#[test]
+fn custom_fields_limit_is_inclusive() {
+    let (_t, mut w) = wallet();
+    let doc = |n: usize| {
+        let fields: Vec<Value> = (0..n).map(|i| json!({"fieldType": "string", "value": format!("v{i}"), "label": "Same"})).collect();
+        payload(vec![json!({"id": "a", "title": "Many", "credentials": [{"type": "custom-fields", "fields": fields}]})], vec![])
+    };
+    let p = w.preview_cxf(&doc(iwcore::cxf::CUSTOM_FIELDS_MAX)).unwrap();
+    assert!(p.skipped.is_empty());
+    assert_eq!(p.counts.other, 1);
+    let p = w.preview_cxf(&doc(iwcore::cxf::CUSTOM_FIELDS_MAX + 1)).unwrap();
+    assert_eq!(p.skipped.len(), 1);
+    assert_eq!(p.counts.other, 0);
+}
+
+/// A generated-password credential without a password is skipped, not counted.
+#[test]
+fn empty_generated_password_is_skipped() {
+    let (_t, mut w) = wallet();
+    let p = w.preview_cxf(&payload(vec![json!({"id": "a", "title": "Gen", "credentials": [{"type": "generated-password", "password": ""}]})], vec![])).unwrap();
+    assert_eq!(p.counts.logins, 0);
+    assert_eq!(p.skipped.len(), 1);
+    assert_eq!(p.skipped[0].reason, "no password");
+}
+
+/// Exactly 200 new labels are accepted.
+#[test]
+fn exactly_200_new_labels_are_accepted() {
+    let (_t, mut w) = wallet();
+    let fields: Vec<Value> = (0..200).map(|i| json!({"fieldType": "string", "value": "v", "label": format!("L{i}")})).collect();
+    let p = w.preview_cxf(&payload(vec![json!({"id": "a", "title": "Many", "credentials": [{"type": "custom-fields", "fields": fields}]})], vec![])).unwrap();
+    assert_eq!(p.new_labels.len(), 200);
+}
+
+/// Custom labels already in the vault are reused, with their value type, and
+/// not announced as new.
+#[test]
+fn existing_custom_labels_are_reused() {
+    let (t, mut w) = wallet();
+    let custom = |title: &str, v: &str| json!({"id": title, "title": title, "credentials": [{"type": "custom-fields", "fields": [
+        {"fieldType": "string", "value": v, "label": "Favourite colour"},
+        {"fieldType": "concealed-string", "value": v, "label": "Recovery code"},
+        {"fieldType": "date", "value": "2026-12-24", "label": "Renewal"}]}]});
+    let first = w.import_cxf(&payload(vec![custom("One", "a")], vec![]), &opts(&t)).unwrap();
+    assert_eq!(first.preview.new_labels, vec!["Favourite colour".to_string(), "Recovery code".to_string(), "Renewal".to_string()]);
+
+    let doc = payload(vec![custom("Two", "b")], vec![]);
+    assert!(w.preview_cxf(&doc).unwrap().new_labels.is_empty());
+    w.import_cxf(&doc, &opts(&t)).unwrap();
+    let labels: Vec<(String, String)> = w.get_labels().unwrap().into_iter().filter(|l| !l.system).map(|l| (l.name, l.value_type)).collect();
+    assert_eq!(labels, vec![
+        ("Favourite colour".to_string(), "text".to_string()),
+        ("Recovery code".to_string(), "pass".to_string()),
+        ("Renewal".to_string(), "date".to_string()),
+    ]);
+    let two = fields_of(&mut w, "Two");
+    let one = fields_of(&mut w, "One");
+    for f in &two {
+        assert!(one.iter().any(|o| o.field_type == f.field_type), "{} reuses the label", f.label);
+    }
+}
+
+/// Only live items count as duplicates: a folder of the same name does not.
+#[test]
+fn folders_are_not_duplicates_of_items() {
+    let (_t, mut w) = wallet();
+    w.add_item("Work", "folder", true, None).unwrap();
+    let p = w.preview_cxf(&payload(vec![json!({"id": "a", "title": "Work", "credentials": []})], vec![])).unwrap();
+    assert_eq!((p.items, p.duplicates), (1, 0));
+}
+
+/// Fields keep the payload's order, 100 apart.
+#[test]
+fn imported_fields_are_weighted_in_order() {
+    let (t, mut w) = wallet();
+    w.import_cxf(&payload(vec![json!({"id": "a", "title": "Ordered", "credentials": [
+        {"type": "basic-auth", "username": ef("string", "user"), "password": ef("concealed-string", "pw")},
+        {"type": "note", "content": ef("string", "n")}]})], vec![]), &opts(&t)).unwrap();
+    let mut weights: Vec<(i32, String)> = fields_of(&mut w, "Ordered").into_iter().map(|f| (f.sort_weight, f.field_type)).collect();
+    weights.sort();
+    assert_eq!(weights, vec![(0, "USER".to_string()), (100, "PASS".to_string()), (200, "NOTE".to_string())]);
+}
+
+/// A document member that starts with a capital keeps it in the label.
+#[test]
+fn capitalised_document_member_keeps_its_label() {
+    let (t, mut w) = wallet();
+    w.import_cxf(&payload(vec![json!({"id": "a", "title": "Doc", "credentials": [
+        {"type": "identity-document", "documentNumber": ef("string", "1"), "XRef": ef("string", "r")}]})], vec![]), &opts(&t)).unwrap();
+    assert!(has_label(&fields_of(&mut w, "Doc"), "X ref", "r"));
 }

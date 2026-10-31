@@ -554,4 +554,35 @@ pub(crate) mod tests {
             assert!(validate_rp_id(bad).is_err(), "{bad}");
         }
     }
+
+    #[test]
+    fn rp_id_length_limit_is_253() {
+        let name = |last: usize| format!("{0}.{0}.{0}.{1}", "a".repeat(63), "b".repeat(last));
+        assert_eq!(name(61).len(), 253);
+        assert!(validate_rp_id(&name(61)).is_ok());
+        assert!(validate_rp_id(&name(62)).is_err());
+    }
+
+    #[test]
+    fn record_size_limit_is_64_kib() {
+        assert_eq!(RECORD_MAX, 65_536);
+        let base = json_of(&sample(false));
+        let pad = |n: usize| with(base.clone(), "pad", "p".repeat(n).into());
+        let fill = RECORD_MAX - pad(0).len();
+        assert_eq!(pad(fill).len(), RECORD_MAX);
+        assert!(PasskeyRecord::from_field_value(&pad(fill)).is_ok());
+        assert!(PasskeyRecord::from_field_value(&pad(fill + 1)).is_err());
+    }
+
+    #[test]
+    fn user_field_lengths_are_accepted_up_to_the_limit() {
+        let base = json_of(&sample(false));
+        let parse = |k: &str, v: Value| PasskeyRecord::from_field_value(&with(base.clone(), k, v));
+        assert!(parse("userHandle", b64::encode(&[1; USER_HANDLE_MAX]).into()).is_ok());
+        assert!(parse("userHandle", b64::encode(&[1; USER_HANDLE_MAX + 1]).into()).is_err());
+        for k in ["userName", "userDisplayName"] {
+            assert!(parse(k, "n".repeat(USER_NAME_MAX).into()).is_ok(), "{k}");
+            assert!(parse(k, "n".repeat(USER_NAME_MAX + 1).into()).is_err(), "{k}");
+        }
+    }
 }

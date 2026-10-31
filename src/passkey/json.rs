@@ -546,15 +546,42 @@ mod tests {
         assert!(set(&["user", "id"], "".into()).is_err());
         assert!(set(&["user", "name"], "n".repeat(USER_NAME_MAX).into()).is_ok());
         assert!(set(&["user", "name"], "n".repeat(USER_NAME_MAX + 1).into()).is_err());
+        assert!(set(&["user", "displayName"], "n".repeat(USER_NAME_MAX).into()).is_ok());
+        assert!(set(&["user", "displayName"], "n".repeat(USER_NAME_MAX + 1).into()).is_err());
         assert!(set(&["rp", "id"], "Not A Domain".into()).is_err());
         assert!(set(&["rp", "id"], "WebAuthn.IO".into()).unwrap().rp_id.as_deref() == Some("webauthn.io"));
         let creds = |n: usize| Value::Array((0..n).map(|i| json!({"type": "public-key", "id": e(&[i as u8; 16])})).collect());
         assert!(set(&["excludeCredentials"], creds(CREDENTIAL_LIST_MAX)).is_ok());
         assert!(set(&["excludeCredentials"], creds(CREDENTIAL_LIST_MAX + 1)).is_err());
-        assert!(set(&["excludeCredentials"], json!([{"type": "public-key", "id": e(&[0; 1024])}])).is_err());
+        assert!(set(&["excludeCredentials"], json!([{"type": "public-key", "id": e(&[0; CREDENTIAL_ID_MAX])}])).is_ok());
+        assert!(set(&["excludeCredentials"], json!([{"type": "public-key", "id": e(&[0; CREDENTIAL_ID_MAX + 1])}])).is_err());
         assert!(set(&["extensions", "prf", "eval"], json!({"first": e(&[0; 1024])})).is_ok());
         assert!(set(&["extensions", "prf", "eval"], json!({"first": e(&[0; 1025])})).is_err());
+        assert!(set(&["extensions", "prf", "eval"], json!({"first": e(b"a"), "second": e(&[0; prf::INPUT_MAX])})).is_ok());
+        assert!(set(&["extensions", "prf", "eval"], json!({"first": e(b"a"), "second": e(&[0; prf::INPUT_MAX + 1])})).is_err());
         assert!(CreationOptions::parse(&" ".repeat(REQUEST_MAX_BYTES + 1)).is_err());
+        // Exactly the size limit, padded with JSON whitespace.
+        let padded = |f: Value| {
+            let s = f.to_string();
+            format!("{s}{}", " ".repeat(REQUEST_MAX_BYTES - s.len()))
+        };
+        assert!(CreationOptions::parse(&padded(creation_fixture())).is_ok());
+        assert!(RequestOptions::parse(&padded(request_fixture())).is_ok());
+    }
+
+    #[test]
+    fn eval_by_credential_bounds() {
+        let with = |n: usize, allow: usize| {
+            let mut f = request_fixture();
+            f["allowCredentials"] = Value::Array((0..allow).map(|i| json!({"type": "public-key", "id": e(&[i as u8; 16])})).collect());
+            let by: Map<String, Value> = (0..n).map(|i| (e(&[i as u8; 16]), json!({"first": e(b"x")}))).collect();
+            f["extensions"]["prf"]["evalByCredential"] = Value::Object(by);
+            RequestOptions::parse(&f.to_string())
+        };
+        assert!(with(CREDENTIAL_LIST_MAX, CREDENTIAL_LIST_MAX).is_ok());
+        assert!(with(CREDENTIAL_LIST_MAX + 1, CREDENTIAL_LIST_MAX).is_err());
+        assert!(with(0, 0).is_ok(), "an empty evalByCredential needs no allowCredentials");
+        assert!(with(1, 0).is_err());
     }
 
     #[test]

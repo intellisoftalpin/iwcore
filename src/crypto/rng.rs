@@ -1,5 +1,5 @@
 //! Randomness for long-lived secrets: data encryption keys, KDF salts,
-//! AutoFill keys, and (from 0.5.0) passkey keys, credential ids and PRF
+//! AutoFill keys, and (from 0.5.1) passkey keys, credential ids and PRF
 //! secrets.
 //!
 //! These are drawn straight from the operating system's generator

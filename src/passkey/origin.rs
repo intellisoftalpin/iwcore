@@ -189,6 +189,19 @@ mod tests {
     }
 
     #[test]
+    fn origin_shape_is_checked_before_the_host() {
+        let reason = |o: &str| match origin_host(o) {
+            Err(WalletError::InvalidInput(m)) => m,
+            other => panic!("{o}: {other:?}"),
+        };
+        for o in ["https://", "https://example.com/", "https://example.com?q", "https://example.com#f",
+                  "https://u@example.com", "https://example.com\\x"] {
+            assert_eq!(reason(o), "origin must be scheme and host only", "{o}");
+        }
+        assert_eq!(reason("https://exa mple.com"), "origin host is not a domain name");
+    }
+
+    #[test]
     fn public_suffixes_come_from_the_full_list() {
         for s in ["com", "co.uk", "github.io", "blogspot.com", "s3.amazonaws.com", "pages.dev", "vercel.app"] {
             assert!(is_public_suffix(s), "{s}");
@@ -258,8 +271,13 @@ mod tests {
         for bad in [&b"{}"[..], b"not json", b"\"str\"", b""] {
             assert!(assetlinks_allows(bad, "p", &c).is_err());
         }
+        assert_eq!(ASSETLINKS_MAX_BYTES, 262_144, "256 KiB");
         let big = vec![b' '; ASSETLINKS_MAX_BYTES + 1];
         assert!(assetlinks_allows(&big, "p", &c).is_err());
+        let mut edge = vec![b' '; ASSETLINKS_MAX_BYTES];
+        edge[0] = b'[';
+        edge[ASSETLINKS_MAX_BYTES - 1] = b']';
+        assert!(!assetlinks_allows(&edge, "p", &c).unwrap(), "exactly the limit is read");
         let many: Vec<Value> = (0..=ASSETLINKS_MAX_STATEMENTS).map(|_| serde_json::json!({})).collect();
         assert!(assetlinks_allows(&serde_json::to_vec(&many).unwrap(), "p", &c).is_err());
         let edge: Vec<Value> = (0..ASSETLINKS_MAX_STATEMENTS).map(|_| serde_json::json!({})).collect();

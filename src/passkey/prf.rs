@@ -193,4 +193,13 @@ mod tests {
         assert!(!format!("{inputs:?}").contains("secret-input"));
         assert!(!format!("{out:?}").contains(&hex(out.first.as_slice())));
     }
+
+    #[test]
+    fn debug_shows_lengths_and_redacts_outputs() {
+        let r = sample(true);
+        let inputs = PrfInputs { first: b"secret-input".to_vec(), second: Some(vec![1, 2]) };
+        assert_eq!(format!("{inputs:?}"), "PrfInputs { first_len: 12, second_len: Some(2) }");
+        let out = evaluate_inputs(&r, &inputs, true).unwrap().unwrap();
+        assert_eq!(format!("{out:?}"), crate::utils::REDACTED);
+    }
 }

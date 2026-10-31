@@ -528,6 +528,87 @@ mod tests {
         );
     }
 
+    fn passkey_entry() -> PasskeyIndexEntry {
+        PasskeyIndexEntry {
+            item_id: "item-1".into(),
+            field_id: "field-1".into(),
+            title: "Example".into(),
+            record: serde_json::json!({ "private_key": "super-secret-key-material" }),
+        }
+    }
+
+    fn format_1_header() -> IndexHeader {
+        IndexHeader { format_version: 1, ..header() }
+    }
+
+    /// Seal an arbitrary padded body under a valid header, bypassing `build`.
+    fn seal_raw_body(key: &[u8; KEY_LEN], body: &[u8]) -> Vec<u8> {
+        let header_bytes = encode_header(&header()).unwrap();
+        let mut out = header_bytes.clone();
+        out.extend_from_slice(&crypto::seal(key, body, &header_bytes).unwrap());
+        out
+    }
+
+    #[test]
+    fn passkey_entry_debug_names_where_it_lives_and_hides_the_record() {
+        let shown = format!("{:?}", passkey_entry());
+        assert!(shown.contains("PasskeyIndexEntry"));
+        assert!(shown.contains("item-1"));
+        assert!(shown.contains("field-1"));
+        assert!(shown.contains("Example"));
+        assert!(shown.contains(crate::utils::REDACTED));
+        assert!(!shown.contains("super-secret-key-material"));
+    }
+
+    #[test]
+    fn format_1_round_trips_logins() {
+        let keys = generate_keys().unwrap();
+        let entries = vec![entry("i1", "example.com")];
+        let sealed = build_with_passkeys(&entries, &[], &keys.index_key, &format_1_header()).unwrap();
+        let (got_header, contents) = open_all(&sealed, &keys.index_key).unwrap();
+        assert_eq!(got_header.format_version, 1);
+        assert_eq!(contents.logins, entries);
+        assert!(contents.passkeys.is_empty());
+    }
+
+    #[test]
+    fn format_1_refuses_passkeys() {
+        let keys = generate_keys().unwrap();
+        assert!(matches!(
+            build_with_passkeys(&[], &[passkey_entry()], &keys.index_key, &format_1_header()),
+            Err(WalletError::InvalidOperation(_))
+        ));
+    }
+
+    #[test]
+    fn a_body_shorter_than_its_length_prefix_is_rejected() {
+        let keys = generate_keys().unwrap();
+        for len in 0..4 {
+            let sealed = seal_raw_body(&keys.index_key, &vec![0u8; len]);
+            assert!(
+                matches!(open_all(&sealed, &keys.index_key), Err(WalletError::DecryptionError(_))),
+                "body of {len} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_of_just_the_length_prefix_is_decoded_not_called_truncated() {
+        let keys = generate_keys().unwrap();
+        let sealed = seal_raw_body(&keys.index_key, &0u32.to_le_bytes());
+        let err = open_all(&sealed, &keys.index_key).unwrap_err().to_string();
+        assert!(err.contains("index decode failed"), "{err}");
+    }
+
+    #[test]
+    fn a_header_with_an_empty_database_id_is_read() {
+        let empty_id = IndexHeader { database_id: String::new(), ..header() };
+        let bytes = encode_header(&empty_id).unwrap();
+        assert_eq!(bytes.len(), 22);
+        assert_eq!(peek_header(&bytes).unwrap(), empty_id);
+        assert!(peek_header(&bytes[..21]).is_err());
+    }
+
     // --- selection rules -------------------------------------------------
 
     #[test]

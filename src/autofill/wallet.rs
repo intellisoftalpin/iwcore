@@ -1062,4 +1062,128 @@ mod tests {
         assert_eq!(summary.updated, vec![named]);
         assert_eq!(summary.unchanged, 0);
     }
+
+    #[test]
+    fn a_staged_record_without_a_password_is_skipped() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+
+        let journal = seal_all(&[capture("r1", "https://example.com/signup", "bkv", "")], &keys);
+        let summary = w
+            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .unwrap();
+
+        assert_eq!(summary.skipped, 1);
+        assert!(summary.created.is_empty());
+    }
+
+    #[test]
+    fn a_capture_repeating_an_updated_password_is_unchanged() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+
+        let journal = seal_all(
+            &[
+                capture("r1", "https://example.com/signup", "bkv", "hunter2"),
+                capture("r2", "https://example.com/settings", "bkv", "hunter3"),
+                capture("r3", "https://example.com/login", "bkv", "hunter3"),
+            ],
+            &keys,
+        );
+        let summary = w
+            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .unwrap();
+
+        assert_eq!(summary.created.len(), 1);
+        assert_eq!(summary.updated.len(), 1);
+        assert_eq!(summary.unchanged, 1);
+    }
+
+    #[test]
+    fn the_folder_is_found_by_name_when_no_id_is_recorded() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+
+        let first = w
+            .drain_autofill_journal(&seal_all(&[record("r1", "bkv")], &keys), &keys.journal_secret, None)
+            .unwrap();
+        let second = w
+            .drain_autofill_journal(&seal_all(&[record("r2", "other")], &keys), &keys.journal_secret, None)
+            .unwrap();
+
+        assert_eq!(second.folder_id, first.folder_id);
+        let folders = w
+            .get_items()
+            .unwrap()
+            .iter()
+            .filter(|i| i.folder && i.name == AUTOFILL_FOLDER_NAME)
+            .count();
+        assert_eq!(folders, 1);
+    }
+
+    #[test]
+    fn a_password_update_naming_a_folder_degrades_to_a_create() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let folder = w.add_item("Logins", "", true, Some(crate::ROOT_ID)).unwrap();
+        w.add_field(&folder, "PASS", "folder-password", Some(100)).unwrap();
+
+        let mut update = record("r1", "bkv");
+        update.op = PendingOp::UpdatePassword;
+        update.item_id = Some(folder.clone());
+        let summary = w
+            .drain_autofill_journal(&seal_all(&[update], &keys), &keys.journal_secret, None)
+            .unwrap();
+
+        assert!(summary.updated.is_empty());
+        assert_eq!(summary.created.len(), 1);
+        assert_eq!(
+            password_of(&mut w, &folder, FIELD_PASSWORD).as_deref(),
+            Some("folder-password")
+        );
+    }
+
+    #[test]
+    fn a_password_update_reuses_an_existing_oldp_field() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let item = login(&mut w, "GitHub", "https://github.com/login", "bkv", "hunter2");
+        w.add_field(&item, FIELD_OLD_PASSWORD, "hunter1", Some(300)).unwrap();
+
+        let mut update = capture("r1", "https://github.com/login", "bkv", "hunter3");
+        update.op = PendingOp::UpdatePassword;
+        update.item_id = Some(item.clone());
+        w.drain_autofill_journal(&seal_all(&[update], &keys), &keys.journal_secret, None)
+            .unwrap();
+
+        let oldp: Vec<String> = w
+            .get_fields_by_item(&item)
+            .unwrap()
+            .iter()
+            .filter(|f| !f.deleted && f.field_type == FIELD_OLD_PASSWORD)
+            .map(|f| f.value.clone())
+            .collect();
+        assert_eq!(oldp, vec!["hunter2".to_string()]);
+    }
+
+    #[test]
+    fn a_staged_totp_secret_is_imported_and_a_blank_one_is_not() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+
+        let mut with_totp = capture("r1", "https://example.com/signup", "bkv", "hunter2");
+        with_totp.totp_secret = Some("JBSWY3DPEHPK3PXP".into());
+        let mut blank_totp = capture("r2", "https://other.example.org/signup", "bkv", "hunter2");
+        blank_totp.totp_secret = Some("  ".into());
+        let summary = w
+            .drain_autofill_journal(&seal_all(&[with_totp, blank_totp], &keys), &keys.journal_secret, None)
+            .unwrap();
+
+        assert_eq!(summary.created.len(), 2);
+        assert_eq!(
+            password_of(&mut w, &summary.created[0], FIELD_TOTP).as_deref(),
+            Some("JBSWY3DPEHPK3PXP")
+        );
+        assert_eq!(password_of(&mut w, &summary.created[1], FIELD_TOTP), None);
+    }
 }

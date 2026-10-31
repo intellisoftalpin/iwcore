@@ -412,6 +412,89 @@ mod tests {
         assert!(target.exists());
     }
 
+    fn zip_with_db_entry(path: &Path, content: &[u8]) {
+        let mut zip = zip::ZipWriter::new(File::create(path).unwrap());
+        zip.start_file(DATABASE_FILENAME, zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(content).unwrap();
+        zip.finish().unwrap();
+    }
+
+    /// Rewrite the uncompressed size the archive declares for its only entry,
+    /// in both the local header and the central directory.
+    fn declare_uncompressed_size(path: &Path, size: u32) {
+        let mut bytes = fs::read(path).unwrap();
+        let patch = |bytes: &mut Vec<u8>, signature: &[u8], offset: usize| {
+            let at = bytes.windows(4).position(|w| w == signature).unwrap() + offset;
+            bytes[at..at + 4].copy_from_slice(&size.to_le_bytes());
+        };
+        patch(&mut bytes, b"PK\x03\x04", 22);
+        patch(&mut bytes, b"PK\x01\x02", 24);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn the_restore_limit_is_two_gibibytes() {
+        assert_eq!(MAX_RESTORED_DB_BYTES, 2 << 30);
+    }
+
+    #[test]
+    fn restore_enforces_the_limit_on_the_bytes_read_when_the_declared_size_lies() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = create_test_backup(temp_dir.path());
+        declare_uncompressed_size(&backup_path, 20);
+        let db_path = temp_dir.path().join("w").join(DATABASE_FILENAME);
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        fs::write(&db_path, b"OLD DATABASE").unwrap();
+
+        // Declares exactly the limit, inflates to 21.
+        let err = restore_backup_capped(&backup_path, &db_path, 20).unwrap_err();
+        assert!(matches!(err, WalletError::BackupError(_)));
+        assert_eq!(fs::read_to_string(&db_path).unwrap(), "OLD DATABASE");
+    }
+
+    #[test]
+    fn a_sidecar_that_cannot_be_removed_fails_the_restore() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = create_test_backup(temp_dir.path());
+        let db_path = temp_dir.path().join(DATABASE_FILENAME);
+        fs::write(&db_path, b"OLD DATABASE").unwrap();
+        // A directory where the `-wal` file would be cannot be unlinked.
+        fs::create_dir(temp_dir.path().join(format!("{DATABASE_FILENAME}-wal"))).unwrap();
+
+        let err = restore_backup(&backup_path, &db_path).unwrap_err();
+        assert!(matches!(err, WalletError::BackupError(_)));
+        assert_eq!(fs::read_to_string(&db_path).unwrap(), "OLD DATABASE");
+    }
+
+    #[test]
+    fn a_backup_with_an_empty_database_does_not_verify() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = temp_dir.path().join("empty-db.zip");
+        zip_with_db_entry(&backup_path, b"");
+
+        assert!(!verify_backup(&backup_path).unwrap());
+    }
+
+    #[test]
+    fn a_backup_from_a_newer_database_version_is_not_compatible() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("future.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE nswallet_properties (version TEXT);
+                 INSERT INTO nswallet_properties (version) VALUES ('999');",
+            )
+            .unwrap();
+        }
+        let backup_path = temp_dir.path().join("future.zip");
+        zip_with_db_entry(&backup_path, &fs::read(&db_path).unwrap());
+        let base = temp_dir.path().join("app_temp");
+
+        assert!(!is_backup_compatible_in(&backup_path, "6", &base).unwrap());
+        assert!(is_backup_compatible_in(&backup_path, "999", &base).unwrap());
+    }
+
     #[test]
     fn test_get_backup_db_version_in_uses_base() {
         let temp_dir = TempDir::new().unwrap();

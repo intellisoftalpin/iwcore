@@ -1,0 +1,24 @@
+# cargo-mutants configuration for the release gate.
+#
+# Equivalent mutants: each change below behaves identically to the original
+# for every possible input, so no test can catch it. They are named by
+# file:line:column; when the code moves the pattern stops matching and the
+# mutant shows up as missed again, so this list can never hide a real gap.
+
+exclude_re = [
+    # `starts_with('.') || ends_with('.')` -> `&&`: a name with a single leading
+    # or trailing dot has an empty label, which the label loop refuses with the
+    # same error.
+    'src/passkey/record\.rs:347:72: replace \|\| with && in validate_rp_id',
+    # `is_public_suffix(id) || domain_str(id).is_none()` -> `&&`: for a valid
+    # rpId the two are always equal (the registrable domain is the suffix plus
+    # one label, absent exactly when the name is its own suffix).
+    'src/passkey/origin\.rs:49:58: replace \|\| with && in rp_id_valid_for_origin',
+    # UP | BE | BS: three constants with no shared bits, so `|` and `^` agree.
+    'src/passkey/webauthn\.rs:44:(25|35): replace \| with \^ in flags',
+    # 0x40 | len for len <= 23: the bits never overlap.
+    'src/passkey/webauthn\.rs:123:33: replace \| with \^ in push_cbor_bytes_header',
+    # A bare relative path has the parent "": the temp file lands in the
+    # current directory either way.
+    'src/backup/restore\.rs:47:20: replace match guard',
+]

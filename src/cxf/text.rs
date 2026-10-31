@@ -98,6 +98,7 @@ pub(crate) fn parse_totp(value: &str) -> Option<Totp> {
         None if label.is_empty() => (None, None),
         None => (None, Some(label)),
     };
+    let label_has_issuer = label_issuer.is_some();
     let mut t = Totp { secret: String::new(), algorithm: "SHA1".into(), digits: 6, period: 30, issuer: label_issuer, account };
     for pair in query.split('&') {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -110,6 +111,11 @@ pub(crate) fn parse_totp(value: &str) -> Option<Totp> {
             "period" => t.period = v.parse().ok()?,
             _ => {}
         }
+    }
+    // `otpauth://totp/ACME?issuer=ACME` is how an issuer without an account
+    // is written: the bare label is the issuer, not an account.
+    if !label_has_issuer && t.account.is_some() && t.account == t.issuer {
+        t.account = None;
     }
     (!t.secret.is_empty()).then_some(t)
 }
@@ -299,6 +305,49 @@ mod tests {
         assert!(parse_totp("not base32!").is_none());
         assert!(parse_totp("otpauth://totp/x?secret=!!").is_none());
         assert!(parse_totp("otpauth://totp/x?digits=6").is_none());
+    }
+
+    #[test]
+    fn value_limit_is_64_kib() {
+        assert_eq!(VALUE_MAX, 65_536);
+    }
+
+    #[test]
+    fn totp_bare_secret_only_for_all_defaults() {
+        let t = |algorithm: &str, digits: u32, period: u32, issuer: Option<&str>, account: Option<&str>| Totp {
+            secret: "JBSWY3DPEHPK3PXP".into(), algorithm: algorithm.into(), digits, period,
+            issuer: issuer.map(Into::into), account: account.map(Into::into),
+        };
+        for (what, totp) in [
+            ("algorithm", t("SHA256", 6, 30, None, None)),
+            ("digits", t("SHA1", 8, 30, None, None)),
+            ("period", t("SHA1", 6, 60, None, None)),
+            ("issuer", t("SHA1", 6, 30, Some("ACME"), None)),
+            ("account", t("SHA1", 6, 30, None, Some("bkv"))),
+        ] {
+            let v = totp_value(&totp);
+            assert!(v.starts_with("otpauth://totp/"), "{what}: {v}");
+            assert_eq!(parse_totp(&v), Some(totp), "{what}");
+        }
+    }
+
+    #[test]
+    fn totp_label_and_issuer_rules() {
+        let p = |uri: &str| parse_totp(uri).map(|t| (t.issuer, t.account)).unwrap();
+        let s = |x: &str| Some(x.to_string());
+        assert_eq!(p("otpauth://totp/?secret=JBSWY3DP"), (None, None), "empty label");
+        assert_eq!(p("otpauth://totp/bkv?secret=JBSWY3DP"), (None, s("bkv")), "label is the account");
+        assert_eq!(p("otpauth://totp/bkv?secret=JBSWY3DP&issuer=ACME"), (s("ACME"), s("bkv")));
+        assert_eq!(p("otpauth://totp/Old:bkv?secret=JBSWY3DP&issuer="), (s("Old"), s("bkv")), "an empty issuer keeps the label's");
+        assert_eq!(p("otpauth://totp/ACME?secret=JBSWY3DP&issuer=ACME"), (s("ACME"), None), "a bare label equal to the issuer");
+        assert_eq!(p("otpauth://totp/ACME:ACME?secret=JBSWY3DP&issuer=ACME"), (s("ACME"), s("ACME")), "an explicit account is kept");
+    }
+
+    #[test]
+    fn wifi_reads_every_member_in_any_order() {
+        assert_eq!(parse_wifi("WIFI:T:WEP;S:net;P:key;H:true;;"), ("net".into(), "WEP".into(), "key".into(), true));
+        assert_eq!(parse_wifi("WIFI:S:net;T:nopass;P:;;"), ("net".into(), "nopass".into(), String::new(), false));
+        assert_eq!(parse_wifi("WIFI:S:net;P:last"), ("net".into(), "WPA".into(), "last".into(), false), "no closing ;;");
     }
 
     #[test]

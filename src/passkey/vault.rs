@@ -79,16 +79,18 @@ impl Wallet {
     /// `(item_id, field_id, record)` for every readable passkey on a live item.
     /// Unreadable records are skipped: one damaged field must not hide the rest.
     pub(crate) fn live_passkeys(&mut self) -> Result<Vec<(String, String, PasskeyRecord)>> {
+        // `get_items` and `get_fields` return live rows only. A live field can
+        // still sit on a trashed item in a vault written by an older app.
         let live_items: std::collections::HashSet<String> = self
             .get_items()?
             .iter()
-            .filter(|i| !i.deleted && !i.folder)
+            .filter(|i| !i.folder)
             .map(|i| i.item_id.clone())
             .collect();
         let pkey_fields: Vec<(String, String)> = self
             .get_fields()?
             .iter()
-            .filter(|f| f.field_type == FIELD_PASSKEY && !f.deleted && live_items.contains(&f.item_id))
+            .filter(|f| f.field_type == FIELD_PASSKEY && live_items.contains(&f.item_id))
             .map(|f| (f.item_id.clone(), f.field_id.clone()))
             .collect();
         let mut out = Vec::with_capacity(pkey_fields.len());
@@ -206,6 +208,22 @@ mod tests {
         w.undelete_field(&item, &field).unwrap();
         assert_eq!(w.list_passkeys().unwrap().len(), 1, "undelete brings it back intact");
         w.delete_item(&item).unwrap();
+        assert!(w.list_passkeys().unwrap().is_empty());
+    }
+
+    #[test]
+    fn passkeys_on_folders_or_on_trashed_items_are_not_listed() {
+        let (mut w, _t, item, _field, record) = wallet_with_passkey();
+        let folder = w.add_item("Folder", "folder", true, None).unwrap();
+        w.add_field_unchecked(&folder, FIELD_PASSKEY, &record.to_field_value().unwrap(), None).unwrap();
+        assert_eq!(w.list_passkeys().unwrap().len(), 1, "the folder's passkey is ignored");
+
+        // An older app trashed the item but left its fields live.
+        w.db.as_ref().unwrap().connection().unwrap()
+            .execute("UPDATE nswallet_items SET deleted = 1 WHERE item_id = ?", [&item]).unwrap();
+        w.items_cache = None;
+        w.fields_cache = None;
+        assert!(w.get_fields().unwrap().iter().any(|f| f.item_id == item && f.field_type == FIELD_PASSKEY));
         assert!(w.list_passkeys().unwrap().is_empty());
     }
 

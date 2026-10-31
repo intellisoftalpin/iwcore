@@ -96,7 +96,13 @@ jobs:
         with:
           tool: cargo-mutants,cargo-nextest
       - name: Mutate the passkey, CXF, AutoFill and restore code
+        # A mutant can turn a loop into an endless allocation that starves the
+        # runner long before the timeout. Capping every process at 6 GiB, two
+        # tests at a time, makes such a mutant fail its test (caught) instead.
+        env:
+          NEXTEST_TEST_THREADS: 2
         run: >
+          ulimit -v 6291456 &&
           cargo mutants --test-tool=nextest --profile=mutants --timeout 300 --shard ${{ matrix.shard }}/8
           -f 'src/passkey/**' -f 'src/cxf/**'
           -f src/autofill/wallet.rs -f src/autofill/index.rs -f src/autofill/journal.rs
