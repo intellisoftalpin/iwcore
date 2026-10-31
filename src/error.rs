@@ -64,6 +64,22 @@ pub enum WalletError {
     /// Export error
     #[error("Export error: {0}")]
     ExportError(String),
+
+    /// Input from outside the vault (a passkey request, a CXF payload, a
+    /// stored record) is malformed or outside its limits. The message names the
+    /// field and the rule, never the value.
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
+    /// The request needs something IntelliWallet does not offer, such as a
+    /// signature algorithm other than ES256.
+    #[error("Not supported: {0}")]
+    NotSupported(String),
+
+    /// A passkey creation named, in `excludeCredentials`, a credential the vault
+    /// already holds: the account already has a passkey here.
+    #[error("A passkey for this account already exists")]
+    PasskeyExcluded,
 }
 
 impl From<rusqlite::Error> for WalletError {

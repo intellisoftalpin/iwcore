@@ -41,6 +41,9 @@ impl Wallet {
             ("SEED", "Seed Phrase", "text", "seed"),
             ("CVVC", "CVV", "pass", "cvv"),
             ("WIFI", "Wi-Fi Password", "pass", "wifi"),
+            // Value type `pass` on purpose: an app older than passkey support
+            // masks it like a password instead of printing the private key.
+            ("PKEY", "Passkey", "pass", "passkey"),
         ];
 
         for (field_type, name, value_type, icon) in system_labels {
@@ -166,7 +169,7 @@ mod tests {
     fn test_labels() {
         let (mut wallet, _temp) = create_test_wallet();
         let labels = wallet.get_labels().unwrap();
-        assert_eq!(labels.len(), 22); // System labels count
+        assert_eq!(labels.len(), 23); // System labels count
     }
 
     #[test]

@@ -41,6 +41,7 @@ pub mod localization;
 pub mod utils;
 pub mod error;
 pub mod export;
+pub mod passkey;
 
 // Re-export main types
 pub use error::{WalletError, Result};

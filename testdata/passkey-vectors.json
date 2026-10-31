@@ -1,0 +1,80 @@
+{
+  "aaguid": "a2117fe2e23640fa9481ca437bd8b94e",
+  "assertions": [
+    {
+      "authenticator_data": "a707659955fec3dfcb508ac3903f9136deefe5970617d9310f755ced3ce7ee7c1d00000000",
+      "signature_der": "30440220717c8229eb156458f4267c963cf695060ada77249b21d8e35aacdaede7110d3402207f27d2bcd8118922f59cb1e46dc4f8b548ef1d7424ce2a4c00f66f66bb928140",
+      "user_verified": true
+    },
+    {
+      "authenticator_data": "a707659955fec3dfcb508ac3903f9136deefe5970617d9310f755ced3ce7ee7c1900000000",
+      "signature_der": "3045022100f9e137feeb348c69ac967e75025155d5a9005f695603ec60862f737c60a37eed022062f9aa9c4dc9314558a5921100a24d4635e5a16811d49519d2ee938a721f2c11",
+      "user_verified": false
+    }
+  ],
+  "client_data_hash": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+  "credential_id": "101112131415161718191a1b1c1d1e1f",
+  "description": "iwcore passkey golden vectors. Never edit by hand; see src/passkey/vectors.rs.",
+  "prf": {
+    "cases": [
+      {
+        "input": "",
+        "output_no_uv": "b08cba420ca70b4041eb52daf9b90f7caf25e2c75ed36e72648f07690001616a",
+        "output_uv": "48bece38d6fc9b3b113bcc29420cb0f575c258a83d37330c252ff5477dae419a",
+        "salt": "6a7e64b2aa34c92736143a062fa149aff1bd8bb3f7ee6f346885481f9414a3d3"
+      },
+      {
+        "input": "576562417574686e205052462074657374",
+        "output_no_uv": "8b6e1cf2433c83762d3559497a9fa116b2cfb7752c95c09e1fd92f06567a3458",
+        "output_uv": "2486b840b7cb65db17452413d6a5038d5b44f774551efe153425d30106dbf709",
+        "salt": "942aac605506c2a869b81f75cf1f7982c813ee3083da5156cbfe93c8939f7420"
+      },
+      {
+        "input": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "output_no_uv": "eb2bc2733c060851757b508e603a324290946dea3f8a9765fd032b1b0a3b658e",
+        "output_uv": "f7be6c647b6df8bbdfd98dce82a075cec19020ba4aeaaad4dc862b202a4c692e",
+        "salt": "e3f2575150188c861752111262fd72696a1d3532978ad9ade2ad08fffbcdf221"
+      },
+      {
+        "input": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "output_no_uv": "bb15c8b4157d90a92a1c99e625dcc7fb9ba96b4dc2759e64ac941a513a9ac1aa",
+        "output_uv": "fe9cd52b5943a18d7d562ec95fa3055eeb55204943868198a3251390595188ba",
+        "salt": "8071f67fec60def2120dc9035705be3432085d4e082d793f69d4743d990b8680"
+      }
+    ],
+    "cred_with_uv": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "cred_without_uv": "fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0"
+  },
+  "private_key_pkcs8": "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104201f2e3d4c5b6a798897a6b5c4d3e2f1000f1e2d3c4b5a69788796a5b4c3d2e1f0a144034200049220332b2300712ecf2da210722d00ade2ae78d46cf8e187142ff1ce4f9183dd40b69ced5bc7d64f83104c5d9a5994d681a207a2c1e6fdf1f4f5be5e66906451",
+  "private_key_scalar": "1f2e3d4c5b6a798897a6b5c4d3e2f1000f1e2d3c4b5a69788796a5b4c3d2e1f0",
+  "public_key_cose": "a50102032620012158209220332b2300712ecf2da210722d00ade2ae78d46cf8e187142ff1ce4f9183dd22582040b69ced5bc7d64f83104c5d9a5994d681a207a2c1e6fdf1f4f5be5e66906451",
+  "public_key_spki": "3059301306072a8648ce3d020106082a8648ce3d030107034200049220332b2300712ecf2da210722d00ade2ae78d46cf8e187142ff1ce4f9183dd40b69ced5bc7d64f83104c5d9a5994d681a207a2c1e6fdf1f4f5be5e66906451",
+  "registration": {
+    "attestation_object": "a363666d74646e6f6e656761747453746d74a06861757468446174615894a707659955fec3dfcb508ac3903f9136deefe5970617d9310f755ced3ce7ee7c5d00000000a2117fe2e23640fa9481ca437bd8b94e0010101112131415161718191a1b1c1d1e1fa50102032620012158209220332b2300712ecf2da210722d00ade2ae78d46cf8e187142ff1ce4f9183dd22582040b69ced5bc7d64f83104c5d9a5994d681a207a2c1e6fdf1f4f5be5e66906451",
+    "authenticator_data": "a707659955fec3dfcb508ac3903f9136deefe5970617d9310f755ced3ce7ee7c5d00000000a2117fe2e23640fa9481ca437bd8b94e0010101112131415161718191a1b1c1d1e1fa50102032620012158209220332b2300712ecf2da210722d00ade2ae78d46cf8e187142ff1ce4f9183dd22582040b69ced5bc7d64f83104c5d9a5994d681a207a2c1e6fdf1f4f5be5e66906451",
+    "user_verified": true
+  },
+  "rp_id": "webauthn.example",
+  "stored_record": {
+    "alg": -7,
+    "createdAt": 1793433600,
+    "credentialId": "EBESExQVFhcYGRobHB0eHw",
+    "fido2Extensions": {
+      "hmacCredentials": {
+        "algorithm": "hmac-sha256",
+        "credWithUV": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "credWithoutUV": "__79_Pv6-fj39vX08_Lx8O_u7ezr6uno5-bl5OPi4eA"
+      }
+    },
+    "key": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgHy49TFtqeYiXprXE0-LxAA8eLTxLWml4h5altMPS4fChRANCAASSIDMrIwBxLs8tohByLQCt4q541Gz44YcUL_HOT5GD3UC2nO1bx9ZPgxBMXZpZlNaBogeiweb98fT1vl5mkGRR",
+    "rpId": "webauthn.example",
+    "userDisplayName": "B K V",
+    "userHandle": "aGFuZGxlLTAx",
+    "userName": "bkv",
+    "v": 1
+  },
+  "stored_record_key_base64url": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgHy49TFtqeYiXprXE0-LxAA8eLTxLWml4h5altMPS4fChRANCAASSIDMrIwBxLs8tohByLQCt4q541Gz44YcUL_HOT5GD3UC2nO1bx9ZPgxBMXZpZlNaBogeiweb98fT1vl5mkGRR",
+  "user_display_name": "B K V",
+  "user_handle": "68616e646c652d3031",
+  "user_name": "bkv"
+}
