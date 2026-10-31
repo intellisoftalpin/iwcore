@@ -56,6 +56,9 @@ sha2 = "0.11.1"
 # Passkeys: base64url for WebAuthn and CXF values, HMAC-SHA256 for PRF.
 base64 = "0.23.1"
 hmac = "0.13.0"
+# Full Public Suffix List, for passkey rpId validation only (AutoFill ranking
+# keeps the curated list in autofill::domain).
+psl = "2.1.245"
 
 [dev-dependencies]
 # Independent decoding of our CBOR / COSE output, and property-based tests.

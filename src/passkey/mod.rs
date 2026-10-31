@@ -22,6 +22,8 @@ pub mod record;
 pub mod webauthn;
 pub mod sign;
 pub mod prf;
+pub mod origin;
+pub mod json;
 
 #[cfg(test)]
 mod vectors;
