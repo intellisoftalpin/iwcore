@@ -149,6 +149,11 @@ impl Wallet {
                 "Cannot move the root folder".to_string(),
             ));
         }
+        if self.is_same_or_descendant(new_parent_id, item_id)? {
+            return Err(WalletError::InvalidOperation(
+                "Cannot move an item into itself or into one of its own subfolders".to_string(),
+            ));
+        }
 
         let conn = self.db.as_ref()
             .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
@@ -158,6 +163,35 @@ impl Wallet {
 
         self.items_cache = None;
         Ok(())
+    }
+
+    /// True when `candidate` is `ancestor` itself or lies anywhere below it.
+    ///
+    /// Walks up from `candidate` through live **and** trashed items, so a
+    /// trashed folder cannot hide a cycle, and stops at the root, at a missing
+    /// parent, or at a chain that already loops (an older vault may hold one).
+    fn is_same_or_descendant(&mut self, candidate: &str, ancestor: &str) -> Result<bool> {
+        let mut parents: std::collections::HashMap<String, Option<String>> = self
+            .get_items()?
+            .iter()
+            .map(|i| (i.item_id.clone(), i.parent_id.clone()))
+            .collect();
+        for i in self.get_deleted_items()? {
+            parents.insert(i.item_id, i.parent_id);
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut current = Some(candidate.to_string());
+        while let Some(id) = current {
+            if id == ancestor {
+                return Ok(true);
+            }
+            if id == ROOT_ID || !seen.insert(id.clone()) {
+                return Ok(false);
+            }
+            current = parents.get(&id).cloned().flatten();
+        }
+        Ok(false)
     }
 
     /// Delete an item (soft delete). If the item is a folder, cascades
@@ -355,6 +389,53 @@ mod tests {
         // Verify new parent
         let item_after = wallet.get_item(&item_id).unwrap().unwrap();
         assert_eq!(item_after.parent_id.as_deref(), Some(folder_id.as_str()));
+    }
+
+    #[test]
+    fn move_into_itself_is_refused() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let folder = wallet.add_item("Folder", "folder", true, None).unwrap();
+        assert!(matches!(
+            wallet.move_item(&folder, &folder),
+            Err(WalletError::InvalidOperation(_))
+        ));
+        assert_eq!(wallet.get_item(&folder).unwrap().unwrap().parent_id.as_deref(), Some(ROOT_ID));
+    }
+
+    #[test]
+    fn move_into_a_descendant_is_refused_at_any_depth() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let a = wallet.add_item("A", "folder", true, None).unwrap();
+        let b = wallet.add_item("B", "folder", true, Some(&a)).unwrap();
+        let c = wallet.add_item("C", "folder", true, Some(&b)).unwrap();
+        for target in [&b, &c] {
+            assert!(matches!(wallet.move_item(&a, target), Err(WalletError::InvalidOperation(_))));
+        }
+        assert_eq!(wallet.get_item(&a).unwrap().unwrap().parent_id.as_deref(), Some(ROOT_ID));
+        // Moving the other way round is fine.
+        wallet.move_item(&c, &a).unwrap();
+        assert_eq!(wallet.get_item(&c).unwrap().unwrap().parent_id.as_deref(), Some(a.as_str()));
+    }
+
+    #[test]
+    fn move_into_a_trashed_descendant_is_refused() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let a = wallet.add_item("A", "folder", true, None).unwrap();
+        let b = wallet.add_item("B", "folder", true, Some(&a)).unwrap();
+        wallet.delete_item(&b).unwrap();
+        assert!(matches!(wallet.move_item(&a, &b), Err(WalletError::InvalidOperation(_))));
+    }
+
+    #[test]
+    fn move_between_siblings_and_to_root_still_works() {
+        let (mut wallet, _temp) = create_test_wallet();
+        let a = wallet.add_item("A", "folder", true, None).unwrap();
+        let b = wallet.add_item("B", "folder", true, None).unwrap();
+        let item = wallet.add_item("Item", "document", false, Some(&a)).unwrap();
+        wallet.move_item(&item, &b).unwrap();
+        wallet.move_item(&b, &a).unwrap();
+        wallet.move_item(&b, ROOT_ID).unwrap();
+        assert_eq!(wallet.get_item(&b).unwrap().unwrap().parent_id.as_deref(), Some(ROOT_ID));
     }
 
     /// Test: CopyFolder from C# BusinessFixture

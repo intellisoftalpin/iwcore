@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use super::compute_path;
+
 use crate::database::models::{IWField, IWItem};
 use crate::error::Result;
 
@@ -84,24 +86,6 @@ fn csv_escape(s: &str) -> String {
     } else {
         s.to_string()
     }
-}
-
-fn compute_path(item: &IWItem, items_map: &HashMap<&str, &IWItem>) -> String {
-    let mut parts = Vec::new();
-    let mut cur = item.parent_id.as_deref();
-    while let Some(pid) = cur {
-        if pid == crate::ROOT_ID {
-            break;
-        }
-        if let Some(parent) = items_map.get(pid) {
-            parts.push(parent.name.clone());
-            cur = parent.parent_id.as_deref();
-        } else {
-            break;
-        }
-    }
-    parts.reverse();
-    parts.join(" / ")
 }
 
 #[cfg(test)]
@@ -198,6 +182,19 @@ mod tests {
         assert!(s.contains("\"Tricky, Name\""));
         assert!(s.contains("\"He said \"\"hi\"\", then left.\""));
         assert!(s.contains("\"line1\nline2\""));
+    }
+
+    #[test]
+    fn parent_cycle_does_not_hang_the_export() {
+        // a -> b -> a, as an older vault with a bad move could hold.
+        let items = vec![
+            make_item("a", "A", Some("b"), true, false),
+            make_item("b", "B", Some("a"), true, false),
+            make_item("i", "Entry", Some("a"), false, false),
+        ];
+        let fields = vec![make_field("i", "f1", "Note", "x", 0, false)];
+        let out = String::from_utf8(generate_csv(&items, &fields).unwrap()).unwrap();
+        assert!(out.contains("Entry"));
     }
 
     #[test]
