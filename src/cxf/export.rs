@@ -285,3 +285,30 @@ fn collection_json<'a>(
     }
     Value::Object(obj)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::business::wallet::tests::create_test_wallet;
+
+    /// The root row is never a collection, even when an old or hand-edited file
+    /// gives it no parent, or itself as the parent.
+    #[test]
+    fn the_root_is_not_a_collection_whatever_its_parent() {
+        for parent in [None, Some(ROOT_ID)] {
+            let (mut w, _t) = create_test_wallet();
+            w.add_item("Top", "folder", true, None).unwrap();
+            w.db.as_ref().unwrap().connection().unwrap()
+                .execute("UPDATE nswallet_items SET parent_id = ? WHERE item_id = ?", rusqlite::params![parent, ROOT_ID])
+                .unwrap();
+            w.items_cache = None;
+            assert_eq!(w.get_item(ROOT_ID).unwrap().unwrap().parent_id.as_deref(), parent);
+
+            let doc = w.export_cxf(&ExportOptions::default()).unwrap();
+            let v: Value = serde_json::from_str(&doc).unwrap();
+            let titles: Vec<&str> = v["accounts"][0]["collections"].as_array().unwrap()
+                .iter().map(|c| c["title"].as_str().unwrap()).collect();
+            assert_eq!(titles, ["Top"], "parent {parent:?}");
+        }
+    }
+}
