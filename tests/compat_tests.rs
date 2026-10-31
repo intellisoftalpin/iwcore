@@ -274,3 +274,36 @@ fn exports_match_the_0_4_0_golden_files() {
         }
     }
 }
+
+/// A backup compressed with a method this build does not include (only Deflate
+/// and Stored are compiled in) is refused with an error, never a panic, and
+/// leaves no partial database behind.
+#[test]
+fn backup_with_unsupported_compression_is_refused_cleanly() {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("iwb-20261031-000000-manual.zip");
+    {
+        let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(iwcore::DATABASE_FILENAME, opts).unwrap();
+        zip.write_all(b"SQLite format 3\0 not really").unwrap();
+        zip.finish().unwrap();
+    }
+    // Rewrite the method field (Stored = 0) to bzip2 (12) in the local and
+    // central headers, as a backup from another tool would carry it.
+    let mut bytes = fs::read(&path).unwrap();
+    for sig in [&b"PK\x03\x04"[..], &b"PK\x01\x02"[..]] {
+        let at = bytes.windows(4).position(|w| w == sig).unwrap();
+        let method = at + if sig[2] == 3 { 8 } else { 10 };
+        bytes[method] = 12;
+    }
+    fs::write(&path, &bytes).unwrap();
+
+    let mgr = BackupManager::new(temp.path());
+    let target = temp.path().join("restored").join(iwcore::DATABASE_FILENAME);
+    assert!(mgr.restore_backup(&path, &target).is_err());
+    assert!(!target.exists() || fs::metadata(&target).unwrap().len() == 0);
+}

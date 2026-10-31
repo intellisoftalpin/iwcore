@@ -16,30 +16,32 @@ exclude = ["docs"]
 
 [dependencies]
 # Database
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 
 # Crypto - current scheme (XChaCha20-Poly1305 + Argon2id)
 chacha20poly1305 = "0.11.0"
-argon2 = "0.6.0-rc.8"
-zeroize = "1.8"
+argon2 = "0.6.0"
+zeroize = "1.9.1"
 
 # Crypto - legacy scheme (read-only, used by the v5->v6 migration path)
-aes = "0.9.1"
+aes = "0.9.3"
 cbc = "0.2.1"
 md-5 = "0.11.0"
 block-padding = "0.4.2"
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 # Utilities
-chrono = { version = "0.4", features = ["serde"] }
-thiserror = "2.0"
-zip = "8.6"
+chrono = { version = "0.4.45", features = ["serde"] }
+thiserror = "2.0.21"
+# Backups are only ever written with Deflate, so only Deflate is compiled in:
+# the default features would pull in zstd, bzip2, lzma and xz for nothing.
+zip = { version = "9.2.0", default-features = false, features = ["deflate"] }
 genpdf = "0.2"
-uuid = { version = "1.23", features = ["v4"] }
-rand = "0.10"
+uuid = { version = "1.29.0", features = ["v4"] }
+rand = "0.10.3"
 tempfile = "3.27"
 
 # Crypto - autofill write-back journal (P-256 ECDH + HKDF-SHA256), see
@@ -47,7 +49,7 @@ tempfile = "3.27"
 # so the iOS AutoFill extension needs no third-party or Rust crypto of its own.
 p256 = { version = "0.14.0", features = ["ecdh"] }
 hkdf = "0.13.0"
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 
 [dev-dependencies]
 
