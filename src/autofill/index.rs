@@ -44,8 +44,8 @@ pub const FORMAT_VERSION: u8 = 1;
 /// The body is padded up to a multiple of this before sealing.
 pub const PAD_BLOCK: usize = 4096;
 
-/// One fillable login.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One fillable login. `Debug` redacts the password and TOTP secret.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexEntry {
     pub item_id: String,
     pub title: String,
@@ -60,6 +60,21 @@ pub struct IndexEntry {
     /// Precomputed registrable domains, so the provider needs no public suffix
     /// list of its own and does plain string comparison.
     pub registrable: Vec<String>,
+}
+
+impl std::fmt::Debug for IndexEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexEntry")
+            .field("item_id", &self.item_id)
+            .field("title", &self.title)
+            .field("identity_type", &self.identity_type)
+            .field("username", &self.username)
+            .field("password", &crate::utils::REDACTED)
+            .field("totp_secret", &self.totp_secret.as_ref().map(|_| crate::utils::REDACTED))
+            .field("hosts", &self.hosts)
+            .field("registrable", &self.registrable)
+            .finish()
+    }
 }
 
 /// Plaintext header of an index file.

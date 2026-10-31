@@ -73,7 +73,9 @@ pub enum PendingOp {
 /// records fill until they are drained. That is a deliberate exemption from the
 /// index's own expiry, because a record the user created moments ago has never
 /// had a chance to reach the vault.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` redacts the password and TOTP secret.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRecord {
     /// Random identifier, so a crash between "written to vault" and "journal
     /// deleted" cannot double-import on the next attempt.
@@ -101,6 +103,23 @@ pub struct PendingRecord {
     pub totp_secret: Option<String>,
     /// Unix seconds. Informational only; never used to expire a record.
     pub created_at: i64,
+}
+
+impl std::fmt::Debug for PendingRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRecord")
+            .field("record_id", &self.record_id)
+            .field("op", &self.op)
+            .field("item_id", &self.item_id)
+            .field("title", &self.title)
+            .field("url", &self.url)
+            .field("identity_value", &self.identity_value)
+            .field("identity_hint", &self.identity_hint)
+            .field("password", &crate::utils::REDACTED)
+            .field("totp_secret", &self.totp_secret.as_ref().map(|_| crate::utils::REDACTED))
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 impl PendingRecord {

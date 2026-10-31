@@ -61,8 +61,11 @@ impl IWItem {
     }
 }
 
-/// Field attached to an item
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Field attached to an item.
+///
+/// `Debug` prints `[redacted]` in place of the decrypted value, so a `{:?}` in
+/// an app's log can never leak a secret.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct IWField {
     /// Parent item ID
     pub item_id: String,
@@ -90,13 +93,41 @@ pub struct IWField {
     pub expiring: bool,
 }
 
+impl std::fmt::Debug for IWField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IWField")
+            .field("item_id", &self.item_id)
+            .field("field_id", &self.field_id)
+            .field("field_type", &self.field_type)
+            .field("value", &crate::utils::REDACTED)
+            .field("label", &self.label)
+            .field("icon", &self.icon)
+            .field("value_type", &self.value_type)
+            .field("sort_weight", &self.sort_weight)
+            .field("change_timestamp", &self.change_timestamp)
+            .field("deleted", &self.deleted)
+            .field("expired", &self.expired)
+            .field("expiring", &self.expiring)
+            .finish()
+    }
+}
+
 /// Frequency entry for a stored value of a given field type. Returned
 /// by `Wallet::get_top_field_values_by_type` so callers can render
 /// suggestion chips ranked by how often a value has been used.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FieldValueUsage {
     pub value: String,
     pub count: u32,
+}
+
+impl std::fmt::Debug for FieldValueUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FieldValueUsage")
+            .field("value", &crate::utils::REDACTED)
+            .field("count", &self.count)
+            .finish()
+    }
 }
 
 /// Field type label definition
