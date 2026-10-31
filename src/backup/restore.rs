@@ -196,6 +196,57 @@ pub fn check_backup_password_in(backup_path: &Path, password: &str, temp_base: &
     wallet.check_password(password)
 }
 
+/// What a backup holds, read without its password. Lets an app warn before a
+/// restore replaces newer data, for example passkeys a pre-passkey backup has
+/// never seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupInspection {
+    /// The database version string (`"6"` for current vaults).
+    pub db_version: String,
+    /// When the backup was made, from its file name, if it follows the naming.
+    pub created: Option<chrono::DateTime<chrono::Utc>>,
+    /// Live entries (not folders, not in the trash).
+    pub item_count: u32,
+    /// Live passkeys on live entries.
+    pub passkey_count: u32,
+}
+
+/// Inspect a backup without its password, extracting into the given
+/// app-writable temp base folder. Item and field types are stored unencrypted,
+/// so counting needs no key.
+pub fn inspect_backup_in(backup_path: &Path, temp_base: &Path) -> Result<BackupInspection> {
+    use rusqlite::{Connection, OpenFlags};
+
+    let temp_dir = temp_dir_in(temp_base)?;
+    let db_path = extract_backup(backup_path, temp_dir.path())?;
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| WalletError::DatabaseError(format!("Failed to open database: {}", e)))?;
+
+    let db_version: String = conn
+        .query_row("SELECT version FROM nswallet_properties LIMIT 1", [], |row| row.get(0))
+        .unwrap_or_else(|_| "1".to_string());
+    let item_count: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM nswallet_items
+         WHERE COALESCE(deleted, 0) = 0 AND COALESCE(folder, 0) = 0 AND item_id <> ?1",
+        [crate::ROOT_ID],
+        |row| row.get(0),
+    )?;
+    let passkey_count: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM nswallet_fields f
+         JOIN nswallet_items i ON i.item_id = f.item_id
+         WHERE f.type = ?1 AND COALESCE(f.deleted, 0) = 0
+           AND COALESCE(i.deleted, 0) = 0 AND COALESCE(i.folder, 0) = 0",
+        [crate::passkey::FIELD_PASSKEY],
+        |row| row.get(0),
+    )?;
+    let created = backup_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(super::get_date_from_backup_filename);
+
+    Ok(BackupInspection { db_version, created, item_count, passkey_count })
+}
+
 /// Check database version directly from a database file (not a backup)
 pub fn get_db_version(db_path: &Path) -> Result<String> {
     use rusqlite::Connection;

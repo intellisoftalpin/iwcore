@@ -12,6 +12,8 @@ pub use restore::{
     is_backup_compatible,
     is_backup_compatible_in,
     check_backup_password_in,
+    inspect_backup_in,
+    BackupInspection,
     get_db_version,
     check_db_version,
 };

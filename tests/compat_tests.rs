@@ -307,3 +307,52 @@ fn backup_with_unsupported_compression_is_refused_cleanly() {
     assert!(mgr.restore_backup(&path, &target).is_err());
     assert!(!target.exists() || fs::metadata(&target).unwrap().len() == 0);
 }
+
+/// Every old backup can be inspected without its password; none has passkeys.
+#[test]
+fn old_backups_inspect_without_a_password() {
+    for v in VERSIONS {
+        let m = manifest(v);
+        let temp = TempDir::new().unwrap();
+        let info = iwcore::backup::inspect_backup_in(&backup_zip(v, &m), temp.path()).unwrap();
+        let entries = from_manifest::<IWItem>(&m, "items").iter().filter(|i| !i.folder).count();
+        assert_eq!(info.item_count as usize, entries, "{v}: entry count");
+        assert_eq!(info.passkey_count, 0, "{v}: pre-passkey backups hold none");
+        assert!(info.created.is_some(), "{v}: date from the file name");
+    }
+}
+
+/// A backup made now carries its passkeys, and inspecting it counts them, so
+/// the app can warn before an old backup replaces them.
+#[test]
+fn a_restored_old_backup_gains_passkeys_and_backs_them_up() {
+    use iwcore::autofill::{generate_keys, journal, PendingOp, PendingRecord};
+    use iwcore::passkey::sign::{self, RegisterInput};
+
+    for v in VERSIONS {
+        let (temp, mut wallet, m) = restore(v);
+        let keys = generate_keys().unwrap();
+        let reg = sign::register(&RegisterInput {
+            rp_id: "example.com", user_name: "bkv", user_display_name: "bkv", user_handle: b"h",
+            exclude_credentials: &[], held_credential_ids: &[], user_verified: true, now: 0,
+        }).unwrap();
+        let record = PendingRecord {
+            record_id: "r".into(), op: PendingOp::CreatePasskey, item_id: None, title: "example.com".into(),
+            url: "https://example.com".into(), identity_value: "bkv".into(), identity_hint: None,
+            password: String::new(), totp_secret: None, created_at: 0,
+            passkey: Some(reg.record.to_field_value().unwrap().to_string()),
+        };
+        let j = journal::seal_record(&record, &keys.journal_public, &keys.index_key).unwrap();
+        let s = wallet.drain_autofill_journal(&j, &keys.journal_secret, None).unwrap();
+        assert_eq!(s.passkeys_added, 1, "{v}");
+        assert!(wallet.get_labels().unwrap().iter().any(|l| l.field_type == "PKEY"), "{v}: label added");
+
+        let mgr = BackupManager::new(&temp.path().join("new-backups"));
+        let zip = mgr.create_backup(wallet.database().unwrap(), true).unwrap();
+        let info = iwcore::backup::inspect_backup_in(&zip, temp.path()).unwrap();
+        assert_eq!(info.passkey_count, 1, "{v}");
+        // The old backup, by contrast, has none: the app warns before restoring it.
+        let old = iwcore::backup::inspect_backup_in(&backup_zip(v, &m), temp.path()).unwrap();
+        assert_eq!(old.passkey_count, 0);
+    }
+}
