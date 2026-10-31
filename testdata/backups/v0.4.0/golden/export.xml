@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<intelliwallet version="1" exported_at="<exported_at>">
+  <items>
+    <item id="__ROOT__" name="8uG9BKTE69yEXz5OLDtswd0MPs98WuEm" parent_id="________" folder="true" icon="" change_timestamp="2026-10-31T14:01:53+00:00">
+    </item>
+    <item id="XfdLzstc" name="Every field type" parent_id="wgMTMEV0" folder="false" icon="document" change_timestamp="2026-10-31T14:01:53+00:00">
+      <field id="zR8S" type="2FAC" label="2FA" value_type="pass" sort_weight="0">JBSWY3DPEHPK3PXP</field>
+      <field id="M9WQ" type="ACNT" label="Account" value_type="text" sort_weight="1">value of ACNT – ñ</field>
+      <field id="YGnL" type="ADDR" label="Address" value_type="text" sort_weight="2">value of ADDR – ñ</field>
+      <field id="72oF" type="CARD" label="Card" value_type="text" sort_weight="3">4111111111111111</field>
+      <field id="Ha9U" type="CVVC" label="CVV" value_type="pass" sort_weight="4">secret-cvvc-Ω</field>
+      <field id="on5f" type="DATE" label="Date" value_type="date" sort_weight="5">20290630</field>
+      <field id="HUsG" type="MAIL" label="Email" value_type="mail" sort_weight="6">fixture.user@example.com</field>
+      <field id="M1XV" type="EXPD" label="Expiry Date" value_type="date" sort_weight="7">20290630</field>
+      <field id="uGcq" type="LINK" label="Link" value_type="link" sort_weight="8">https://login.example.com/path?x=1</field>
+      <field id="J1oS" type="NAME" label="Name" value_type="text" sort_weight="9">value of NAME – ñ</field>
+      <field id="wDwl" type="NOTE" label="Note" value_type="text" sort_weight="10">Line 1
+Zürich – 東京 – 🔐
+long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long </field>
+      <field id="R14u" type="OLDP" label="Old Password" value_type="pass" sort_weight="11">secret-oldp-Ω</field>
+      <field id="saXh" type="PASS" label="Password" value_type="pass" sort_weight="12">secret-pass-Ω</field>
+      <field id="2edc" type="PHON" label="Phone" value_type="phon" sort_weight="13">+41 44 123 45 67</field>
+      <field id="ogdY" type="PINC" label="PIN" value_type="pass" sort_weight="14">secret-pinc-Ω</field>
+      <field id="QVzT" type="SANS" label="Secret Answer" value_type="pass" sort_weight="15">secret-sans-Ω</field>
+      <field id="BvWG" type="SQUE" label="Secret Question" value_type="text" sort_weight="16">value of SQUE – ñ</field>
+      <field id="a54K" type="SEED" label="Seed Phrase" value_type="text" sort_weight="17">value of SEED – ñ</field>
+      <field id="khua" type="SNUM" label="Serial Number" value_type="text" sort_weight="18">value of SNUM – ñ</field>
+      <field id="Q9Vh" type="TIME" label="Time" value_type="time" sort_weight="19">1230</field>
+      <field id="9WYO" type="USER" label="Username" value_type="text" sort_weight="20">fixture_user</field>
+      <field id="K6Ij" type="WIFI" label="Wi-Fi Password" value_type="pass" sort_weight="21">WIFI:T:WPA;S:Fixture Net;P:wifi-pass-1;H:false;;</field>
+      <field id="EXKx" type="Pz65" label="Fixture Custom" value_type="text" sort_weight="22">value of Pz65 – ñ</field>
+    </item>
+    <item id="gcARl1Hq" name="Example Login" parent_id="c5cFXoGA" folder="false" icon="web" change_timestamp="2026-10-31T14:01:53+00:00">
+      <field id="qnEP" type="USER" label="Username" value_type="text" sort_weight="0">fixture_user</field>
+      <field id="EgGo" type="PASS" label="Password" value_type="pass" sort_weight="1">P@ss;word,with:special"chars\</field>
+      <field id="xguj" type="LINK" label="Link" value_type="link" sort_weight="2">https://login.example.com/</field>
+      <field id="EQ7p" type="Pz65" label="Fixture Custom" value_type="text" sort_weight="3">custom label value</field>
+    </item>
+    <item id="c5cFXoGA" name="Fixture Folder" parent_id="__ROOT__" folder="true" icon="folder" change_timestamp="2026-10-31T14:01:53+00:00">
+    </item>
+    <item id="wgMTMEV0" name="Nested – Ünterordner" parent_id="c5cFXoGA" folder="true" icon="folder" change_timestamp="2026-10-31T14:01:53+00:00">
+    </item>
+    <item id="fAQYOEo8" name="Root level item" parent_id="__ROOT__" folder="false" icon="document" change_timestamp="2026-10-31T14:01:53+00:00">
+      <field id="eG2R" type="NOTE" label="Note" value_type="text" sort_weight="0"></field>
+    </item>
+  </items>
+</intelliwallet>

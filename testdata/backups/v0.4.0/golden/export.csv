@@ -1,0 +1,34 @@
+item_id,item_name,item_path,item_is_folder,field_id,field_type,field_label,field_value,field_value_type,field_sort_weight,field_change_timestamp
+__ROOT__,8uG9BKTE69yEXz5OLDtswd0MPs98WuEm,,true,,,,,,,
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,zR8S,2FAC,2FA,JBSWY3DPEHPK3PXP,pass,0,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,M9WQ,ACNT,Account,value of ACNT – ñ,text,1,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,YGnL,ADDR,Address,value of ADDR – ñ,text,2,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,72oF,CARD,Card,4111111111111111,text,3,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,Ha9U,CVVC,CVV,secret-cvvc-Ω,pass,4,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,on5f,DATE,Date,20290630,date,5,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,HUsG,MAIL,Email,fixture.user@example.com,mail,6,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,M1XV,EXPD,Expiry Date,20290630,date,7,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,uGcq,LINK,Link,https://login.example.com/path?x=1,link,8,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,J1oS,NAME,Name,value of NAME – ñ,text,9,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,wDwl,NOTE,Note,"Line 1
+Zürich – 東京 – 🔐
+long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long long ",text,10,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,R14u,OLDP,Old Password,secret-oldp-Ω,pass,11,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,saXh,PASS,Password,secret-pass-Ω,pass,12,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,2edc,PHON,Phone,+41 44 123 45 67,phon,13,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,ogdY,PINC,PIN,secret-pinc-Ω,pass,14,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,QVzT,SANS,Secret Answer,secret-sans-Ω,pass,15,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,BvWG,SQUE,Secret Question,value of SQUE – ñ,text,16,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,a54K,SEED,Seed Phrase,value of SEED – ñ,text,17,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,khua,SNUM,Serial Number,value of SNUM – ñ,text,18,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,Q9Vh,TIME,Time,1230,time,19,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,9WYO,USER,Username,fixture_user,text,20,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,K6Ij,WIFI,Wi-Fi Password,WIFI:T:WPA;S:Fixture Net;P:wifi-pass-1;H:false;;,pass,21,2026-10-31T14:01:53+00:00
+XfdLzstc,Every field type,Fixture Folder / Nested – Ünterordner,false,EXKx,Pz65,Fixture Custom,value of Pz65 – ñ,text,22,2026-10-31T14:01:53+00:00
+gcARl1Hq,Example Login,Fixture Folder,false,qnEP,USER,Username,fixture_user,text,0,2026-10-31T14:01:53+00:00
+gcARl1Hq,Example Login,Fixture Folder,false,EgGo,PASS,Password,"P@ss;word,with:special""chars\",pass,1,2026-10-31T14:01:53+00:00
+gcARl1Hq,Example Login,Fixture Folder,false,xguj,LINK,Link,https://login.example.com/,link,2,2026-10-31T14:01:53+00:00
+gcARl1Hq,Example Login,Fixture Folder,false,EQ7p,Pz65,Fixture Custom,custom label value,text,3,2026-10-31T14:01:53+00:00
+c5cFXoGA,Fixture Folder,,true,,,,,,,
+wgMTMEV0,Nested – Ünterordner,Fixture Folder,true,,,,,,,
+fAQYOEo8,Root level item,,false,eG2R,NOTE,Note,,text,0,2026-10-31T14:01:53+00:00

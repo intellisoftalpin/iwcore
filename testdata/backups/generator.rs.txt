@@ -1,0 +1,123 @@
+//! Generates an old-format backup fixture with a pinned iwcore version.
+//! Usage: g <iwcore-version> <out-dir>
+use iwcore::{BackupManager, Wallet};
+use std::path::Path;
+
+const PASSWORD: &str = "Fixture-Pass-2026!";
+
+fn value_for(field_type: &str, value_type: &str) -> String {
+    match field_type {
+        "2FAC" => "JBSWY3DPEHPK3PXP".into(),
+        "WIFI" => "WIFI:T:WPA;S:Fixture Net;P:wifi-pass-1;H:false;;".into(),
+        "LINK" => "https://login.example.com/path?x=1".into(),
+        "MAIL" => "fixture.user@example.com".into(),
+        "USER" => "fixture_user".into(),
+        "PHON" => "+41 44 123 45 67".into(),
+        "DATE" | "EXPD" => "20290630".into(),
+        "TIME" => "1230".into(),
+        "CARD" => "4111111111111111".into(),
+        "NOTE" => format!("Line 1\nZürich – 東京 – 🔐\n{}", "long ".repeat(400)),
+        _ => match value_type {
+            "pass" => format!("secret-{}-Ω", field_type.to_lowercase()),
+            _ => format!("value of {field_type} – ñ"),
+        },
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let version = &args[1];
+    let out = Path::new(&args[2]);
+    let wallet_dir = out.join("wallet");
+    let backup_dir = out.join("backups");
+    std::fs::create_dir_all(&wallet_dir).unwrap();
+    std::fs::create_dir_all(&backup_dir).unwrap();
+
+    let mut w = Wallet::create(&wallet_dir, PASSWORD, "en").unwrap();
+    if !w.is_unlocked() {
+        assert!(w.unlock(PASSWORD).unwrap());
+    }
+
+    let custom = w.add_label("Fixture Custom", "label", "text").unwrap();
+    let folder = w.add_item("Fixture Folder", "folder", true, None).unwrap();
+    let sub = w.add_item("Nested – Ünterordner", "folder", true, Some(&folder)).unwrap();
+
+    // One item per system label, carrying every type that version knows.
+    let all = w.add_item("Every field type", "document", false, Some(&sub)).unwrap();
+    let labels = w.get_labels().unwrap();
+    for (i, l) in labels.iter().enumerate() {
+        let v = value_for(&l.field_type, &l.value_type);
+        w.add_field(&all, &l.field_type, &v, Some(i as i32)).unwrap();
+    }
+
+    let login = w.add_item("Example Login", "web", false, Some(&folder)).unwrap();
+    w.add_field(&login, "USER", "fixture_user", Some(0)).unwrap();
+    w.add_field(&login, "PASS", "P@ss;word,with:special\"chars\\", Some(1)).unwrap();
+    w.add_field(&login, "LINK", "https://login.example.com/", Some(2)).unwrap();
+    w.add_field(&login, &custom, "custom label value", Some(3)).unwrap();
+
+    let root_item = w.add_item("Root level item", "document", false, None).unwrap();
+    w.add_field(&root_item, "NOTE", "", Some(0)).unwrap();
+
+    let trashed = w.add_item("Trashed item", "document", false, None).unwrap();
+    w.add_field(&trashed, "PASS", "trashed-secret", Some(0)).unwrap();
+    w.delete_item(&trashed).unwrap();
+
+    #[cfg(feature = "autofill")]
+    let af = {
+        use iwcore::autofill::{generate_keys, journal, IndexOptions, PendingOp, PendingRecord};
+        let keys = generate_keys().unwrap();
+        let index = w
+            .build_autofill_index(&keys.index_key, 1, 1_790_000_000, IndexOptions::default())
+            .unwrap();
+        let rec = PendingRecord {
+            record_id: "fixture-record-1".into(),
+            op: PendingOp::Create,
+            item_id: None,
+            title: "Staged before update".into(),
+            url: "https://staged.example.org".into(),
+            identity_value: "staged@example.org".into(),
+            identity_hint: None,
+            password: "staged-pass-1".into(),
+            totp_secret: None,
+            created_at: 1_790_000_100,
+        };
+        let jr = journal::seal_record(&rec, &keys.journal_public, &keys.index_key).unwrap();
+        std::fs::write(out.join("autofill-index-v1.bin"), &index).unwrap();
+        std::fs::write(out.join("autofill-journal-v1.bin"), &jr).unwrap();
+        serde_json::json!({
+            "index_key": hex(&keys.index_key[..]),
+            "journal_secret": hex(&keys.journal_secret[..]),
+            "journal_public": hex(&keys.journal_public),
+            "staged_record": rec,
+        })
+    };
+    #[cfg(not(feature = "autofill"))]
+    let af = serde_json::Value::Null;
+
+    let items: Vec<_> = w.get_items().unwrap().to_vec();
+    let fields: Vec<_> = w.get_fields().unwrap().to_vec();
+    let backup = BackupManager::new(&backup_dir)
+        .create_backup(w.database().unwrap(), true)
+        .unwrap();
+
+    let manifest = serde_json::json!({
+        "generated_with_iwcore": version,
+        "password": PASSWORD,
+        "backup_file": backup.file_name().unwrap().to_string_lossy(),
+        "trashed_item_id": trashed,
+        "custom_label": custom,
+        "labels": labels,
+        "items": items,
+        "fields": fields,
+        "autofill": af,
+    });
+    std::fs::write(out.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+    w.close();
+    println!("{version}: {}", backup.display());
+}
+
+#[allow(dead_code)]
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
