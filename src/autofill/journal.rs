@@ -65,6 +65,9 @@ pub enum PendingOp {
     /// A password change for an entry that already exists. The old value moves
     /// into an `OLDP` field and the new one is written to `PASS`.
     UpdatePassword,
+    /// A passkey created in the provider. The record is in
+    /// [`PendingRecord::passkey`]; the password field is empty.
+    CreatePasskey,
 }
 
 /// One staged login.
@@ -103,6 +106,11 @@ pub struct PendingRecord {
     pub totp_secret: Option<String>,
     /// Unix seconds. Informational only; never used to expire a record.
     pub created_at: i64,
+    /// For [`PendingOp::CreatePasskey`]: the passkey as a `PKEY` field value
+    /// (see `passkey::record`), private key included. Absent otherwise, so
+    /// records written before passkeys existed read unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passkey: Option<String>,
 }
 
 impl std::fmt::Debug for PendingRecord {
@@ -118,6 +126,7 @@ impl std::fmt::Debug for PendingRecord {
             .field("password", &crate::utils::REDACTED)
             .field("totp_secret", &self.totp_secret.as_ref().map(|_| crate::utils::REDACTED))
             .field("created_at", &self.created_at)
+            .field("passkey", &self.passkey.as_ref().map(|_| crate::utils::REDACTED))
             .finish()
     }
 }
@@ -388,6 +397,7 @@ mod tests {
             password: "correct horse battery staple".into(),
             totp_secret: None,
             created_at: 1_700_000_000,
+            passkey: None,
         }
     }
 

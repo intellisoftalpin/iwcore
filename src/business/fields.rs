@@ -10,6 +10,7 @@ use crate::database::{IWField, FieldValueUsage, queries};
 use crate::database::queries::parse_timestamp;
 use crate::utils::generate_field_id;
 use super::wallet::Wallet;
+use crate::passkey::{vault::public_value, FIELD_PASSKEY};
 
 impl Wallet {
     /// Get all fields (decrypted)
@@ -46,7 +47,8 @@ impl Wallet {
         let fields = self.get_fields()?;
         let mut counts: HashMap<&str, u32> = HashMap::new();
         for f in fields {
-            if f.deleted || f.field_type != field_type || f.value.is_empty() {
+            // Passkeys are never offered as suggestions.
+            if f.deleted || f.field_type != field_type || f.value.is_empty() || f.field_type == FIELD_PASSKEY {
                 continue;
             }
             *counts.entry(f.value.as_str()).or_insert(0) += 1;
@@ -82,15 +84,21 @@ impl Wallet {
 
         let labels = self.labels_cache.as_ref().unwrap();
         let mut fields = Vec::with_capacity(raw_fields.len());
+        let mut passkey_values = HashMap::new();
 
         for raw in raw_fields {
             // NULL value columns arrive as empty blobs (COALESCE in the
             // query); they carry no ciphertext, so the value is empty.
-            let value = if raw.value_encrypted.is_empty() {
+            let mut value = if raw.value_encrypted.is_empty() {
                 String::new()
             } else {
                 self.dec_value(&raw.value_encrypted)?
             };
+            if raw.field_type == FIELD_PASSKEY {
+                let stored = zeroize::Zeroizing::new(std::mem::take(&mut value));
+                value = public_value(&stored);
+                passkey_values.insert((raw.item_id.clone(), raw.field_id.clone()), stored);
+            }
 
             let label = labels.get(&raw.field_type);
             let (label_name, icon, value_type) = match label {
@@ -125,11 +133,21 @@ impl Wallet {
         }
 
         self.fields_cache = Some(fields);
+        self.passkey_values = passkey_values;
         Ok(())
     }
 
-    /// Add a new field to an item
+    /// Add a new field to an item.
+    ///
+    /// Refuses `PKEY`: passkeys are created by sites through the passkey
+    /// provider and arrive through the AutoFill journal or a CXF import.
     pub fn add_field(&mut self, item_id: &str, field_type: &str, value: &str, sort_weight: Option<i32>) -> Result<String> {
+        refuse_passkey(field_type)?;
+        self.add_field_unchecked(item_id, field_type, value, sort_weight)
+    }
+
+    /// `add_field` without the passkey guard, for the crate's own validated writes.
+    pub(crate) fn add_field_unchecked(&mut self, item_id: &str, field_type: &str, value: &str, sort_weight: Option<i32>) -> Result<String> {
         self.ensure_unlocked()?;
 
         let field_id = generate_field_id();
@@ -154,7 +172,19 @@ impl Wallet {
 
     /// Update a field's value. Soft-deletes the old field (preserving its value in the deleted pool)
     /// and creates a new field with the updated value. Returns the new field_id.
+    ///
+    /// Refuses a `PKEY` field: a passkey's value is not user-editable.
     pub fn update_field(&mut self, field_id: &str, value: &str, sort_weight: Option<i32>) -> Result<String> {
+        self.update_field_checked(field_id, value, sort_weight, true)
+    }
+
+    /// `update_field` for the crate's own validated writes, which may replace a
+    /// passkey (the old one stays recoverable in the trash).
+    pub(crate) fn update_field_unchecked(&mut self, field_id: &str, value: &str, sort_weight: Option<i32>) -> Result<String> {
+        self.update_field_checked(field_id, value, sort_weight, false)
+    }
+
+    fn update_field_checked(&mut self, field_id: &str, value: &str, sort_weight: Option<i32>, guard: bool) -> Result<String> {
         self.ensure_unlocked()?;
 
         // Encrypt the new value up front (immutable borrow of the DEK) before
@@ -168,6 +198,9 @@ impl Wallet {
         // Fetch old field from DB
         let old_field = queries::get_field_raw_by_id(conn, field_id)?
             .ok_or_else(|| WalletError::FieldNotFound(field_id.to_string()))?;
+        if guard {
+            refuse_passkey(&old_field.field_type)?;
+        }
 
         // If PASS type: copy old encrypted bytes directly to OLDP. Both fields
         // are encrypted under the same DEK, so the ciphertext is reusable as-is.
@@ -223,6 +256,7 @@ impl Wallet {
 
         for raw in raw_fields {
             let value = match self.dec_value(&raw.value_encrypted) {
+                Ok(v) if raw.field_type == FIELD_PASSKEY => public_value(&zeroize::Zeroizing::new(v)),
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -275,7 +309,10 @@ impl Wallet {
         Ok(())
     }
 
-    /// Copy a field to another item
+    /// Copy a field to another item.
+    ///
+    /// Refuses `PKEY`: a copy would be a second item answering for the same
+    /// credential.
     pub fn copy_field(&mut self, source_item_id: &str, field_id: &str, target_item_id: &str) -> Result<String> {
         let fields = self.get_fields_by_item(source_item_id)?;
         let field = fields.iter().find(|f| f.field_id == field_id)
@@ -284,12 +321,26 @@ impl Wallet {
         self.add_field(target_item_id, &field.field_type, &field.value, None)
     }
 
-    /// Move a field to another item
+    /// Move a field to another item. Works for passkeys too: the credential
+    /// moves with its stored value and stays unique.
     pub fn move_field(&mut self, source_item_id: &str, field_id: &str, target_item_id: &str) -> Result<()> {
-        self.copy_field(source_item_id, field_id, target_item_id)?;
+        if let Some(stored) = self.passkey_stored_value(source_item_id, field_id)? {
+            self.add_field_unchecked(target_item_id, FIELD_PASSKEY, &stored, None)?;
+        } else {
+            self.copy_field(source_item_id, field_id, target_item_id)?;
+        }
         self.delete_field(source_item_id, field_id)?;
         Ok(())
     }
+}
+
+fn refuse_passkey(field_type: &str) -> Result<()> {
+    if field_type == FIELD_PASSKEY {
+        return Err(WalletError::InvalidOperation(
+            "passkeys are created by sites, not added or edited by hand".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Check if a date field is expired or expiring soon. The wallet's

@@ -87,7 +87,7 @@ pub fn set_properties(
          VALUES (?, ?, ?, ?, ?, ?)",
         params![database_id, lang, version, encryption_count.to_string(), now_timestamp(), now_timestamp()],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -97,7 +97,18 @@ pub fn set_db_version(conn: &Connection, version: &str) -> Result<()> {
         "UPDATE nswallet_properties SET version = ?, update_timestamp = ?",
         params![version, now_timestamp()],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
+    Ok(())
+}
+
+/// Fold the WAL back into the database file after a write, so a crash or a
+/// copied file never loses it. Skipped inside an open transaction, where a
+/// checkpoint cannot run; the code that opened the transaction checkpoints after
+/// COMMIT (see `Wallet::in_transaction`).
+pub(crate) fn checkpoint(conn: &Connection) -> Result<()> {
+    if conn.is_autocommit() {
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    }
     Ok(())
 }
 
@@ -578,7 +589,7 @@ pub fn create_item(
     folder: bool,
 ) -> Result<()> {
     create_item_no_checkpoint(conn, item_id, parent_id, name_encrypted, icon, folder)?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -608,7 +619,7 @@ pub fn update_item_name(conn: &Connection, item_id: &str, name_encrypted: &[u8])
         "UPDATE nswallet_items SET name = ?, change_timestamp = ? WHERE item_id = ?",
         params![name_encrypted, now_timestamp(), item_id],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -618,7 +629,7 @@ pub fn update_item_icon(conn: &Connection, item_id: &str, icon: &str) -> Result<
         "UPDATE nswallet_items SET icon = ?, change_timestamp = ? WHERE item_id = ?",
         params![icon, now_timestamp(), item_id],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -628,7 +639,7 @@ pub fn update_item_parent(conn: &Connection, item_id: &str, parent_id: &str) -> 
         "UPDATE nswallet_items SET parent_id = ?, change_timestamp = ? WHERE item_id = ?",
         params![parent_id, now_timestamp(), item_id],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -643,7 +654,7 @@ pub fn delete_item(conn: &Connection, item_id: &str) -> Result<()> {
         "UPDATE nswallet_fields SET deleted = 1, change_timestamp = ? WHERE item_id = ? AND deleted = 0",
         params![now, item_id],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -680,7 +691,7 @@ pub fn undelete_item(conn: &Connection, item_id: &str) -> Result<()> {
     if rows == 0 {
         return Err(crate::error::WalletError::ItemNotFound(item_id.to_string()));
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -705,7 +716,7 @@ pub fn delete_item_descendants(conn: &Connection, item_id: &str) -> Result<()> {
         UPDATE nswallet_fields SET deleted = 1, change_timestamp = ?2 WHERE item_id IN (SELECT id FROM descendants) AND deleted = 0",
         params![item_id, now],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -761,7 +772,7 @@ pub fn create_field(
          VALUES (?, ?, ?, ?, ?, 0, ?)",
         params![item_id, field_id, field_type, value_encrypted, now_timestamp(), sort_weight],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -783,7 +794,7 @@ pub fn update_field(
             params![value_encrypted, now_timestamp(), field_id],
         )?;
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -793,7 +804,7 @@ pub fn delete_field(conn: &Connection, item_id: &str, field_id: &str) -> Result<
         "UPDATE nswallet_fields SET deleted = 1, change_timestamp = ? WHERE item_id = ? AND field_id = ?",
         params![now_timestamp(), item_id, field_id],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -838,7 +849,7 @@ pub fn undelete_field(conn: &Connection, item_id: &str, field_id: &str) -> Resul
     if rows == 0 {
         return Err(crate::error::WalletError::FieldNotFound(field_id.to_string()));
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -890,7 +901,7 @@ pub fn purge_deleted(conn: &Connection) -> Result<(u32, u32)> {
     // run outside a transaction, which holds here.
     conn.execute_batch("VACUUM")?;
 
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
 
     Ok((items_count, fields_count))
 }
@@ -1053,7 +1064,7 @@ pub fn create_label(
          VALUES (?, ?, ?, ?, ?, ?, 0)",
         params![field_type, label_name, value_type, icon, system as i32, now_timestamp()],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(result > 0)
 }
 
@@ -1063,7 +1074,7 @@ pub fn update_label_name(conn: &Connection, field_type: &str, label_name: &str) 
         "UPDATE nswallet_labels SET label_name = ?, change_timestamp = ? WHERE field_type = ?",
         params![label_name, now_timestamp(), field_type],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -1073,7 +1084,7 @@ pub fn update_label_icon(conn: &Connection, field_type: &str, icon: &str) -> Res
         "UPDATE nswallet_labels SET icon = ?, change_timestamp = ? WHERE field_type = ?",
         params![icon, now_timestamp(), field_type],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(())
 }
 
@@ -1091,7 +1102,7 @@ pub fn delete_label(conn: &Connection, field_type: &str) -> Result<i32> {
             "UPDATE nswallet_labels SET deleted = 1, change_timestamp = ? WHERE field_type = ?",
             params![now_timestamp(), field_type],
         )?;
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        checkpoint(conn)?;
     }
 
     Ok(count)
@@ -1103,7 +1114,7 @@ pub fn remove_label_for_real(conn: &Connection, field_type: &str) -> Result<bool
         "DELETE FROM nswallet_labels WHERE field_type = ?",
         params![field_type],
     )?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    checkpoint(conn)?;
     Ok(result > 0)
 }
 

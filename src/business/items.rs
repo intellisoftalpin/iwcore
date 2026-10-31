@@ -296,7 +296,9 @@ impl Wallet {
         // Copy fields if it's not a folder
         if !source_item.folder {
             let fields = self.get_fields_by_item(source_item_id)?;
-            for field in fields {
+            // Passkeys are not copied: a copy would be a second item answering
+            // for the same credential.
+            for field in fields.iter().filter(|f| f.field_type != crate::passkey::FIELD_PASSKEY) {
                 self.add_field(&new_item_id, &field.field_type, &field.value, Some(field.sort_weight))?;
             }
         }

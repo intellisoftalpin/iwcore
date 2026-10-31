@@ -103,8 +103,12 @@ pub struct Wallet {
     pub(crate) encryption_count: u32,
     /// Cached items (decrypted)
     pub(crate) items_cache: Option<Vec<IWItem>>,
-    /// Cached fields (decrypted)
+    /// Cached fields (decrypted). A `PKEY` field's value here is its public,
+    /// secret-free summary; see `passkey::vault`.
     pub(crate) fields_cache: Option<Vec<IWField>>,
+    /// Stored values of `PKEY` fields, keyed by (item id, field id), filled
+    /// together with `fields_cache`. Holds private keys: crate-only, wiped on drop.
+    pub(crate) passkey_values: HashMap<(String, String), zeroize::Zeroizing<String>>,
     /// Cached labels
     pub(crate) labels_cache: Option<HashMap<String, IWLabel>>,
     /// Outcome of the v5->v6 migration, when this session performed one.
@@ -146,6 +150,7 @@ impl Wallet {
             encryption_count: ENCRYPTION_COUNT_DEFAULT,
             items_cache: None,
             fields_cache: None,
+            passkey_values: HashMap::new(),
             labels_cache: None,
             last_migration_summary: None,
         })
@@ -166,6 +171,7 @@ impl Wallet {
             encryption_count: 0,
             items_cache: None,
             fields_cache: None,
+            passkey_values: HashMap::new(),
             labels_cache: None,
             last_migration_summary: None,
         };
@@ -466,9 +472,40 @@ impl Wallet {
     }
 
     /// Clear all caches
+    /// Run `f` as one database transaction: every write it makes lands, or
+    /// none does. On error the transaction is rolled back and the caches are
+    /// dropped, so nothing written inside it stays visible. The WAL is
+    /// checkpointed once after the commit.
+    pub(crate) fn in_transaction<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.ensure_unlocked()?;
+        self.db
+            .as_mut()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .begin_transaction()?;
+        let outcome = f(self);
+        let db = self
+            .db
+            .as_mut()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
+        match outcome {
+            Ok(value) => {
+                db.commit_transaction()?;
+                db.checkpoint()?;
+                self.clear_caches();
+                Ok(value)
+            }
+            Err(e) => {
+                db.rollback_transaction()?;
+                self.clear_caches();
+                Err(e)
+            }
+        }
+    }
+
     pub(crate) fn clear_caches(&mut self) {
         self.items_cache = None;
         self.fields_cache = None;
+        self.passkey_values.clear();
         self.labels_cache = None;
     }
 
@@ -2092,4 +2129,42 @@ pub(crate) mod tests {
         assert_eq!(deleted_fields.len(), 1);
         assert_eq!(deleted_fields[0].value, "deleted_secret");
     }
+
+    #[test]
+    fn a_failed_transaction_leaves_nothing_behind_even_after_reopening() {
+        let (mut w, temp) = create_test_wallet();
+        let before = w.get_items().unwrap().len();
+        let r: Result<()> = w.in_transaction(|w| {
+            let item = w.add_item("Inside", "document", false, None)?;
+            w.add_field(&item, "PASS", "x", None)?;
+            Err(WalletError::InvalidOperation("injected failure".into()))
+        });
+        assert!(r.is_err());
+        assert_eq!(w.get_items().unwrap().len(), before, "rolled back in this session");
+        w.close();
+        let mut again = Wallet::open(temp.path()).unwrap();
+        again.unlock("TestPassword123").unwrap();
+        assert_eq!(again.get_items().unwrap().len(), before, "and on disk");
+    }
+
+    #[test]
+    fn a_committed_transaction_is_durable() {
+        let (mut w, temp) = create_test_wallet();
+        let id = w.in_transaction(|w| w.add_item("Kept", "document", false, None)).unwrap();
+        // The WAL was folded back after COMMIT.
+        let wal = temp.path().join(format!("{}-wal", crate::DATABASE_FILENAME));
+        assert!(!wal.exists() || std::fs::metadata(&wal).unwrap().len() == 0);
+        w.close();
+        let mut again = Wallet::open(temp.path()).unwrap();
+        again.unlock("TestPassword123").unwrap();
+        assert!(again.get_item(&id).unwrap().is_some());
+    }
+
+    #[test]
+    fn transactions_need_an_unlocked_wallet() {
+        let (mut w, _temp) = create_test_wallet();
+        w.lock();
+        assert!(w.in_transaction(|_| Ok(())).is_err());
+    }
 }
+

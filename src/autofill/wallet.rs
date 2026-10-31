@@ -10,6 +10,7 @@
 
 use crate::business::Wallet;
 use crate::error::{Result, WalletError};
+use crate::passkey::{PasskeyRecord, FIELD_PASSKEY};
 
 use super::index::{self, IndexHeader, IndexOptions};
 use super::journal::{self, PendingOp, PendingRecord};
@@ -23,7 +24,7 @@ pub struct DrainSummary {
     pub folder_id: String,
     /// Items created, in import order.
     pub created: Vec<String>,
-    /// Items whose password was updated.
+    /// Items whose password was updated, or that received a passkey.
     pub updated: Vec<String>,
     /// Records that named a login the vault already held, with the same
     /// password, and were therefore dropped. A re-capture of something the user
@@ -31,6 +32,20 @@ pub struct DrainSummary {
     pub unchanged: usize,
     /// Records that could not be applied at all.
     pub skipped: usize,
+    /// Staged passkeys added to the vault (on a matching login or a new item).
+    pub passkeys_added: usize,
+    /// Staged passkeys that replaced one for the same site and account; the
+    /// replaced passkey is in the trash, recoverable.
+    pub passkeys_replaced: usize,
+}
+
+/// What became of one staged passkey.
+enum PasskeyOutcome {
+    AlreadyThere,
+    Replaced,
+    AttachedTo(String),
+    Created(String),
+    Invalid,
 }
 
 /// What an unattributed create record turned out to be, once the vault could be
@@ -65,9 +80,11 @@ impl Wallet {
         let items = self.get_items()?.to_vec();
         let fields = self.get_fields()?.to_vec();
         let entries = index::entries_from_vault(&items, &fields, options);
+        let passkeys = self.passkey_index_entries(&items)?;
 
-        index::build(
+        index::build_with_passkeys(
             &entries,
+            &passkeys,
             index_key,
             &IndexHeader {
                 format_version: index::FORMAT_VERSION,
@@ -119,6 +136,12 @@ impl Wallet {
         self.ensure_unlocked()?;
 
         let records = journal::dedupe(journal::open_with_journal_key(journal_bytes, journal_secret));
+        // All or nothing: a failure part-way leaves the vault as it was, and the
+        // journal, which is only deleted after a successful drain, is retried.
+        self.in_transaction(|w| w.drain_records(records, folder_id))
+    }
+
+    fn drain_records(&mut self, records: Vec<PendingRecord>, folder_id: Option<&str>) -> Result<DrainSummary> {
         let folder = self.resolve_autofill_folder(folder_id)?;
 
         // Snapshot of the login-shaped vault, taken once. It is kept current by
@@ -134,13 +157,33 @@ impl Wallet {
             updated: Vec::new(),
             unchanged: 0,
             skipped: 0,
+            passkeys_added: 0,
+            passkeys_replaced: 0,
         };
 
         for record in records {
+            if record.op == PendingOp::CreatePasskey {
+                match self.apply_staged_passkey(&record, &known, &folder)? {
+                    PasskeyOutcome::Replaced => summary.passkeys_replaced += 1,
+                    PasskeyOutcome::AttachedTo(item_id) => {
+                        summary.passkeys_added += 1;
+                        summary.updated.push(item_id);
+                    }
+                    PasskeyOutcome::Created(item_id) => {
+                        summary.passkeys_added += 1;
+                        summary.created.push(item_id);
+                    }
+                    PasskeyOutcome::AlreadyThere => summary.unchanged += 1,
+                    PasskeyOutcome::Invalid => summary.skipped += 1,
+                }
+                continue;
+            }
+
             // An explicit update wins outright: the provider named an item, so
             // there is nothing to reconcile.
             let mut target = match record.op {
                 PendingOp::UpdatePassword => record.item_id.clone(),
+                PendingOp::CreatePasskey => unreachable!("handled above"),
                 PendingOp::Create => match Self::reconcile(&known, &record) {
                     Some(Match::Same) => {
                         summary.unchanged += 1;
@@ -173,6 +216,61 @@ impl Wallet {
         }
 
         Ok(summary)
+    }
+
+    /// Put a staged passkey into the vault. First match wins:
+    ///
+    /// 1. the vault already holds this credential id: already drained, nothing to do;
+    /// 2. a live passkey for the same rpId **and** user handle: WebAuthn treats
+    ///    the new one as a replacement, so it takes that field's place and the
+    ///    old one goes to the trash (recoverable, never destroyed);
+    /// 3. a live login whose `LINK` is the rpId's host or registrable domain
+    ///    **and** whose identity equals the user name (ignoring ASCII case): the
+    ///    passkey is added to that item;
+    /// 4. otherwise a new item in the `AutoFill` folder.
+    fn apply_staged_passkey(
+        &mut self,
+        record: &PendingRecord,
+        known: &[index::IndexEntry],
+        folder: &str,
+    ) -> Result<PasskeyOutcome> {
+        let Some(stored) = record.passkey.as_deref() else { return Ok(PasskeyOutcome::Invalid) };
+        let Ok(passkey) = PasskeyRecord::from_field_value(stored) else { return Ok(PasskeyOutcome::Invalid) };
+        let value = passkey.to_field_value()?;
+
+        let existing = self.live_passkeys()?;
+        if existing.iter().any(|(_, _, r)| r.credential_id == passkey.credential_id) {
+            return Ok(PasskeyOutcome::AlreadyThere);
+        }
+        if let Some((_, field_id, _)) = existing
+            .iter()
+            .find(|(_, _, r)| r.rp_id == passkey.rp_id && r.user_handle == passkey.user_handle)
+        {
+            self.update_field_unchecked(field_id, &value, None)?;
+            return Ok(PasskeyOutcome::Replaced);
+        }
+
+        let user = passkey.user_name.trim();
+        if !user.is_empty()
+            && let Some(entry) = known.iter().find(|e| {
+                e.username.trim().eq_ignore_ascii_case(user)
+                    && index::rank(e, &passkey.rp_id)
+                        .is_some_and(|t| t >= super::domain::MatchTier::RegistrableDomain)
+            })
+        {
+            let item_id = entry.item_id.clone();
+            self.add_field_unchecked(&item_id, FIELD_PASSKEY, &value, None)?;
+            return Ok(PasskeyOutcome::AttachedTo(item_id));
+        }
+
+        let item_id = self.add_item(&passkey.rp_id, "", false, Some(folder))?;
+        self.add_field_unchecked(&item_id, FIELD_LINK, &format!("https://{}", passkey.rp_id), None)?;
+        if !user.is_empty() {
+            let kind = super::identity::classify(user);
+            self.add_field_unchecked(&item_id, kind.field_type(), user, None)?;
+        }
+        self.add_field_unchecked(&item_id, FIELD_PASSKEY, &value, None)?;
+        Ok(PasskeyOutcome::Created(item_id))
     }
 
     /// Decide what an unattributed create record actually means against the
@@ -230,6 +328,25 @@ impl Wallet {
             hosts,
             registrable,
         }
+    }
+
+    /// Every readable passkey on a live item, as the index carries it.
+    /// Unreadable records are left out, never fatal.
+    fn passkey_index_entries(&mut self, items: &[crate::IWItem]) -> Result<Vec<index::PasskeyIndexEntry>> {
+        let titles: std::collections::HashMap<&str, &str> =
+            items.iter().map(|i| (i.item_id.as_str(), i.name.as_str())).collect();
+        let mut out = Vec::new();
+        for (item_id, field_id, record) in self.live_passkeys()? {
+            let stored = record.to_field_value()?;
+            let Ok(value) = serde_json::from_str(&stored) else { continue };
+            out.push(index::PasskeyIndexEntry {
+                title: titles.get(item_id.as_str()).copied().unwrap_or_default().to_string(),
+                item_id,
+                field_id,
+                record: value,
+            });
+        }
+        Ok(out)
     }
 
     /// Find the `AutoFill` folder, by recorded id first and by name second,
@@ -351,6 +468,7 @@ mod tests {
             password: "hunter2".into(),
             totp_secret: None,
             created_at: 1_700_000_000,
+            passkey: None,
         }
     }
 
@@ -643,6 +761,7 @@ mod tests {
             password: exported.password.clone(),
             totp_secret: None,
             created_at: 0,
+            passkey: None,
         };
         let journal =
             journal::seal_record(&staged, &keys.journal_public, &keys.index_key).unwrap();
@@ -706,6 +825,7 @@ mod tests {
             password: password.into(),
             totp_secret: None,
             created_at: 1_700_000_000,
+            passkey: None,
         }
     }
 

@@ -11,7 +11,7 @@ impl Wallet {
         self.ensure_unlocked()?;
 
         let items = self.get_items()?.to_vec();
-        let fields = self.get_fields()?.to_vec();
+        let fields = self.export_fields()?;
 
         crate::export::generate_pdf(&items, &fields)
     }
@@ -23,7 +23,7 @@ impl Wallet {
         self.ensure_unlocked()?;
 
         let items = self.get_items()?.to_vec();
-        let fields = self.get_fields()?.to_vec();
+        let fields = self.export_fields()?;
 
         crate::export::generate_csv(&items, &fields)
     }
@@ -35,7 +35,7 @@ impl Wallet {
         self.ensure_unlocked()?;
 
         let items = self.get_items()?.to_vec();
-        let fields = self.get_fields()?.to_vec();
+        let fields = self.export_fields()?;
 
         crate::export::generate_json(&items, &fields)
     }
@@ -47,9 +47,19 @@ impl Wallet {
         self.ensure_unlocked()?;
 
         let items = self.get_items()?.to_vec();
-        let fields = self.get_fields()?.to_vec();
+        let fields = self.export_fields()?;
 
         crate::export::generate_xml(&items, &fields)
+    }
+
+    /// Fields as exports show them: a passkey becomes one readable line,
+    /// `Passkey · <site> · <user>`, never its key.
+    fn export_fields(&mut self) -> Result<Vec<crate::IWField>> {
+        let mut fields = self.get_fields()?.to_vec();
+        for f in fields.iter_mut().filter(|f| f.field_type == crate::passkey::FIELD_PASSKEY) {
+            f.value = crate::passkey::vault::display_text(&f.value);
+        }
+        Ok(fields)
     }
 }
 

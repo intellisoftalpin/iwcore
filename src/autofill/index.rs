@@ -39,8 +39,11 @@ use super::identity::{IdentityKind, READ_PRIORITY};
 
 /// Magic bytes at the start of every index file.
 pub const MAGIC: &[u8; 4] = b"IWAF";
-/// Current index format version.
-pub const FORMAT_VERSION: u8 = 1;
+/// Current index format version. 2 adds passkeys; format 1 (logins only, as
+/// iwcore 0.3 and 0.4 wrote it) is still read.
+pub const FORMAT_VERSION: u8 = 2;
+/// Oldest format still read.
+pub const OLDEST_READABLE_VERSION: u8 = 1;
 /// The body is padded up to a multiple of this before sealing.
 pub const PAD_BLOCK: usize = 4096;
 
@@ -77,6 +80,43 @@ impl std::fmt::Debug for IndexEntry {
     }
 }
 
+/// One passkey the provider can sign with: the stored `PKEY` record (private
+/// key and PRF secrets included) plus where it lives in the vault. `Debug` shows
+/// only where it lives.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasskeyIndexEntry {
+    pub item_id: String,
+    pub field_id: String,
+    pub title: String,
+    /// The `PKEY` field value, as stored. See `passkey::record`.
+    pub record: serde_json::Value,
+}
+
+impl std::fmt::Debug for PasskeyIndexEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasskeyIndexEntry")
+            .field("item_id", &self.item_id)
+            .field("field_id", &self.field_id)
+            .field("title", &self.title)
+            .field("record", &crate::utils::REDACTED)
+            .finish()
+    }
+}
+
+/// Everything an index carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexContents {
+    pub logins: Vec<IndexEntry>,
+    pub passkeys: Vec<PasskeyIndexEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BodyV2 {
+    logins: Vec<IndexEntry>,
+    #[serde(default)]
+    passkeys: Vec<PasskeyIndexEntry>,
+}
+
 /// Plaintext header of an index file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexHeader {
@@ -94,14 +134,31 @@ pub struct IndexOptions {
     pub include_totp: bool,
 }
 
-/// Seal an index.
+/// Seal an index of logins only.
 pub fn build(
     entries: &[IndexEntry],
     index_key: &[u8; KEY_LEN],
     header: &IndexHeader,
 ) -> Result<Vec<u8>> {
-    let json = serde_json::to_vec(entries)
-        .map_err(|e| WalletError::EncryptionError(format!("index encode failed: {e}")))?;
+    build_with_passkeys(entries, &[], index_key, header)
+}
+
+/// Seal an index of logins and passkeys. The body layout follows
+/// `header.format_version`: format 1 is a bare array of logins (and cannot hold
+/// passkeys), format 2 is `{"logins": [...], "passkeys": [...]}`.
+pub fn build_with_passkeys(
+    entries: &[IndexEntry],
+    passkeys: &[PasskeyIndexEntry],
+    index_key: &[u8; KEY_LEN],
+    header: &IndexHeader,
+) -> Result<Vec<u8>> {
+    let json = match header.format_version {
+        1 if passkeys.is_empty() => serde_json::to_vec(entries),
+        1 => return Err(WalletError::InvalidOperation("index format 1 cannot hold passkeys".into())),
+        2 => serde_json::to_vec(&BodyV2 { logins: entries.to_vec(), passkeys: passkeys.to_vec() }),
+        v => return Err(WalletError::InvalidVersion(format!("cannot write autofill index format {v}"))),
+    }
+    .map_err(|e| WalletError::EncryptionError(format!("index encode failed: {e}")))?;
 
     let actual_len = u32::try_from(json.len())
         .map_err(|_| WalletError::EncryptionError("index is too large to frame".into()))?;
@@ -120,9 +177,14 @@ pub fn build(
     Ok(out)
 }
 
-/// Open a sealed index. Fails on a wrong key, an unknown format version, a
-/// tampered header, or any modification to the body.
+/// Open a sealed index and return its logins. Fails on a wrong key, an unknown
+/// format version, a tampered header, or any modification to the body.
 pub fn open(bytes: &[u8], index_key: &[u8; KEY_LEN]) -> Result<(IndexHeader, Vec<IndexEntry>)> {
+    open_all(bytes, index_key).map(|(header, contents)| (header, contents.logins))
+}
+
+/// Open a sealed index of either format and return logins and passkeys.
+pub fn open_all(bytes: &[u8], index_key: &[u8; KEY_LEN]) -> Result<(IndexHeader, IndexContents)> {
     let (header, header_len) = decode_header(bytes)?;
     let sealed = &bytes[header_len..];
 
@@ -136,9 +198,14 @@ pub fn open(bytes: &[u8], index_key: &[u8; KEY_LEN]) -> Result<(IndexHeader, Vec
         .get(4..4 + actual_len)
         .ok_or_else(|| WalletError::DecryptionError("index body length is out of range".into()))?;
 
-    let entries = serde_json::from_slice(json)
-        .map_err(|e| WalletError::DecryptionError(format!("index decode failed: {e}")))?;
-    Ok((header, entries))
+    let decode_err = |e: serde_json::Error| WalletError::DecryptionError(format!("index decode failed: {e}"));
+    let contents = if header.format_version == 1 {
+        IndexContents { logins: serde_json::from_slice(json).map_err(decode_err)?, passkeys: Vec::new() }
+    } else {
+        let body: BodyV2 = serde_json::from_slice(json).map_err(decode_err)?;
+        IndexContents { logins: body.logins, passkeys: body.passkeys }
+    };
+    Ok((header, contents))
 }
 
 /// Read the header without the key. The provider uses this to reject a format
@@ -170,7 +237,7 @@ fn decode_header(bytes: &[u8]) -> Result<(IndexHeader, usize)> {
         return Err(malformed());
     }
     let format_version = bytes[4];
-    if format_version != FORMAT_VERSION {
+    if !(OLDEST_READABLE_VERSION..=FORMAT_VERSION).contains(&format_version) {
         return Err(WalletError::InvalidVersion(format!(
             "unsupported autofill index format {format_version}"
         )));

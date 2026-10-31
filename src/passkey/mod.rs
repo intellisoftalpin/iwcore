@@ -24,6 +24,7 @@ pub mod sign;
 pub mod prf;
 pub mod origin;
 pub mod json;
+pub mod vault;
 
 #[cfg(test)]
 mod vectors;

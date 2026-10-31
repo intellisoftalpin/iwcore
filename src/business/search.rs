@@ -67,7 +67,7 @@ impl Wallet {
 
             // Field match: search in field values
             let matching_fields: Vec<IWField> = fields.iter()
-                .filter(|f| f.item_id == item.item_id && f.value.to_lowercase().contains(&query_lower))
+                .filter(|f| f.item_id == item.item_id && field_matches(f, &query_lower))
                 .cloned()
                 .collect();
 
@@ -91,6 +91,18 @@ impl Wallet {
 
         Ok(results)
     }
+}
+
+/// A passkey matches on its site, user name and display name only, never on
+/// the JSON around them.
+fn field_matches(field: &IWField, query_lower: &str) -> bool {
+    if field.field_type == crate::passkey::FIELD_PASSKEY {
+        let v: serde_json::Value = serde_json::from_str(&field.value).unwrap_or_default();
+        return ["rpId", "userName", "userDisplayName"].iter().any(|k| {
+            v.get(k).and_then(|s| s.as_str()).is_some_and(|s| s.to_lowercase().contains(query_lower))
+        });
+    }
+    field.value.to_lowercase().contains(query_lower)
 }
 
 #[cfg(test)]

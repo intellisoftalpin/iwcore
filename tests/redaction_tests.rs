@@ -83,6 +83,7 @@ fn pending_records_are_redacted() {
         password: PASSWORD.into(),
         totp_secret: Some(TOTP.into()),
         created_at: 0,
+        passkey: None,
     };
     assert_hidden("PendingRecord", format!("{record:?}"));
 
