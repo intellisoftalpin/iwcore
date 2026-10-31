@@ -1,0 +1,104 @@
+name: Release gate
+
+# The checks that are too slow for every push: API compatibility, strict docs,
+# packaging, fuzzing of every untrusted parser, and mutation testing of the
+# security-relevant modules. Runs on pull requests to main and on demand.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  semver:
+    name: API compatibility (cargo semver-checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check against the latest release on crates.io
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+
+  docs-and-package:
+    name: Docs and packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Docs without warnings
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Package contents
+        run: cargo package --list | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Publish dry run (nothing is published)
+        run: cargo publish --dry-run
+
+  fuzz:
+    name: Fuzz ${{ matrix.target }} (30 min)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [cxf_preview, passkey_request, passkey_record, assetlinks, journal]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz
+        working-directory: fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=1800 -rss_limit_mb=2048
+      - name: Keep the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/
+
+  mutants:
+    name: Mutation testing (shard ${{ matrix.shard }}/8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants,cargo-nextest
+      - name: Mutate the passkey, CXF, AutoFill and restore code
+        run: >
+          cargo mutants --test-tool=nextest --timeout 300 --shard ${{ matrix.shard }}/8
+          -f 'src/passkey/**' -f 'src/cxf/**'
+          -f src/autofill/wallet.rs -f src/autofill/index.rs -f src/autofill/journal.rs
+          -f src/backup/restore.rs
+      - name: Missed mutants
+        if: always()
+        run: |
+          {
+            echo "### Shard ${{ matrix.shard }}/8"
+            for f in caught missed timeout unviable; do
+              echo "- $f: $(wc -l < mutants.out/$f.txt 2>/dev/null || echo 0)"
+            done
+            echo '```'
+            cat mutants.out/missed.txt 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out/
