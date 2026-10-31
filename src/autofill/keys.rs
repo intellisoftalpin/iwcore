@@ -38,7 +38,7 @@ pub struct AutofillKeys {
 
 /// Generate a complete, independent set of autofill keys.
 pub fn generate_keys() -> Result<AutofillKeys> {
-    let index_key = crypto::random_key();
+    let index_key = crypto::random_key()?;
     let (journal_secret, journal_public) = crypto::generate_p256_keypair()?;
     Ok(AutofillKeys {
         index_key,

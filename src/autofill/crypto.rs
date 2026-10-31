@@ -31,18 +31,14 @@ pub const TAG_LEN: usize = 16;
 /// Length of a SEC1 uncompressed P-256 public key.
 pub const P256_PUBLIC_LEN: usize = 65;
 
-/// Fill a buffer from the OS CSPRNG.
-pub fn random_bytes(len: usize) -> Vec<u8> {
-    let mut out = vec![0u8; len];
-    rand::rng().fill_bytes(&mut out);
-    out
+/// `len` random bytes from the operating system's generator.
+pub fn random_bytes(len: usize) -> Result<Vec<u8>> {
+    crate::crypto::rng::bytes(len)
 }
 
-/// Generate a random symmetric key.
-pub fn random_key() -> Zeroizing<[u8; KEY_LEN]> {
-    let mut key = [0u8; KEY_LEN];
-    rand::rng().fill_bytes(&mut key);
-    Zeroizing::new(key)
+/// Generate a random symmetric key from the operating system's generator.
+pub fn random_key() -> Result<Zeroizing<[u8; KEY_LEN]>> {
+    crate::crypto::rng::secret::<KEY_LEN>()
 }
 
 /// Seal `plaintext` under `key`, binding `aad` into the authentication tag.
@@ -97,7 +93,7 @@ pub fn open(key: &[u8; KEY_LEN], blob: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
 /// independent of which `rand_core` version the curve crate happens to want.
 pub fn generate_p256_keypair() -> Result<(Zeroizing<[u8; 32]>, Vec<u8>)> {
     for _ in 0..64 {
-        let candidate = random_key();
+        let candidate = random_key()?;
         if let Ok(secret) = p256::SecretKey::from_slice(candidate.as_slice()) {
             let public = secret.public_key().to_sec1_bytes().to_vec();
             return Ok((candidate, public));
@@ -166,29 +162,29 @@ mod tests {
 
     #[test]
     fn seal_open_round_trip() {
-        let key = random_key();
+        let key = random_key().unwrap();
         let sealed = seal(&key, b"hello", b"aad").unwrap();
         assert_eq!(open(&key, &sealed, b"aad").unwrap(), b"hello");
     }
 
     #[test]
     fn wrong_key_fails() {
-        let key = random_key();
-        let other = random_key();
+        let key = random_key().unwrap();
+        let other = random_key().unwrap();
         let sealed = seal(&key, b"hello", b"").unwrap();
         assert!(open(&other, &sealed, b"").is_err());
     }
 
     #[test]
     fn wrong_aad_fails() {
-        let key = random_key();
+        let key = random_key().unwrap();
         let sealed = seal(&key, b"hello", b"aad-a").unwrap();
         assert!(open(&key, &sealed, b"aad-b").is_err());
     }
 
     #[test]
     fn every_single_bit_flip_is_detected() {
-        let key = random_key();
+        let key = random_key().unwrap();
         let sealed = seal(&key, b"sensitive", b"aad").unwrap();
         for byte in 0..sealed.len() {
             for bit in 0..8u32 {
@@ -204,7 +200,7 @@ mod tests {
 
     #[test]
     fn truncation_at_every_length_is_detected() {
-        let key = random_key();
+        let key = random_key().unwrap();
         let sealed = seal(&key, b"sensitive", b"").unwrap();
         for len in 0..sealed.len() {
             assert!(open(&key, &sealed[..len], b"").is_err(), "length {len}");
@@ -213,7 +209,7 @@ mod tests {
 
     #[test]
     fn nonces_differ_between_seals() {
-        let key = random_key();
+        let key = random_key().unwrap();
         let a = seal(&key, b"same", b"").unwrap();
         let b = seal(&key, b"same", b"").unwrap();
         assert_ne!(a[..NONCE_LEN], b[..NONCE_LEN]);

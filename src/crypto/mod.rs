@@ -18,6 +18,7 @@ mod wordlist;
 pub mod kdf;
 pub mod aead;
 pub mod dek;
+pub mod rng;
 
 pub use aes::{encrypt, decrypt};
 pub use md5::md5_hex;

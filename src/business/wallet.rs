@@ -13,7 +13,6 @@ use crate::crypto;
 use crate::crypto::dek::DEK_LEN;
 use crate::utils::generate_database_id;
 use crate::{DATABASE_FILENAME, ROOT_ID, ROOT_PARENT_ID, DB_VERSION, ENCRYPTION_COUNT_DEFAULT};
-use rand::Rng;
 use zeroize::Zeroizing;
 
 /// Filename of the pre-migration snapshot kept (permanently) next to the
@@ -69,11 +68,9 @@ pub struct RecoveryResult {
     pub remaining: u32,
 }
 
-/// Draw `n` cryptographically random bytes from the OS CSPRNG.
-fn random_bytes(n: usize) -> Vec<u8> {
-    let mut v = vec![0u8; n];
-    rand::rng().fill_bytes(&mut v);
-    v
+/// Draw `n` random bytes from the operating system's generator.
+fn random_bytes(n: usize) -> Result<Vec<u8>> {
+    crypto::rng::bytes(n)
 }
 
 /// Turn the legacy `email` column (which actually stores the AES
@@ -182,16 +179,16 @@ impl Wallet {
     /// system labels.
     fn init_new_database(&mut self, password: &str, lang: &str) -> Result<()> {
         // Generate fresh key material and wrap the DEK under the password.
-        let dek = crypto::dek::generate_dek();
+        let dek = crypto::dek::generate_dek()?;
         let params = crypto::kdf::KdfParams::current();
-        let salt = random_bytes(KDF_SALT_LEN);
+        let salt = random_bytes(KDF_SALT_LEN)?;
         let kek = crypto::kdf::derive_kek(password.as_bytes(), &salt, params)
             .map_err(WalletError::EncryptionError)?;
         let dek_wrapped = crypto::dek::wrap_dek(&kek, &dek)
             .map_err(WalletError::EncryptionError)?;
 
         // Hold the DEK so the root item can be encrypted under it.
-        self.unlocked = Some(Unlocked { dek: Zeroizing::new(dek) });
+        self.unlocked = Some(Unlocked { dek });
 
         let db_id = generate_database_id();
         let root_data = crate::utils::generate_id(32);
@@ -540,7 +537,7 @@ impl Wallet {
 
         let dek = *self.dek()?;
         let params = crypto::kdf::KdfParams::current();
-        let salt = random_bytes(KDF_SALT_LEN);
+        let salt = random_bytes(KDF_SALT_LEN)?;
         let kek = crypto::kdf::derive_kek(new_password.as_bytes(), &salt, params)
             .map_err(WalletError::EncryptionError)?;
         let dek_wrapped = crypto::dek::wrap_dek(&kek, &dek)
@@ -623,9 +620,9 @@ impl Wallet {
         self.create_pre_v6_backup()?;
 
         // 2. Fresh key material; wrap the DEK under the password.
-        let dek = crypto::dek::generate_dek();
+        let dek = crypto::dek::generate_dek()?;
         let params = crypto::kdf::KdfParams::current();
-        let salt = random_bytes(KDF_SALT_LEN);
+        let salt = random_bytes(KDF_SALT_LEN)?;
         let kek = crypto::kdf::derive_kek(password.as_bytes(), &salt, params)
             .map_err(WalletError::EncryptionError)?;
         let dek_wrapped = crypto::dek::wrap_dek(&kek, &dek)
@@ -805,7 +802,7 @@ impl Wallet {
         summary.key_mode = legacy_key.preferred_mode().as_str().to_string();
         summary.duration_ms = started.elapsed().as_millis() as u64;
         self.last_migration_summary = Some(summary);
-        self.unlocked = Some(Unlocked { dek: Zeroizing::new(dek) });
+        self.unlocked = Some(Unlocked { dek });
         Ok(())
     }
 

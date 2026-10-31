@@ -124,7 +124,7 @@ pub fn seal_record(
     let json = serde_json::to_vec(record)
         .map_err(|e| WalletError::EncryptionError(format!("journal encode failed: {e}")))?;
 
-    let record_key = crypto::random_key();
+    let record_key = crypto::random_key()?;
 
     // The app wrap carries its own ephemeral key, so it cannot be bound to a
     // header that contains that key. It is bound to the version instead; any
