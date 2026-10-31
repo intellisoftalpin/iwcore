@@ -84,7 +84,7 @@ jobs:
   mutants:
     name: Mutation testing (shard ${{ matrix.shard }}/8)
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -97,7 +97,7 @@ jobs:
           tool: cargo-mutants,cargo-nextest
       - name: Mutate the passkey, CXF, AutoFill and restore code
         run: >
-          cargo mutants --test-tool=nextest --timeout 300 --shard ${{ matrix.shard }}/8
+          cargo mutants --test-tool=nextest --profile=mutants --timeout 300 --shard ${{ matrix.shard }}/8
           -f 'src/passkey/**' -f 'src/cxf/**'
           -f src/autofill/wallet.rs -f src/autofill/index.rs -f src/autofill/journal.rs
           -f src/backup/restore.rs

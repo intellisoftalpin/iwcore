@@ -68,3 +68,11 @@ proptest = "1.12.0"
 
 [features]
 default = []
+
+# Mutation testing (release-gate.yml): the test build with optimisation, so the
+# Argon2id key derivation behind every test wallet takes milliseconds instead of
+# seconds and a full test run fits the per-mutant timeout.
+[profile.mutants]
+inherits = "test"
+opt-level = 2
+debug = false
