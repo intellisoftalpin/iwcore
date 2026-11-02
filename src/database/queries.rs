@@ -177,9 +177,11 @@ pub fn get_crypto_record(conn: &Connection) -> Result<Option<CryptoRecord>> {
                 Ok(CryptoRecord {
                     scheme: row.get(0)?,
                     kdf: row.get(1)?,
-                    m_cost_kib: row.get::<_, i64>(2)? as u32,
-                    t_cost: row.get::<_, i64>(3)? as u32,
-                    p_cost: row.get::<_, i64>(4)? as u32,
+                    // Range-checked: a negative or oversized value is an error,
+                    // never wrapped into a different number.
+                    m_cost_kib: row.get::<_, u32>(2)?,
+                    t_cost: row.get::<_, u32>(3)?,
+                    p_cost: row.get::<_, u32>(4)?,
                     salt: row.get(5)?,
                     dek_wrapped: row.get(6)?,
                 })
@@ -1207,6 +1209,98 @@ pub struct RawLabel {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Datelike, Timelike};
+
+    fn conn_with_all_tables() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in super::super::schema::CREATE_ALL_TABLES {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn properties_id_presence_and_version_round_trip() {
+        let conn = conn_with_all_tables();
+        assert_eq!(get_database_id(&conn).unwrap(), None);
+        assert!(!has_properties(&conn).unwrap());
+
+        set_properties(&conn, "db-1", "en", "4", 0).unwrap();
+        assert_eq!(get_database_id(&conn).unwrap().as_deref(), Some("db-1"));
+        assert!(has_properties(&conn).unwrap());
+
+        set_db_version(&conn, "5").unwrap();
+        assert_eq!(get_properties(&conn).unwrap().unwrap().version, "5");
+    }
+
+    #[test]
+    fn property_queries_fail_without_the_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(get_database_id(&conn).unwrap(), None);
+        assert!(has_properties(&conn).is_err());
+        assert!(set_db_version(&conn, "5").is_err());
+        assert!(has_root_item(&conn).is_err());
+        assert!(update_field(&conn, "f", b"v", None).is_err());
+        assert!(remove_label_for_real(&conn, "MAIL").is_err());
+    }
+
+    #[test]
+    fn root_item_presence_is_reported() {
+        let conn = conn_with_all_tables();
+        assert!(!has_root_item(&conn).unwrap());
+        create_item(&conn, "__ROOT__", "__ROOT__", b"root", "folder", true).unwrap();
+        assert!(has_root_item(&conn).unwrap());
+    }
+
+    #[test]
+    fn update_field_with_and_without_a_sort_weight() {
+        let conn = conn_with_all_tables();
+        create_field(&conn, "item", "f1", "MAIL", b"old", 3).unwrap();
+
+        update_field(&conn, "f1", b"new", None).unwrap();
+        let f = &get_all_fields_raw(&conn).unwrap()[0];
+        assert_eq!((f.value_encrypted.as_slice(), f.sort_weight), (&b"new"[..], Some(3)));
+
+        update_field(&conn, "f1", b"newer", Some(7)).unwrap();
+        let f = &get_all_fields_raw(&conn).unwrap()[0];
+        assert_eq!((f.value_encrypted.as_slice(), f.sort_weight), (&b"newer"[..], Some(7)));
+    }
+
+    #[test]
+    fn remove_label_for_real_deletes_the_row() {
+        let conn = conn_with_all_tables();
+        assert!(create_label(&conn, "XTRA", "Extra", "text", "icon", false).unwrap());
+        assert!(remove_label_for_real(&conn, "XTRA").unwrap());
+        assert!(!remove_label_for_real(&conn, "XTRA").unwrap());
+        assert!(get_all_labels(&conn).unwrap().iter().all(|l| l.field_type != "XTRA"));
+    }
+
+    #[test]
+    fn crypto_record_costs_outside_u32_are_an_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_crypto_table(&conn).unwrap();
+        let rec = CryptoRecord {
+            scheme: 1,
+            kdf: "argon2id".to_string(),
+            m_cost_kib: 65_536,
+            t_cost: 3,
+            p_cost: 1,
+            salt: vec![0; 16],
+            dek_wrapped: vec![0; 72],
+        };
+        set_crypto_record(&conn, &rec).unwrap();
+        assert_eq!(get_crypto_record(&conn).unwrap().unwrap().m_cost_kib, 65_536);
+
+        for (column, value) in [
+            ("kdf_m_cost", -1i64),
+            ("kdf_t_cost", -3),
+            ("kdf_p_cost", 1 << 32),
+            ("kdf_m_cost", i64::MAX),
+        ] {
+            set_crypto_record(&conn, &rec).unwrap();
+            conn.execute(&format!("UPDATE nswallet_crypto SET {column} = ?"), [value]).unwrap();
+            assert!(get_crypto_record(&conn).is_err(), "{column} = {value}");
+        }
+    }
 
     #[test]
     fn test_format_timestamp() {

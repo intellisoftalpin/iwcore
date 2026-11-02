@@ -1,5 +1,102 @@
 # Changelog
 
+## 0.6.0
+
+### Hardening
+
+- **AutoFill index leaves no key copies behind.** Building the index grew its
+  JSON and padding buffers while writing, and every grow released a block that
+  still held passkey records in plain text. Both buffers are now sized before
+  anything is written. `tests/wipe_on_drop.rs` scans every block released
+  during the build, and during the drop of a passkey record, for the secret.
+- **Backups from outside.** The database inside a backup is checked before any
+  query (SQLite header, `quick_check`, wallet tables must be real tables) and
+  opened read-only with defensive mode, `trusted_schema` off, `query_only` on
+  and a work budget. `inspect_backup_in`, `is_backup_compatible_in` and
+  `check_backup_password_in` use it; the password check no longer goes
+  through `Wallet::open`, so nothing is migrated or written.
+- **Restore.** The SQLite header is checked before a temp file is created; the
+  restored database is capped at 256 MiB (was 2 GiB) and, above 1 MiB, at 1000
+  times its compressed size. The previous database's `-wal`, `-shm` and
+  `-journal` files are moved aside and only deleted once the new file is in
+  place (moved back on failure); the folder is synced on Unix.
+- **Stored KDF settings** are checked before any key derivation: v6 scheme and
+  argon2id only, memory <= 1 GiB, time cost 1..=100, parallelism 1..=16.
+- **Pre-v6 snapshot.** The snapshot written by the v5 to v6 upgrade is no
+  longer kept forever: `Wallet::retire_pre_v6_snapshot(backup_folder)` deletes
+  it once the vault is v6, unlocked, and the folder holds a v6 backup.
+- **AutoFill journal.** Format 2 closes every record with an HMAC-SHA256 tag
+  under a new symmetric journal auth key held only by the app and its
+  provider; the drain applies only records that verify and counts the rest.
+  Format-1 records are applied only through an explicit recovery path.
+  A drained passkey for an account that already has one no longer replaces
+  it: it is reported for confirmation (`Wallet::confirm_passkey_replacement`).
+- **AutoFill framing** uses checked arithmetic and bounds-checked slices on
+  every pointer width; a CI job runs the tests on i686 (32-bit `usize`).
+- **Passkey attach.** A drained passkey joins an existing login only by exact
+  host or the same registrable domain under the full Public Suffix List.
+- **Key material in memory.** `derive_kek`, `unwrap_dek` and the exports return
+  zeroizing buffers; no plain copies of the data key; `LegacyKeyChain` wipes
+  its keys; `IWItem` `Debug` redacts the name. Passkey private keys are no
+  longer reachable through public fields: the AutoFill index and journal hold
+  them opaquely, the stored record serialiser is crate-internal, and parsed or
+  serialised copies are wiped. `Wallet::export_cxf` writes straight into one
+  exact-size zeroizing buffer without an intermediate JSON tree.
+- **Client data.** `passkey::json::client_data` decides what is signed: for an
+  `android:apk-key-hash:` origin a caller-supplied clientDataHash is refused
+  and clientDataJSON is always built by the core.
+- **CXF import** reads the payload with streaming readers (no JSON tree), with
+  a 16 MiB payload limit (was 64 MiB) and new limits on collections, list
+  entries, fields per import and listed skips. A passkey credential id is never
+  stored twice, and an existing passkey for the same account is never
+  replaced by an import (skipped with a reason). Date arithmetic is checked.
+- **Legacy decrypt** refuses malformed plaintexts with an error instead of
+  panicking, and legacy key derivation terminates for an empty password.
+- `crypto/`, `backup/`, `autofill/` and `cxf/` deny `unwrap`, `expect`, `panic`
+  and indexing outside tests (plus `arithmetic_side_effects` where applied).
+
+### Features
+
+- `autofill::passkeys`: `HeldPasskeys` (index plus staged journal passkeys),
+  `sign_from_index`, `SignRequest`, `SignedAssertion`, `PasskeyCandidate`: a
+  provider lists and signs without decoding a passkey record.
+- Password AutoFill verification helpers in `passkey::origin` (pure, no
+  network): `registrable_domain`, `login_assetlinks_url`,
+  `app_allowed_for_domain`, `web_domain_matches_url`.
+
+### API (breaking)
+
+- `AutofillKeys` gains `journal_auth_key`. `journal::seal_record` takes the
+  auth key; `journal::FORMAT_VERSION` is 2 (new `LEGACY_FORMAT_VERSION`,
+  `TAG_LEN`, `MAC_CONTEXT`). `journal::open_with_journal_key` is replaced by
+  `open_for_drain(journal, &DrainKeys) -> DrainRead`.
+- `Wallet::drain_autofill_journal` takes `&DrainKeys`. `DrainSummary`:
+  `passkeys_replaced` removed; `pending_replacements` and `unauthenticated`
+  added. New `PasskeyReplacement`, `Wallet::confirm_passkey_replacement`.
+- `PendingRecord.passkey` is private; new `PendingRecord::new_login`,
+  `::new_passkey`, `::staged_passkey`, and `Registration::pending_record`.
+- `PasskeyIndexEntry` fields are private (`new`, `record()`, `summary()`); its
+  Serialize/Deserialize derives are removed (wire format unchanged).
+  `IndexContents` no longer derives `PartialEq`/`Eq`.
+- `PasskeyRecord::to_field_value` is crate-internal.
+- `crypto::encrypt`/`decrypt` and `crypto::legacy::encrypt`/`decrypt` are no
+  longer public; legacy data is read through `legacy::LegacyKeyChain`.
+- `kdf::derive_kek` and `dek::unwrap_dek` return `Zeroizing<[u8; 32]>`;
+  `export_pdf`/`csv`/`json`/`xml` return `Zeroizing<Vec<u8>>`.
+- New `KdfParams::check_stored`, `KDF_MAX_*`; new `Wallet::has_pre_v6_snapshot`,
+  `Wallet::retire_pre_v6_snapshot`; new `origin::ANDROID_ORIGIN_PREFIX`,
+  `origin::is_android_origin`; `cxf` limit constants.
+
+### Tests
+
+- Fuzz targets added: `restore_inspect`, `autofill_index`, `legacy_decrypt`,
+  `origin_check`, `cxf_import_apply`; the CXF targets run with seeds and a
+  1 MiB input size in the release gate.
+
+### Dependencies
+
+- `serde_json` gains the `raw_value` feature.
+
 ## 0.5.2
 
 ### Features

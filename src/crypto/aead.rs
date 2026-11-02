@@ -13,6 +13,8 @@
 //! The leading 0x06 tag lets readers distinguish a v6 blob from a legacy
 //! (v5 AES-CBC) blob, which has no such tag.
 
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use rand::Rng;
@@ -31,12 +33,12 @@ pub const KEY_LEN: usize = 32;
 const MIN_BLOB_LEN: usize = 1 + NONCE_LEN + TAG_LEN;
 
 fn cipher(key: &[u8; KEY_LEN]) -> XChaCha20Poly1305 {
-    XChaCha20Poly1305::new_from_slice(key).expect("key is exactly 32 bytes")
+    XChaCha20Poly1305::new(key.into())
 }
 
 /// Returns true if `blob` looks like a v6 AEAD blob (tag byte + minimum length).
 pub fn is_v6_blob(blob: &[u8]) -> bool {
-    blob.len() >= MIN_BLOB_LEN && blob[0] == FORMAT_TAG
+    blob.len() >= MIN_BLOB_LEN && blob.first() == Some(&FORMAT_TAG)
 }
 
 /// Encrypt `plaintext` under `key`, producing the self-describing blob above.
@@ -50,7 +52,7 @@ pub fn seal(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>, String> {
         .encrypt(&nonce, plaintext)
         .map_err(|_| "AEAD seal failed".to_string())?;
 
-    let mut out = Vec::with_capacity(1 + NONCE_LEN + ct.len());
+    let mut out = Vec::with_capacity(ct.len().saturating_add(1 + NONCE_LEN));
     out.push(FORMAT_TAG);
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
@@ -60,17 +62,16 @@ pub fn seal(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>, String> {
 /// Decrypt a v6 blob produced by [`seal`]. Returns an error on a malformed blob,
 /// a wrong key, or any tampering (authentication failure).
 pub fn open(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>, String> {
+    let too_short = || "AEAD blob too short".to_string();
     if blob.len() < MIN_BLOB_LEN {
-        return Err("AEAD blob too short".to_string());
+        return Err(too_short());
     }
-    if blob[0] != FORMAT_TAG {
+    let (&tag, rest) = blob.split_first().ok_or_else(too_short)?;
+    if tag != FORMAT_TAG {
         return Err("not a v6 AEAD blob".to_string());
     }
-
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    nonce_bytes.copy_from_slice(&blob[1..1 + NONCE_LEN]);
-    let nonce = XNonce::from(nonce_bytes);
-    let ciphertext = &blob[1 + NONCE_LEN..];
+    let (nonce_bytes, ciphertext) = rest.split_first_chunk::<NONCE_LEN>().ok_or_else(too_short)?;
+    let nonce = XNonce::from(*nonce_bytes);
 
     cipher(key)
         .decrypt(&nonce, ciphertext)

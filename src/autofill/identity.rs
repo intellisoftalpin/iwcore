@@ -105,11 +105,9 @@ fn looks_like_email(value: &str) -> bool {
         return false;
     }
     // A dot that starts or ends the domain does not count as a separator.
-    match domain.find('.') {
-        Some(0) => false,
-        Some(idx) => idx + 1 < domain.len(),
-        None => false,
-    }
+    domain
+        .split_once('.')
+        .is_some_and(|(head, tail)| !head.is_empty() && !tail.is_empty())
 }
 
 /// Identifier-shaped: once punctuation is removed, the value is non-empty,
@@ -123,7 +121,8 @@ fn looks_like_identifier(value: &str) -> bool {
         return false;
     }
     let digits = core.iter().filter(|c| c.is_ascii_digit()).count();
-    digits > 0 && digits * 2 >= core.len()
+    // "At least half", written without a multiplication: digits >= rest.
+    digits > 0 && digits >= core.len().saturating_sub(digits)
 }
 
 #[cfg(test)]

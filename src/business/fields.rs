@@ -175,16 +175,6 @@ impl Wallet {
     ///
     /// Refuses a `PKEY` field: a passkey's value is not user-editable.
     pub fn update_field(&mut self, field_id: &str, value: &str, sort_weight: Option<i32>) -> Result<String> {
-        self.update_field_checked(field_id, value, sort_weight, true)
-    }
-
-    /// `update_field` for the crate's own validated writes, which may replace a
-    /// passkey (the old one stays recoverable in the trash).
-    pub(crate) fn update_field_unchecked(&mut self, field_id: &str, value: &str, sort_weight: Option<i32>) -> Result<String> {
-        self.update_field_checked(field_id, value, sort_weight, false)
-    }
-
-    fn update_field_checked(&mut self, field_id: &str, value: &str, sort_weight: Option<i32>, guard: bool) -> Result<String> {
         self.ensure_unlocked()?;
 
         // Encrypt the new value up front (immutable borrow of the DEK) before
@@ -198,9 +188,7 @@ impl Wallet {
         // Fetch old field from DB
         let old_field = queries::get_field_raw_by_id(conn, field_id)?
             .ok_or_else(|| WalletError::FieldNotFound(field_id.to_string()))?;
-        if guard {
-            refuse_passkey(&old_field.field_type)?;
-        }
+        refuse_passkey(&old_field.field_type)?;
 
         // If PASS type: copy old encrypted bytes directly to OLDP. Both fields
         // are encrypted under the same DEK, so the ciphertext is reusable as-is.

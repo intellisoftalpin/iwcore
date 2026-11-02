@@ -27,10 +27,14 @@
 //! - fields this version does not know, at the top level and inside
 //!   `fido2Extensions`, are kept and written back unchanged;
 //! - the private key and the PRF secrets have no public getter and are printed
-//!   as `[redacted]` by `Debug`.
+//!   as `[redacted]` by `Debug`; the serialised record (which carries them) is
+//!   only built inside the crate, for the vault, the journal and CXF export;
+//! - every intermediate JSON copy of a secret is wiped when it is dropped.
+
+use std::ops::{Deref, DerefMut};
 
 use serde_json::{Map, Value};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{b64, ALG_ES256};
 use crate::error::{Result, WalletError};
@@ -69,6 +73,65 @@ const KNOWN: [&str; 10] = [
     K_VERSION, K_CREDENTIAL_ID, K_RP_ID, K_USER_NAME, K_USER_DISPLAY_NAME, K_USER_HANDLE, K_KEY,
     K_ALG, K_CREATED_AT, K_FIDO2,
 ];
+
+/// Wipe every string inside a JSON value (object keys are not secret).
+pub(crate) fn wipe_value(value: &mut Value) {
+    match value {
+        Value::String(s) => s.zeroize(),
+        Value::Array(items) => items.iter_mut().for_each(wipe_value),
+        Value::Object(map) => map.values_mut().for_each(wipe_value),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// A JSON object holding secrets (a base64 private key, PRF secrets): every
+/// string in it is wiped when it is dropped.
+#[derive(Clone, Default)]
+pub(crate) struct SecretMap(Map<String, Value>);
+
+impl Drop for SecretMap {
+    fn drop(&mut self) {
+        self.0.values_mut().for_each(wipe_value);
+    }
+}
+
+impl Deref for SecretMap {
+    type Target = Map<String, Value>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for SecretMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Serialise `value` as JSON into a buffer allocated once at its exact size
+/// (so no partial copy is left behind by a reallocation) and wiped on drop.
+fn to_json_wiped<T: serde::Serialize>(value: &T) -> Result<Zeroizing<String>> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let encode_failed = |e: serde_json::Error| WalletError::EncryptionError(format!("passkey record encode failed: {e}"));
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).map_err(encode_failed)?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(count.0));
+    serde_json::to_writer(&mut *bytes, value).map_err(encode_failed)?;
+    // serde_json writes UTF-8 only; the bytes move into the String uncopied.
+    String::from_utf8(std::mem::take(&mut *bytes)).map(Zeroizing::new).map_err(|e| {
+        e.into_bytes().zeroize();
+        WalletError::EncryptionError("passkey record encode failed: not UTF-8".into())
+    })
+}
 
 /// The two secrets behind the WebAuthn PRF extension (CXF `hmacCredentials`).
 /// One answers when the user was verified, the other when not.
@@ -119,6 +182,15 @@ impl PrfSecrets {
 }
 
 /// A passkey with everything needed to sign with it.
+///
+/// The private key and PRF secrets never come back out through the public
+/// API; even the stored form is crate-only:
+///
+/// ```compile_fail
+/// fn leak(r: &iwcore::passkey::PasskeyRecord) {
+///     let _ = r.to_field_value();
+/// }
+/// ```
 #[derive(Clone)]
 pub struct PasskeyRecord {
     pub credential_id: Vec<u8>,
@@ -132,8 +204,9 @@ pub struct PasskeyRecord {
     pub created_at: i64,
     /// Parsed from `fido2Extensions.hmacCredentials`, when usable.
     prf: Option<PrfSecrets>,
-    /// `fido2Extensions` exactly as stored, so unknown members survive.
-    fido2_extensions: Option<Map<String, Value>>,
+    /// `fido2Extensions` exactly as stored, so unknown members survive. Holds
+    /// the PRF secrets in base64, so it is wiped on drop.
+    fido2_extensions: Option<SecretMap>,
     /// Top-level members this version does not know, kept for round trips.
     extra: Map<String, Value>,
 }
@@ -185,7 +258,7 @@ impl PasskeyRecord {
         prf: Option<PrfSecrets>,
     ) -> Result<Self> {
         let fido2_extensions = prf.as_ref().map(|p| {
-            let mut m = Map::new();
+            let mut m = SecretMap::default();
             m.insert(K_HMAC.into(), p.to_json());
             m
         });
@@ -210,9 +283,15 @@ impl PasskeyRecord {
         if text.len() > RECORD_MAX {
             return Err(invalid("passkey record is larger than 64 KiB"));
         }
-        let mut obj: Map<String, Value> = match serde_json::from_str(text) {
-            Ok(Value::Object(obj)) => obj,
-            _ => return Err(invalid("passkey record is not a JSON object")),
+        // Every string of the parsed document is wiped when `obj` drops, on
+        // the error paths too.
+        let mut obj = match serde_json::from_str(text) {
+            Ok(Value::Object(obj)) => SecretMap(obj),
+            Ok(mut other) => {
+                wipe_value(&mut other);
+                return Err(invalid("passkey record is not a JSON object"));
+            }
+            Err(_) => return Err(invalid("passkey record is not a JSON object")),
         };
 
         match obj.get(K_VERSION).and_then(Value::as_u64) {
@@ -239,16 +318,22 @@ impl PasskeyRecord {
             None => return Err(invalid("passkey record has no alg")),
         }
         let created_at = obj.get(K_CREATED_AT).and_then(Value::as_i64).unwrap_or(0);
-        let fido2_extensions = match obj.get(K_FIDO2) {
+        let fido2_extensions = match obj.remove(K_FIDO2) {
             None | Some(Value::Null) => None,
-            Some(Value::Object(m)) => Some(m.clone()),
-            Some(_) => return Err(invalid("fido2Extensions is not an object")),
+            Some(Value::Object(m)) => Some(SecretMap(m)),
+            Some(mut other) => {
+                wipe_value(&mut other);
+                return Err(invalid("fido2Extensions is not an object"));
+            }
         };
         let prf = fido2_extensions.as_ref().and_then(|m| m.get(K_HMAC)).and_then(PrfSecrets::from_json);
 
         for k in KNOWN {
-            obj.remove(k);
+            if let Some(mut v) = obj.remove(k) {
+                wipe_value(&mut v);
+            }
         }
+        let extra = std::mem::take(&mut obj.0);
         let record = Self {
             credential_id,
             rp_id,
@@ -259,15 +344,18 @@ impl PasskeyRecord {
             created_at,
             prf,
             fido2_extensions,
-            extra: obj,
+            extra,
         };
         record.validate()?;
         Ok(record)
     }
 
-    /// Serialise for storage in a `PKEY` field.
-    pub fn to_field_value(&self) -> Result<Zeroizing<String>> {
-        let mut obj = self.extra.clone();
+    /// Serialise for storage in a `PKEY` field. The result carries the private
+    /// key, so it stays inside the crate: it goes to the vault, the AutoFill
+    /// journal ([`super::sign::Registration::pending_record`]) or the CXF
+    /// export, never back to a caller on its own.
+    pub(crate) fn to_field_value(&self) -> Result<Zeroizing<String>> {
+        let mut obj = SecretMap(self.extra.clone());
         obj.insert(K_VERSION.into(), RECORD_VERSION.into());
         obj.insert(K_CREDENTIAL_ID.into(), b64::encode(&self.credential_id).into());
         obj.insert(K_RP_ID.into(), self.rp_id.clone().into());
@@ -278,11 +366,17 @@ impl PasskeyRecord {
         obj.insert(K_ALG.into(), ALG_ES256.into());
         obj.insert(K_CREATED_AT.into(), self.created_at.into());
         if let Some(ext) = &self.fido2_extensions {
-            obj.insert(K_FIDO2.into(), Value::Object(ext.clone()));
+            obj.insert(K_FIDO2.into(), Value::Object(ext.0.clone()));
         }
-        serde_json::to_string(&Value::Object(obj))
-            .map(Zeroizing::new)
-            .map_err(|e| WalletError::EncryptionError(format!("passkey record encode failed: {e}")))
+        to_json_wiped(&obj.0)
+    }
+
+    /// Round trip through the stored form, for the fuzz targets only (the
+    /// stored form itself never leaves the crate).
+    #[cfg(fuzzing)]
+    #[doc(hidden)]
+    pub fn fuzz_round_trip(&self) -> Result<Self> {
+        Self::from_field_value(&self.to_field_value()?)
     }
 
     /// What may be shown about this passkey.
@@ -314,7 +408,7 @@ impl PasskeyRecord {
 
     /// `fido2Extensions` as stored, for export.
     pub(crate) fn fido2_extensions(&self) -> Option<&Map<String, Value>> {
-        self.fido2_extensions.as_ref()
+        self.fido2_extensions.as_deref()
     }
 
     /// PKCS#8 DER of the private key, for export only.
@@ -532,6 +626,41 @@ pub(crate) mod tests {
         assert_eq!((s.item_id.as_str(), s.field_id.as_str()), ("item1", "fld1"));
         assert!(s.has_prf);
         assert!(!format!("{s:?}").contains(&b64::encode(r.pkcs8())));
+    }
+
+    #[test]
+    fn wipe_value_clears_every_string() {
+        let mut v = serde_json::json!({"key": "c2VjcmV0", "n": 5, "list": ["a", {"deep": "b"}], "ok": true, "none": null});
+        wipe_value(&mut v);
+        assert_eq!(v, serde_json::json!({"key": "", "n": 5, "list": ["", {"deep": ""}], "ok": true, "none": null}));
+    }
+
+    #[test]
+    fn secret_map_derefs_to_its_map() {
+        let mut m = SecretMap::default();
+        m.insert("k".into(), "v".into());
+        assert_eq!(m.get("k"), Some(&Value::from("v")));
+        let copy = m.clone();
+        drop(m);
+        assert_eq!(copy.get("k"), Some(&Value::from("v")), "a clone is its own copy");
+    }
+
+    #[test]
+    fn stored_form_matches_plain_serde_output() {
+        for prf in [false, true] {
+            let r = sample(prf);
+            let stored = r.to_field_value().unwrap();
+            assert_eq!(stored.len(), stored.capacity(), "allocated once, at its exact size");
+            let reparsed: Value = serde_json::from_str(&stored).unwrap();
+            assert_eq!(*stored, serde_json::to_string(&reparsed).unwrap());
+        }
+    }
+
+    #[test]
+    fn non_object_documents_are_refused() {
+        for text in ["[\"key\"]", "\"key\"", "5", "null"] {
+            assert!(PasskeyRecord::from_field_value(text).is_err(), "{text}");
+        }
     }
 
     #[test]

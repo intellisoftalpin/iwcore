@@ -26,3 +26,6 @@ lcov.info
 # Backup files
 *.orig
 *.bak
+
+# cargo-mutants output
+/mutants.out*/

@@ -38,22 +38,23 @@ pub fn prepare_key(password: &str, hash: Option<&str>, re_encryption_count: u32)
         derive_key_from_password(password, re_encryption_count)
     };
 
-    // Convert to UTF-8 bytes and ensure exactly 32 bytes
-    let key_bytes = key_string.as_bytes();
+    // Convert to UTF-8 bytes and ensure exactly 32 bytes: copy up to
+    // KEY_LENGTH bytes, zero-pad the rest.
     let mut key = [0u8; KEY_LENGTH];
-
-    // Copy up to KEY_LENGTH bytes
-    let copy_len = std::cmp::min(key_bytes.len(), KEY_LENGTH);
-    key[..copy_len].copy_from_slice(&key_bytes[..copy_len]);
+    for (dst, src) in key.iter_mut().zip(key_string.as_bytes()) {
+        *dst = *src;
+    }
 
     key
 }
 
 /// Derive key from password with optional MD5 iterations
 fn derive_key_from_password(password: &str, re_encryption_count: u32) -> String {
-    // Step 1: Pad password by doubling until >= 32 chars
+    // Step 1: Pad password by doubling until >= 32 chars. An empty password
+    // cannot be padded: it stays empty (an all-zero key) instead of looping
+    // forever.
     let mut padded = password.to_string();
-    while padded.chars().count() < KEY_LENGTH {
+    while !password.is_empty() && padded.chars().count() < KEY_LENGTH {
         padded.push_str(password);
     }
 
@@ -117,6 +118,20 @@ mod tests {
     }
 
     #[test]
+    fn test_key_short_hash_is_zero_padded() {
+        let key = prepare_key("ignored", Some("abc"), 1);
+        assert_eq!(&key[..3], b"abc");
+        assert!(key[3..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn test_key_multibyte_password_truncates_to_32_bytes() {
+        // 32 Cyrillic chars = 64 UTF-8 bytes; only the first 32 bytes are kept.
+        let key = prepare_key("ж", None, 0);
+        assert_eq!(&key[..], "ж".repeat(16).as_bytes());
+    }
+
+    #[test]
     fn test_key_with_empty_hash() {
         // When hash is empty, derive from password
         let key = prepare_key("Sun001!", Some(""), 0);
@@ -136,4 +151,20 @@ mod tests {
         assert_eq!(&key[..], expected_hash.as_bytes());
     }
 
+    #[test]
+    fn test_key_empty_password_terminates() {
+        // An empty password must not hang the padding loop.
+        assert_eq!(prepare_key("", None, 0), [0u8; KEY_LENGTH]);
+        assert_eq!(prepare_key("", Some(""), 200), md5_iterated_empty(200));
+    }
+
+    fn md5_iterated_empty(count: u32) -> [u8; KEY_LENGTH] {
+        let mut s = String::new();
+        for _ in 0..count {
+            s = super::md5_hex(&s);
+        }
+        let mut key = [0u8; KEY_LENGTH];
+        key.copy_from_slice(s.as_bytes());
+        key
+    }
 }

@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use iwcore::cxf::export::ExportOptions;
 use iwcore::cxf::import::{ImportOptions, KindCounts};
-use iwcore::passkey::sign::{self, RegisterInput};
+use iwcore::passkey::sign;
 use iwcore::passkey::{prf, PasskeyRecord, FIELD_PASSKEY};
 use iwcore::{WalletError, Wallet};
 use serde_json::{json, Value};
@@ -37,20 +37,37 @@ fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }
 
-/// A passkey credential as another manager would export it.
+/// A passkey credential as another manager would export it: a fresh P-256
+/// key, credential id and PRF secrets made here (iwcore never hands a stored
+/// key out), and the same passkey as iwcore reads it.
 fn cxf_passkey(rp: &str, handle: &[u8]) -> (Value, PasskeyRecord) {
-    let reg = sign::register(&RegisterInput {
-        rp_id: rp, user_name: "bkv", user_display_name: "B K V", user_handle: handle,
-        exclude_credentials: &[], held_credential_ids: &[], user_verified: true, now: 0,
-    }).unwrap();
-    let stored: Value = serde_json::from_str(&reg.record.to_field_value().unwrap()).unwrap();
+    use p256::pkcs8::EncodePrivateKey;
+    let random = |n: usize| -> Vec<u8> {
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        (0..n).map(|_| rng.random::<u8>()).collect()
+    };
+    let key = loop {
+        if let Ok(k) = p256::SecretKey::from_slice(&random(32)) {
+            break k;
+        }
+    };
+    let pkcs8 = b64(key.to_pkcs8_der().unwrap().as_bytes());
+    let fido2 = json!({ "hmacCredentials": {
+        "algorithm": "hmac-sha256", "credWithUV": b64(&random(32)), "credWithoutUV": b64(&random(32)),
+    }});
+    let credential_id = b64(&random(16));
     let cred = json!({
         "type": "passkey",
-        "credentialId": stored["credentialId"], "rpId": rp, "username": "bkv",
-        "userDisplayName": "B K V", "userHandle": stored["userHandle"], "key": stored["key"],
-        "fido2Extensions": stored["fido2Extensions"],
+        "credentialId": credential_id, "rpId": rp, "username": "bkv",
+        "userDisplayName": "B K V", "userHandle": b64(handle), "key": pkcs8,
+        "fido2Extensions": fido2,
     });
-    (cred, reg.record)
+    let stored = json!({
+        "v": 1, "credentialId": credential_id, "rpId": rp, "userName": "bkv", "userDisplayName": "B K V",
+        "userHandle": b64(handle), "key": pkcs8, "alg": -7, "createdAt": 0, "fido2Extensions": fido2,
+    });
+    (cred, PasskeyRecord::from_field_value(&stored.to_string()).unwrap())
 }
 
 fn payload(items: Vec<Value>, collections: Vec<Value>) -> String {
@@ -377,9 +394,9 @@ fn export_then_import_into_an_empty_vault_round_trips() {
     assert_eq!(list[0].credential_id, record.credential_id);
     let sealed = fresh.build_autofill_index(&[5; 32], 1, 0, Default::default()).unwrap();
     let (_, contents) = iwcore::autofill::index::open_all(&sealed, &[5; 32]).unwrap();
-    let back = PasskeyRecord::from_field_value(&contents.passkeys[0].record.to_string()).unwrap();
-    sign::assert(&back, "github.com", &[1; 32], true).unwrap();
-    assert_eq!(prf::evaluate_salts(&back, &[3; 32], None, true), prf::evaluate_salts(&record, &[3; 32], None, true));
+    let back = contents.passkeys[0].record();
+    sign::assert(back, "github.com", &[1; 32], true).unwrap();
+    assert_eq!(prf::evaluate_salts(back, &[3; 32], None, true), prf::evaluate_salts(&record, &[3; 32], None, true));
 }
 
 #[test]

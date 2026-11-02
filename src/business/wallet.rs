@@ -15,8 +15,9 @@ use crate::utils::generate_database_id;
 use crate::{DATABASE_FILENAME, ROOT_ID, ROOT_PARENT_ID, DB_VERSION, ENCRYPTION_COUNT_DEFAULT};
 use zeroize::Zeroizing;
 
-/// Filename of the pre-migration snapshot kept (permanently) next to the
-/// database when a v5 vault is upgraded to v6. See `iwcore-hardening.md`.
+/// Filename of the pre-migration snapshot written next to the database when a
+/// v5 vault is upgraded to v6. Kept until [`Wallet::retire_pre_v6_snapshot`]
+/// removes it once a v6 backup exists. See `iwcore-hardening.md`.
 pub const PRE_V6_BACKUP_FILENAME: &str = "nswallet.pre-v6.bak";
 
 /// Scheme id stored in the crypto record (1 = XChaCha20-Poly1305 / Argon2id).
@@ -88,6 +89,89 @@ fn random_bytes(n: usize) -> Result<Vec<u8>> {
 /// NULL `email` column, making a correct password look "wrong" on import.
 fn legacy_encryption_count(email: Option<&str>) -> u32 {
     email.and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+/// KDF name stored in the crypto record of a v6 vault.
+const KDF_ARGON2ID: &str = "argon2id";
+
+/// First database version written with the v6 crypto scheme.
+const V6: u32 = 6;
+
+/// Whether `backup_folder` holds a backup that passes inspection and reports
+/// database version >= 6. Inspection extracts into a temporary folder under
+/// `temp_base`.
+fn has_v6_backup(backup_folder: &Path, temp_base: &Path) -> Result<bool> {
+    let backups = crate::backup::BackupManager::new(backup_folder).list_backups()?;
+    Ok(backups.iter().any(|b| {
+        crate::backup::inspect_backup_in(&b.path, temp_base)
+            .ok()
+            .and_then(|i| i.db_version.parse::<u32>().ok())
+            .is_some_and(|v| v >= V6)
+    }))
+}
+
+/// Derive the KEK from `password` using the record's stored params and try
+/// to unwrap the DEK. Returns the DEK on success, `None` on wrong password.
+///
+/// The record is checked first: an unknown scheme or KDF, or cost parameters
+/// outside [`crypto::kdf::KdfParams::check_stored`], are an error and no
+/// derivation is attempted.
+fn unwrap_with_password(rec: &CryptoRecord, password: &str) -> Result<Option<Zeroizing<[u8; DEK_LEN]>>> {
+    if rec.scheme != CRYPTO_SCHEME_V6 {
+        return Err(WalletError::NotSupported(format!("crypto scheme {}", rec.scheme)));
+    }
+    if rec.kdf != KDF_ARGON2ID {
+        return Err(WalletError::NotSupported("key derivation function".to_string()));
+    }
+    let params = crypto::kdf::KdfParams {
+        m_cost_kib: rec.m_cost_kib,
+        t_cost: rec.t_cost,
+        p_cost: rec.p_cost,
+    };
+    params
+        .check_stored()
+        .map_err(|e| WalletError::InvalidInput(format!("crypto record: {e}")))?;
+    let kek = crypto::kdf::derive_kek(password.as_bytes(), &rec.salt, params)
+        .map_err(|e| WalletError::InvalidInput(format!("crypto record: {e}")))?;
+    Ok(crypto::dek::unwrap_dek(&kek, &rec.dek_wrapped).ok())
+}
+
+/// Verify a password against a sample of active data blobs (used when the
+/// root record is missing). See [`Wallet::check_password`].
+fn verify_password_against_sample(
+    conn: &rusqlite::Connection,
+    key_chain: &mut crypto::legacy::LegacyKeyChain,
+) -> Result<bool> {
+    let samples = queries::get_sample_blobs(conn, 20)?;
+    if samples.is_empty() {
+        return Err(WalletError::DatabaseError(
+            "Legacy vault has no root record and no data to verify a password against"
+                .to_string(),
+        ));
+    }
+    Ok(samples.iter().any(|blob| key_chain.decrypt(blob).is_ok()))
+}
+
+/// Check a password against the vault behind `conn` without changing it:
+/// v6 vaults verify through the DEK unwrap, not-yet-migrated v5 vaults through
+/// the legacy root item (or a data sample when the root is missing). Only
+/// reads, so it also works on a read-only connection to a backup copy.
+pub(crate) fn check_password_on(conn: &rusqlite::Connection, password: &str) -> Result<bool> {
+    let props = queries::get_properties(conn)?;
+    let crypto_rec = queries::get_crypto_record(conn)?;
+    let root_blob = queries::get_root_item_raw(conn)?;
+
+    if let Some(rec) = crypto_rec {
+        Ok(unwrap_with_password(&rec, password)?.is_some())
+    } else {
+        let encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()));
+        let mut key_chain = crypto::legacy::LegacyKeyChain::new(password, encryption_count);
+        match &root_blob {
+            Some(encrypted_name) => Ok(key_chain.decrypt(encrypted_name).is_ok()),
+            // Rootless legacy vault: verify against the data, like unlock.
+            None => verify_password_against_sample(conn, &mut key_chain),
+        }
+    }
 }
 
 /// Main wallet interface
@@ -208,7 +292,7 @@ impl Wallet {
             queries::set_properties(conn, &db_id, lang, DB_VERSION, 0)?;
             queries::set_crypto_record(conn, &CryptoRecord {
                 scheme: CRYPTO_SCHEME_V6,
-                kdf: "argon2id".to_string(),
+                kdf: KDF_ARGON2ID.to_string(),
                 m_cost_kib: params.m_cost_kib,
                 t_cost: params.t_cost,
                 p_cost: params.p_cost,
@@ -247,9 +331,9 @@ impl Wallet {
 
         if let Some(rec) = crypto_rec {
             // v6 vault: derive KEK from the stored params and unwrap the DEK.
-            match self.unwrap_with_password(&rec, password) {
+            match unwrap_with_password(&rec, password)? {
                 Some(dek) => {
-                    self.unlocked = Some(Unlocked { dek: Zeroizing::new(dek) });
+                    self.unlocked = Some(Unlocked { dek });
                     self.clear_caches();
                     self.add_system_labels()?;
                     Ok(true)
@@ -300,19 +384,10 @@ impl Wallet {
         &self,
         key_chain: &mut crypto::legacy::LegacyKeyChain,
     ) -> Result<bool> {
-        let samples = {
-            let conn = self.db.as_ref()
-                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
-                .connection()?;
-            queries::get_sample_blobs(conn, 20)?
-        };
-        if samples.is_empty() {
-            return Err(WalletError::DatabaseError(
-                "Legacy vault has no root record and no data to verify a password against"
-                    .to_string(),
-            ));
-        }
-        Ok(samples.iter().any(|blob| key_chain.decrypt(blob).is_ok()))
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+        verify_password_against_sample(conn, key_chain)
     }
 
     /// Outcome of the v5->v6 migration when this wallet session performed
@@ -342,7 +417,7 @@ impl Wallet {
     /// strict no-op. Repeatable any number of times.
     pub fn recover_quarantined(&mut self, password: &str) -> Result<RecoveryResult> {
         self.ensure_unlocked()?;
-        let dek = *self.dek()?;
+        let dek = Zeroizing::new(*self.dek()?);
         let mut chain = crypto::legacy::LegacyKeyChain::new(password, self.encryption_count);
 
         let rows = {
@@ -420,18 +495,6 @@ impl Wallet {
         let _ = self.db.as_ref().unwrap().checkpoint();
         self.clear_caches();
         Ok(result)
-    }
-
-    /// Derive the KEK from `password` using the record's stored params and try
-    /// to unwrap the DEK. Returns the DEK on success, `None` on wrong password.
-    fn unwrap_with_password(&self, rec: &CryptoRecord, password: &str) -> Option<[u8; DEK_LEN]> {
-        let params = crypto::kdf::KdfParams {
-            m_cost_kib: rec.m_cost_kib,
-            t_cost: rec.t_cost,
-            p_cost: rec.p_cost,
-        };
-        let kek = crypto::kdf::derive_kek(password.as_bytes(), &rec.salt, params).ok()?;
-        crypto::dek::unwrap_dek(&kek, &rec.dek_wrapped).ok()
     }
 
     /// Lock the wallet (zeroizes the in-memory DEK).
@@ -518,28 +581,10 @@ impl Wallet {
     /// (verify via DEK unwrap) and not-yet-migrated v5 vaults (verify via the
     /// legacy root item). Read-only: never mutates the database.
     pub fn check_password(&self, password: &str) -> Result<bool> {
-        let (props, crypto_rec, root_blob) = {
-            let conn = self.db.as_ref()
-                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
-                .connection()?;
-            (
-                queries::get_properties(conn)?,
-                queries::get_crypto_record(conn)?,
-                queries::get_root_item_raw(conn)?,
-            )
-        };
-
-        if let Some(rec) = crypto_rec {
-            Ok(self.unwrap_with_password(&rec, password).is_some())
-        } else {
-            let encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()));
-            let mut key_chain = crypto::legacy::LegacyKeyChain::new(password, encryption_count);
-            match &root_blob {
-                Some(encrypted_name) => Ok(key_chain.decrypt(encrypted_name).is_ok()),
-                // Rootless legacy vault: verify against the data, like unlock.
-                None => self.verify_password_against_sample(&mut key_chain),
-            }
-        }
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+        check_password_on(conn, password)
     }
 
     /// Get database properties
@@ -572,7 +617,7 @@ impl Wallet {
     pub fn change_password(&mut self, new_password: &str) -> Result<bool> {
         self.ensure_unlocked()?;
 
-        let dek = *self.dek()?;
+        let dek = Zeroizing::new(*self.dek()?);
         let params = crypto::kdf::KdfParams::current();
         let salt = random_bytes(KDF_SALT_LEN)?;
         let kek = crypto::kdf::derive_kek(new_password.as_bytes(), &salt, params)
@@ -585,7 +630,7 @@ impl Wallet {
             .connection()?;
         queries::set_crypto_record(conn, &CryptoRecord {
             scheme: CRYPTO_SCHEME_V6,
-            kdf: "argon2id".to_string(),
+            kdf: KDF_ARGON2ID.to_string(),
             m_cost_kib: params.m_cost_kib,
             t_cost: params.t_cost,
             p_cost: params.p_cost,
@@ -604,9 +649,52 @@ impl Wallet {
         Ok(())
     }
 
+    /// Whether the pre-v6 snapshot ([`PRE_V6_BACKUP_FILENAME`]) is still in
+    /// the wallet folder.
+    pub fn has_pre_v6_snapshot(&self) -> bool {
+        self.folder.join(PRE_V6_BACKUP_FILENAME).is_file()
+    }
+
+    /// Delete the pre-v6 snapshot once it is no longer needed. Returns whether
+    /// a snapshot was deleted.
+    ///
+    /// The snapshot still holds the vault in the old format, so it is removed
+    /// as soon as the converted vault is known to work and a current backup
+    /// can replace it. It is deleted only when all of these hold:
+    /// - the wallet is unlocked (else [`WalletError::Locked`]), which proves
+    ///   the converted vault opens with the password;
+    /// - the vault is v6 (it has a crypto record and version >= 6);
+    /// - the snapshot exists;
+    /// - `backup_folder` holds at least one backup that passes
+    ///   [`crate::backup::inspect_backup_in`] and reports database version >= 6.
+    ///
+    /// Backups are inspected through a temporary folder inside the wallet
+    /// folder. Backups that fail inspection are skipped, not reported.
+    /// Calling it again after the snapshot is gone returns `Ok(false)`.
+    pub fn retire_pre_v6_snapshot(&self, backup_folder: &Path) -> Result<bool> {
+        self.ensure_unlocked()?;
+        {
+            let conn = self.db.as_ref()
+                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+                .connection()?;
+            let version: u32 = migrations::get_database_version(conn)?.parse().unwrap_or(0);
+            if version < V6 || queries::get_crypto_record(conn)?.is_none() {
+                return Ok(false);
+            }
+        }
+        if !self.has_pre_v6_snapshot() || !has_v6_backup(backup_folder, &self.folder)? {
+            return Ok(false);
+        }
+        std::fs::remove_file(self.folder.join(PRE_V6_BACKUP_FILENAME)).map_err(|e| {
+            WalletError::BackupError(format!("Failed to remove pre-v6 snapshot: {e}"))
+        })?;
+        Ok(true)
+    }
+
     /// Write a consistent pre-migration snapshot of the database to
-    /// `<folder>/nswallet.pre-v6.bak` using SQLite `VACUUM INTO`. Kept
-    /// permanently as a recovery anchor. Overwrites any stale snapshot (safe:
+    /// `<folder>/nswallet.pre-v6.bak` using SQLite `VACUUM INTO`. Kept as a
+    /// recovery anchor until [`Wallet::retire_pre_v6_snapshot`] removes it.
+    /// Overwrites any stale snapshot (safe:
     /// only called while the live DB is still an intact v5).
     fn create_pre_v6_backup(&self) -> Result<()> {
         let dst = self.folder.join(PRE_V6_BACKUP_FILENAME);
@@ -629,8 +717,8 @@ impl Wallet {
     /// from the verified derivation and falls back through the others for
     /// vaults with a mixed key history).
     ///
-    /// Sequence (see `iwcore-hardening.md`): checkpoint, write a kept pre-v6
-    /// snapshot, then in a single transaction generate fresh key material,
+    /// Sequence (see `iwcore-hardening.md`): checkpoint, write a pre-v6
+    /// snapshot (kept until retired), then in a single transaction generate fresh key material,
     /// re-encrypt every item name and field value (active, deleted, and root)
     /// from the legacy scheme to the DEK AEAD scheme, write the crypto record,
     /// and bump the version to 6.
@@ -808,7 +896,7 @@ impl Wallet {
 
             queries::set_crypto_record(conn, &CryptoRecord {
                 scheme: CRYPTO_SCHEME_V6,
-                kdf: "argon2id".to_string(),
+                kdf: KDF_ARGON2ID.to_string(),
                 m_cost_kib: params.m_cost_kib,
                 t_cost: params.t_cost,
                 p_cost: params.p_cost,
@@ -902,6 +990,82 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let wallet = Wallet::create(temp_dir.path(), "TestPassword123", "en").unwrap();
         (wallet, temp_dir)
+    }
+
+    /// A closed v6 wallet whose crypto record was then changed by `sql`.
+    fn wallet_with_crypto_record_changed(sql: &str) -> (TempDir, std::path::PathBuf) {
+        let (wallet, temp) = create_test_wallet();
+        let folder = wallet.folder().to_path_buf();
+        drop(wallet);
+        let conn = rusqlite::Connection::open(folder.join(DATABASE_FILENAME)).unwrap();
+        conn.execute_batch(sql).unwrap();
+        (temp, folder)
+    }
+
+    #[test]
+    fn a_crypto_record_outside_the_bounds_is_an_error_not_a_derivation() {
+        for sql in [
+            "UPDATE nswallet_crypto SET kdf_m_cost = 4194304",
+            "UPDATE nswallet_crypto SET kdf_t_cost = 1000000",
+            "UPDATE nswallet_crypto SET kdf_p_cost = 0",
+            "UPDATE nswallet_crypto SET kdf_p_cost = 255",
+            "UPDATE nswallet_crypto SET kdf_m_cost = -1",
+            "UPDATE nswallet_crypto SET kdf_t_cost = 4294967296",
+            "UPDATE nswallet_crypto SET kdf = 'scrypt'",
+            "UPDATE nswallet_crypto SET scheme = 2",
+            "UPDATE nswallet_crypto SET kdf_salt = x'00'",
+        ] {
+            let (_temp, folder) = wallet_with_crypto_record_changed(sql);
+            let mut wallet = Wallet::open(&folder).unwrap();
+            let started = std::time::Instant::now();
+            assert!(wallet.check_password("TestPassword123").is_err(), "{sql}");
+            assert!(wallet.unlock("TestPassword123").is_err(), "{sql}");
+            assert!(!wallet.is_unlocked());
+            assert!(started.elapsed() < std::time::Duration::from_secs(2), "{sql}");
+        }
+    }
+
+    /// A v6 backup of the wallet at `folder`, written into a new backup folder.
+    fn v6_backup_folder(folder: &Path) -> TempDir {
+        let backups = TempDir::new().unwrap();
+        crate::backup::BackupManager::new(backups.path())
+            .create_backup_from_path(&folder.join(DATABASE_FILENAME), true)
+            .unwrap();
+        backups
+    }
+
+    #[test]
+    fn the_pre_v6_snapshot_stays_while_the_vault_is_not_v6() {
+        for sql in [
+            "UPDATE nswallet_properties SET version = '5'",
+            "UPDATE nswallet_properties SET version = 'x'",
+            "DELETE FROM nswallet_crypto",
+        ] {
+            let (wallet, temp) = create_test_wallet();
+            let backups = v6_backup_folder(temp.path());
+            std::fs::write(temp.path().join(PRE_V6_BACKUP_FILENAME), b"snapshot").unwrap();
+            assert!(wallet.has_pre_v6_snapshot());
+            wallet.db.as_ref().unwrap().connection().unwrap().execute_batch(sql).unwrap();
+            assert!(!wallet.retire_pre_v6_snapshot(backups.path()).unwrap(), "{sql}");
+            assert!(wallet.has_pre_v6_snapshot(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn retiring_without_a_snapshot_is_a_no_op() {
+        let (wallet, temp) = create_test_wallet();
+        let backups = v6_backup_folder(temp.path());
+        assert!(!wallet.has_pre_v6_snapshot());
+        assert!(!wallet.retire_pre_v6_snapshot(backups.path()).unwrap());
+    }
+
+    #[test]
+    fn a_crypto_record_within_the_bounds_still_unlocks() {
+        let (_temp, folder) = wallet_with_crypto_record_changed("UPDATE nswallet_crypto SET kdf_p_cost = 1");
+        let mut wallet = Wallet::open(&folder).unwrap();
+        assert!(wallet.check_password("TestPassword123").unwrap());
+        assert!(!wallet.check_password("wrong").unwrap());
+        assert!(wallet.unlock("TestPassword123").unwrap());
     }
 
     #[test]
@@ -1711,6 +1875,76 @@ pub(crate) mod tests {
         let fields = wallet.get_fields_by_item(&existing_item).unwrap();
         let restored = fields.iter().find(|f| f.value == "old quarantine value").unwrap();
         assert_eq!(restored.field_type, "NOTE", "NULL metadata falls back to NOTE");
+    }
+
+    /// A raw quarantine row: record type, item id, field id, blob.
+    type QuarantineRowIn<'a> = (&'a str, &'a str, Option<&'a str>, Option<Vec<u8>>);
+
+    /// Insert raw quarantine rows into a closed, migrated vault.
+    fn insert_quarantine_rows(db_path: &std::path::Path, rows: &[QuarantineRowIn<'_>]) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        queries::ensure_quarantine_table(&conn).unwrap();
+        for (kind, item_id, field_id, blob) in rows {
+            conn.execute(
+                "INSERT INTO nswallet_quarantine (record_type, item_id, field_id, blob, quarantined_at)
+                 VALUES (?, ?, ?, ?, '2026-07-01 00:00:00')",
+                rusqlite::params![kind, item_id, field_id, blob],
+            ).unwrap();
+        }
+    }
+
+    /// Rows that cannot be placed stay quarantined: no blob, an item id that
+    /// is already live, a field whose slot is taken, a field without parent.
+    #[test]
+    fn test_recovery_keeps_rows_it_cannot_place() {
+        let password = "TestPassword123";
+        let (_temp, path) = create_legacy_vault_with_data(0);
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password).unwrap());
+        drop(wallet);
+
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        let (item_id, field_id): (String, String) = rusqlite::Connection::open(&db_path).unwrap()
+            .query_row("SELECT item_id, field_id FROM nswallet_fields LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        let blob = || Some(crypto::legacy::encrypt("quarantined value", password, 0, None).unwrap());
+        insert_quarantine_rows(&db_path, &[
+            ("item", "NOBLOB01", None, None),
+            ("item", "EMPTYB01", None, Some(Vec::new())),
+            ("item", &item_id, None, blob()),
+            ("field", &item_id, Some(&field_id), blob()),
+            ("field", "NOPARENT", Some("ORPHAN01"), blob()),
+        ]);
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password).unwrap());
+        let rec = wallet.recover_quarantined(password).unwrap();
+        assert_eq!(rec.recovered_items + rec.recovered_fields, 0);
+        assert_eq!(rec.remaining, 4);
+        assert_eq!(rec.waiting_for_parent, 1);
+        assert_eq!(wallet.quarantine_count().unwrap(), 5);
+    }
+
+    /// A write failure during recovery rolls the whole pass back.
+    #[test]
+    fn test_recovery_failure_rolls_back() {
+        let password = "TestPassword123";
+        let (_temp, path) = create_legacy_vault_with_data(0);
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password).unwrap());
+        drop(wallet);
+
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        let blob = crypto::legacy::encrypt("quarantined item", password, 0, None).unwrap();
+        insert_quarantine_rows(&db_path, &[("item", "NEWITEM1", None, Some(blob))]);
+        rusqlite::Connection::open(&db_path).unwrap().execute_batch(
+            "CREATE TRIGGER block_items BEFORE INSERT ON nswallet_items BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        ).unwrap();
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password).unwrap());
+        assert!(wallet.recover_quarantined(password).is_err());
+        assert_eq!(wallet.quarantine_count().unwrap(), 1);
     }
 
     /// The Nirav regression: a fully migrated, crypto-healthy v6 vault with a

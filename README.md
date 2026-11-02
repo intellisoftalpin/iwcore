@@ -70,7 +70,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-iwcore = "0.5"
+iwcore = "0.6"
 ```
 
 Or use cargo:
@@ -230,6 +230,11 @@ backup_mgr.cleanup_auto_backups(3, 30)?;
 Backups carry the database version, so newer backups are correctly rejected by older
 versions, while newer versions can read and migrate older backups on restore.
 
+Upgrading a v5 vault to v6 leaves a snapshot of the old file
+(`nswallet.pre-v6.bak`) in the wallet folder. Once the upgraded vault is
+unlocked and a v6 backup exists, `wallet.retire_pre_v6_snapshot(backup_folder)?`
+deletes it (`wallet.has_pre_v6_snapshot()` tells whether it is still there).
+
 ## Passkeys
 
 A passkey is stored as a `PKEY` field on a login item. Its private key and PRF
@@ -252,14 +257,30 @@ let registration = sign::register(&sign::RegisterInput {
     now: unix_seconds,
 })?;
 
-// Sign in:
-let assertion = sign::assert(&registration.record, "example.com", &client_data_hash, true)?;
+// Stage it in the AutoFill journal until the app drains it into the vault
+// (the stored record, private key included, never comes back to the caller):
+let pending = registration.pending_record(&options.rp_name, unix_seconds)?;
+
+// Sign in. What is signed depends on the caller: a privileged browser may hand
+// over its own clientDataHash; for a native app (android:apk-key-hash: origin)
+// a supplied hash is refused and clientDataJSON is always built here.
+let request = json::RequestOptions::parse(&request_json)?;
+let cd = json::client_data(json::Ceremony::Get, &request.challenge, &origin, app_package, browser_hash)?;
+let assertion = sign::assert(&registration.record, "example.com", &cd.hash, true)?;
 
 // What the app may show:
 for p in wallet.list_passkeys()? {
     println!("{} · {}", p.rp_id, p.user_name);
 }
 ```
+
+The same origin rules serve password AutoFill on Android:
+`origin::app_allowed_for_domain` lets a native app fill a saved login only when
+`https://<registrable domain>/.well-known/assetlinks.json`
+(`origin::login_assetlinks_url`) grants it `get_login_creds`, and
+`origin::web_domain_matches_url` checks a privileged browser's `webDomain`
+against the saved URL by registrable domain (full Public Suffix List). Fetching
+the file is the app's job; deciding is done here.
 
 Fixed choices: ES256 only, attestation `none` with IntelliWallet's AAGUID
 `a2117fe2-e236-40fa-9481-ca437bd8b94e`, sign counter 0, backup eligible and

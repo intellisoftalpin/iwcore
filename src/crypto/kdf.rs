@@ -11,6 +11,7 @@
 //! what makes future hardening a cheap DEK re-wrap rather than a data re-encrypt.
 
 use argon2::{Algorithm, Argon2, Params, Version};
+use zeroize::Zeroizing;
 
 /// KEK length (32 bytes = 256 bits).
 pub const KEK_LEN: usize = 32;
@@ -29,6 +30,13 @@ pub const ARGON2_M_COST_KIB: u32 = 65_536;
 pub const ARGON2_T_COST: u32 = 3;
 /// Parallelism (number of lanes).
 pub const ARGON2_P_COST: u32 = 1;
+
+/// Largest memory cost accepted from a stored vault record: 1 GiB.
+pub const KDF_MAX_M_COST_KIB: u32 = 1024 * 1024;
+/// Largest time cost accepted from a stored vault record.
+pub const KDF_MAX_T_COST: u32 = 100;
+/// Largest parallelism accepted from a stored vault record.
+pub const KDF_MAX_P_COST: u32 = 16;
 
 /// Argon2id cost parameters for a vault. Stored per-vault and used verbatim on
 /// unlock, so older vaults remain decryptable after the consts are raised.
@@ -51,17 +59,41 @@ impl KdfParams {
             p_cost: ARGON2_P_COST,
         }
     }
+
+    /// Check parameters read from a vault or backup before deriving with them.
+    ///
+    /// Accepts everything iwcore has ever written ([`KdfParams::current`])
+    /// and anything Argon2 accepts up to [`KDF_MAX_M_COST_KIB`],
+    /// [`KDF_MAX_T_COST`] and [`KDF_MAX_P_COST`], so a damaged or crafted
+    /// record fails with an error instead of a derivation that takes
+    /// gigabytes or minutes.
+    pub fn check_stored(&self) -> Result<(), String> {
+        if self.p_cost == 0 || self.p_cost > KDF_MAX_P_COST {
+            return Err(format!("KDF parallelism {} is outside 1..={KDF_MAX_P_COST}", self.p_cost));
+        }
+        if self.t_cost == 0 || self.t_cost > KDF_MAX_T_COST {
+            return Err(format!("KDF time cost {} is outside 1..={KDF_MAX_T_COST}", self.t_cost));
+        }
+        let min_m = self.p_cost.saturating_mul(8);
+        if self.m_cost_kib < min_m || self.m_cost_kib > KDF_MAX_M_COST_KIB {
+            return Err(format!(
+                "KDF memory cost {} KiB is outside {min_m}..={KDF_MAX_M_COST_KIB}",
+                self.m_cost_kib
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Derive a 32-byte KEK from a password and salt using Argon2id with the given
-/// parameters.
-pub fn derive_kek(password: &[u8], salt: &[u8], params: KdfParams) -> Result<[u8; KEK_LEN], String> {
+/// parameters. The KEK is wiped when the returned value is dropped.
+pub fn derive_kek(password: &[u8], salt: &[u8], params: KdfParams) -> Result<Zeroizing<[u8; KEK_LEN]>, String> {
     let p = Params::new(params.m_cost_kib, params.t_cost, params.p_cost, Some(KEK_LEN))
         .map_err(|e| format!("Argon2 params invalid: {e}"))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, p);
-    let mut out = [0u8; KEK_LEN];
+    let mut out = Zeroizing::new([0u8; KEK_LEN]);
     argon
-        .hash_password_into(password, salt, &mut out)
+        .hash_password_into(password, salt, out.as_mut_slice())
         .map_err(|e| format!("Argon2 derivation failed: {e}"))?;
     Ok(out)
 }
@@ -107,9 +139,44 @@ mod tests {
     }
 
     #[test]
+    fn kek_is_returned_in_a_wiping_wrapper() {
+        let k: Zeroizing<[u8; KEK_LEN]> = derive_kek(b"pw", b"0123456789abcdef", fast()).unwrap();
+        assert_ne!(*k, [0u8; KEK_LEN]);
+    }
+
+    #[test]
     fn output_is_32_bytes() {
         let k = derive_kek(b"pw", b"0123456789abcdef", fast()).unwrap();
         assert_eq!(k.len(), KEK_LEN);
+    }
+
+    #[test]
+    fn current_params_are_within_the_stored_bounds() {
+        KdfParams::current().check_stored().unwrap();
+        fast().check_stored().unwrap();
+    }
+
+    #[test]
+    fn stored_bounds_accept_the_edges() {
+        let ok = |m, t, p| KdfParams { m_cost_kib: m, t_cost: t, p_cost: p }.check_stored();
+        ok(8, 1, 1).unwrap();
+        ok(KDF_MAX_M_COST_KIB, KDF_MAX_T_COST, KDF_MAX_P_COST).unwrap();
+        ok(8 * KDF_MAX_P_COST, 1, KDF_MAX_P_COST).unwrap();
+    }
+
+    #[test]
+    fn stored_bounds_reject_absurd_values() {
+        let bad = |m, t, p| KdfParams { m_cost_kib: m, t_cost: t, p_cost: p }.check_stored().is_err();
+        assert!(bad(KDF_MAX_M_COST_KIB + 1, 3, 1));
+        assert!(bad(u32::MAX, 3, 1));
+        assert!(bad(7, 1, 1));
+        assert!(bad(15, 1, 2));
+        assert!(bad(65_536, 0, 1));
+        assert!(bad(65_536, KDF_MAX_T_COST + 1, 1));
+        assert!(bad(65_536, u32::MAX, 1));
+        assert!(bad(65_536, 3, 0));
+        assert!(bad(u32::MAX, 3, KDF_MAX_P_COST + 1));
+        assert!(bad(u32::MAX, 3, u32::MAX));
     }
 
     #[test]
