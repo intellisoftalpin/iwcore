@@ -790,6 +790,62 @@ mod tests {
     }
 
     #[test]
+    fn a_small_entry_without_the_sqlite_header_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = temp_dir.path().join("text.zip");
+        zip_with_db_entry(&backup_path, b"this is plain text, not a database file");
+        let db_path = temp_dir.path().join("w").join(DATABASE_FILENAME);
+        let err = restore_backup(&backup_path, &db_path).unwrap_err();
+        assert!(err.to_string().contains("not an SQLite database"), "{err}");
+        assert!(!db_path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn a_tiny_cap_refuses_an_entry_declared_above_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = create_test_backup(temp_dir.path());
+        let db_path = temp_dir.path().join(DATABASE_FILENAME);
+        let err = restore_backup_capped(&backup_path, &db_path, 8).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn a_bare_file_name_restores_into_the_current_folder() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = create_test_backup(temp_dir.path());
+        // A relative path without a folder: the temp file and the rename go
+        // to the current folder. Persisting is replaced so nothing lands in
+        // the real working directory.
+        let name = Path::new("iwcore-restore-bare-name.dat");
+        let mut seen = None;
+        restore_backup_with(&backup_path, name, MAX_RESTORED_DB_BYTES, |temp, path| {
+            seen = Some((temp.path().parent().map(Path::to_path_buf), path.to_path_buf()));
+            Ok(())
+        })
+        .unwrap();
+        let (temp_parent, path) = seen.unwrap();
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(temp_parent.unwrap().canonicalize().unwrap(), cwd);
+        assert_eq!(path, name);
+        assert!(!name.exists());
+    }
+
+    #[test]
+    fn a_backup_without_a_database_entry_does_not_verify() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = temp_dir.path().join("other.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&backup_path).unwrap());
+        zip.start_file("readme.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"hello").unwrap();
+        zip.finish().unwrap();
+
+        assert!(!verify_backup(&backup_path).unwrap());
+        let err = restore_backup(&backup_path, &temp_dir.path().join(DATABASE_FILENAME)).unwrap_err();
+        assert!(err.to_string().contains("Database not found"), "{err}");
+    }
+
+    #[test]
     fn a_backup_with_an_empty_database_does_not_verify() {
         let temp_dir = TempDir::new().unwrap();
         let backup_path = temp_dir.path().join("empty-db.zip");
