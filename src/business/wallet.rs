@@ -90,6 +90,56 @@ fn legacy_encryption_count(email: Option<&str>) -> u32 {
     email.and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
+/// Derive the KEK from `password` using the record's stored params and try
+/// to unwrap the DEK. Returns the DEK on success, `None` on wrong password.
+fn unwrap_with_password(rec: &CryptoRecord, password: &str) -> Option<[u8; DEK_LEN]> {
+    let params = crypto::kdf::KdfParams {
+        m_cost_kib: rec.m_cost_kib,
+        t_cost: rec.t_cost,
+        p_cost: rec.p_cost,
+    };
+    let kek = crypto::kdf::derive_kek(password.as_bytes(), &rec.salt, params).ok()?;
+    crypto::dek::unwrap_dek(&kek, &rec.dek_wrapped).ok()
+}
+
+/// Verify a password against a sample of active data blobs (used when the
+/// root record is missing). See [`Wallet::check_password`].
+fn verify_password_against_sample(
+    conn: &rusqlite::Connection,
+    key_chain: &mut crypto::legacy::LegacyKeyChain,
+) -> Result<bool> {
+    let samples = queries::get_sample_blobs(conn, 20)?;
+    if samples.is_empty() {
+        return Err(WalletError::DatabaseError(
+            "Legacy vault has no root record and no data to verify a password against"
+                .to_string(),
+        ));
+    }
+    Ok(samples.iter().any(|blob| key_chain.decrypt(blob).is_ok()))
+}
+
+/// Check a password against the vault behind `conn` without changing it:
+/// v6 vaults verify through the DEK unwrap, not-yet-migrated v5 vaults through
+/// the legacy root item (or a data sample when the root is missing). Only
+/// reads, so it also works on a read-only connection to a backup copy.
+pub(crate) fn check_password_on(conn: &rusqlite::Connection, password: &str) -> Result<bool> {
+    let props = queries::get_properties(conn)?;
+    let crypto_rec = queries::get_crypto_record(conn)?;
+    let root_blob = queries::get_root_item_raw(conn)?;
+
+    if let Some(rec) = crypto_rec {
+        Ok(unwrap_with_password(&rec, password).is_some())
+    } else {
+        let encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()));
+        let mut key_chain = crypto::legacy::LegacyKeyChain::new(password, encryption_count);
+        match &root_blob {
+            Some(encrypted_name) => Ok(key_chain.decrypt(encrypted_name).is_ok()),
+            // Rootless legacy vault: verify against the data, like unlock.
+            None => verify_password_against_sample(conn, &mut key_chain),
+        }
+    }
+}
+
 /// Main wallet interface
 pub struct Wallet {
     /// Path to the wallet folder
@@ -247,7 +297,7 @@ impl Wallet {
 
         if let Some(rec) = crypto_rec {
             // v6 vault: derive KEK from the stored params and unwrap the DEK.
-            match self.unwrap_with_password(&rec, password) {
+            match unwrap_with_password(&rec, password) {
                 Some(dek) => {
                     self.unlocked = Some(Unlocked { dek: Zeroizing::new(dek) });
                     self.clear_caches();
@@ -300,19 +350,10 @@ impl Wallet {
         &self,
         key_chain: &mut crypto::legacy::LegacyKeyChain,
     ) -> Result<bool> {
-        let samples = {
-            let conn = self.db.as_ref()
-                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
-                .connection()?;
-            queries::get_sample_blobs(conn, 20)?
-        };
-        if samples.is_empty() {
-            return Err(WalletError::DatabaseError(
-                "Legacy vault has no root record and no data to verify a password against"
-                    .to_string(),
-            ));
-        }
-        Ok(samples.iter().any(|blob| key_chain.decrypt(blob).is_ok()))
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+        verify_password_against_sample(conn, key_chain)
     }
 
     /// Outcome of the v5->v6 migration when this wallet session performed
@@ -422,18 +463,6 @@ impl Wallet {
         Ok(result)
     }
 
-    /// Derive the KEK from `password` using the record's stored params and try
-    /// to unwrap the DEK. Returns the DEK on success, `None` on wrong password.
-    fn unwrap_with_password(&self, rec: &CryptoRecord, password: &str) -> Option<[u8; DEK_LEN]> {
-        let params = crypto::kdf::KdfParams {
-            m_cost_kib: rec.m_cost_kib,
-            t_cost: rec.t_cost,
-            p_cost: rec.p_cost,
-        };
-        let kek = crypto::kdf::derive_kek(password.as_bytes(), &rec.salt, params).ok()?;
-        crypto::dek::unwrap_dek(&kek, &rec.dek_wrapped).ok()
-    }
-
     /// Lock the wallet (zeroizes the in-memory DEK).
     pub fn lock(&mut self) {
         self.unlocked = None;
@@ -518,28 +547,10 @@ impl Wallet {
     /// (verify via DEK unwrap) and not-yet-migrated v5 vaults (verify via the
     /// legacy root item). Read-only: never mutates the database.
     pub fn check_password(&self, password: &str) -> Result<bool> {
-        let (props, crypto_rec, root_blob) = {
-            let conn = self.db.as_ref()
-                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
-                .connection()?;
-            (
-                queries::get_properties(conn)?,
-                queries::get_crypto_record(conn)?,
-                queries::get_root_item_raw(conn)?,
-            )
-        };
-
-        if let Some(rec) = crypto_rec {
-            Ok(self.unwrap_with_password(&rec, password).is_some())
-        } else {
-            let encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()));
-            let mut key_chain = crypto::legacy::LegacyKeyChain::new(password, encryption_count);
-            match &root_blob {
-                Some(encrypted_name) => Ok(key_chain.decrypt(encrypted_name).is_ok()),
-                // Rootless legacy vault: verify against the data, like unlock.
-                None => self.verify_password_against_sample(&mut key_chain),
-            }
-        }
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+        check_password_on(conn, password)
     }
 
     /// Get database properties

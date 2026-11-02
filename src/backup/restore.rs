@@ -146,20 +146,9 @@ pub fn get_backup_db_version_in(backup_path: &Path, temp_base: &Path) -> Result<
 
 /// Extract a backup into `target` and read its database version.
 fn db_version_from_extracted(backup_path: &Path, target: &Path) -> Result<String> {
-    use rusqlite::Connection;
-
     let db_path = extract_backup(backup_path, target)?;
-
-    let conn = Connection::open(&db_path)
-        .map_err(|e| WalletError::DatabaseError(format!("Failed to open database: {}", e)))?;
-
-    let version: String = conn.query_row(
-        "SELECT version FROM nswallet_properties LIMIT 1",
-        [],
-        |row| row.get(0),
-    ).unwrap_or_else(|_| "1".to_string());
-
-    Ok(version)
+    let conn = super::untrusted::open_untrusted(&db_path)?;
+    super::untrusted::read_db_version(&conn)
 }
 
 /// Check if a backup's database version is compatible.
@@ -186,14 +175,14 @@ fn compatible(backup_version: String, current_version: &str) -> Result<bool> {
 }
 
 /// Verify a password against a backup database, extracting into the given
-/// app-writable temp base folder.
+/// app-writable temp base folder. The extracted copy is checked and read
+/// through a read-only connection (see [`inspect_backup_in`]); nothing in it
+/// is changed.
 pub fn check_backup_password_in(backup_path: &Path, password: &str, temp_base: &Path) -> Result<bool> {
-    use crate::business::Wallet;
-
     let temp_dir = temp_dir_in(temp_base)?;
-    extract_backup(backup_path, temp_dir.path())?;
-    let wallet = Wallet::open(temp_dir.path())?;
-    wallet.check_password(password)
+    let db_path = extract_backup(backup_path, temp_dir.path())?;
+    let conn = super::untrusted::open_untrusted(&db_path)?;
+    crate::business::wallet::check_password_on(&conn, password)
 }
 
 /// What a backup holds, read without its password. Lets an app warn before a
@@ -214,17 +203,18 @@ pub struct BackupInspection {
 /// Inspect a backup without its password, extracting into the given
 /// app-writable temp base folder. Item and field types are stored unencrypted,
 /// so counting needs no key.
+///
+/// The backup's database is untrusted: before any query it must carry the
+/// SQLite header, pass `PRAGMA quick_check` and hold its wallet tables as real
+/// tables. It is opened read-only, with SQLite's defensive mode on, the schema
+/// untrusted and a fixed work budget, so a crafted file fails with an error
+/// instead of running for long.
 pub fn inspect_backup_in(backup_path: &Path, temp_base: &Path) -> Result<BackupInspection> {
-    use rusqlite::{Connection, OpenFlags};
-
     let temp_dir = temp_dir_in(temp_base)?;
     let db_path = extract_backup(backup_path, temp_dir.path())?;
-    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| WalletError::DatabaseError(format!("Failed to open database: {}", e)))?;
+    let conn = super::untrusted::open_untrusted(&db_path)?;
 
-    let db_version: String = conn
-        .query_row("SELECT version FROM nswallet_properties LIMIT 1", [], |row| row.get(0))
-        .unwrap_or_else(|_| "1".to_string());
+    let db_version = super::untrusted::read_db_version(&conn)?;
     let item_count: u32 = conn.query_row(
         "SELECT COUNT(*) FROM nswallet_items
          WHERE COALESCE(deleted, 0) = 0 AND COALESCE(folder, 0) = 0 AND item_id <> ?1",
@@ -478,17 +468,11 @@ mod tests {
     #[test]
     fn a_backup_from_a_newer_database_version_is_not_compatible() {
         let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("future.db");
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE nswallet_properties (version TEXT);
-                 INSERT INTO nswallet_properties (version) VALUES ('999');",
-            )
-            .unwrap();
-        }
-        let backup_path = temp_dir.path().join("future.zip");
-        zip_with_db_entry(&backup_path, &fs::read(&db_path).unwrap());
+        let backup_path = zip_of_db(
+            temp_dir.path(),
+            "future.zip",
+            &format!("{MINIMAL_WALLET_SCHEMA} INSERT INTO nswallet_properties (version) VALUES ('999');"),
+        );
         let base = temp_dir.path().join("app_temp");
 
         assert!(!is_backup_compatible_in(&backup_path, "6", &base).unwrap());
@@ -498,13 +482,13 @@ mod tests {
     #[test]
     fn test_get_backup_db_version_in_uses_base() {
         let temp_dir = TempDir::new().unwrap();
-        let backup_path = create_test_backup(temp_dir.path());
+        let backup_path = zip_of_db(temp_dir.path(), "v.zip", MINIMAL_WALLET_SCHEMA);
 
         // App-controlled temp base that does not yet exist (must be created)
         let base = temp_dir.path().join("app_temp").join("nested");
         let version = get_backup_db_version_in(&backup_path, &base).unwrap();
 
-        // Dummy backup has no valid properties table → defaults to "1"
+        // No properties row → defaults to "1"
         assert_eq!(version, "1");
         assert!(base.exists(), "temp base folder should have been created");
     }
@@ -512,11 +496,92 @@ mod tests {
     #[test]
     fn test_is_backup_compatible_in() {
         let temp_dir = TempDir::new().unwrap();
-        let backup_path = create_test_backup(temp_dir.path());
+        let backup_path = zip_of_db(temp_dir.path(), "v.zip", MINIMAL_WALLET_SCHEMA);
         let base = temp_dir.path().join("app_temp");
 
         // version "1" backup is compatible with current "5"
         assert!(is_backup_compatible_in(&backup_path, "5", &base).unwrap());
+        assert!(is_backup_compatible(&backup_path, "5").unwrap());
+        assert_eq!(get_backup_db_version(&backup_path).unwrap(), "1");
+    }
+
+    /// Tables a wallet database must have, without anything else.
+    const MINIMAL_WALLET_SCHEMA: &str = "
+        CREATE TABLE nswallet_properties (database_id TEXT, version TEXT, email TEXT);
+        CREATE TABLE nswallet_items (item_id TEXT, name BLOB, deleted INT, folder INT);
+        CREATE TABLE nswallet_fields (item_id TEXT, type TEXT, value BLOB, deleted INT);";
+
+    /// Build an SQLite database from `sql` and wrap it in a backup zip.
+    fn zip_of_db(dir: &Path, zip_name: &str, sql: &str) -> PathBuf {
+        let db_path = dir.join(format!("{zip_name}.db"));
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(sql).unwrap();
+        }
+        let backup_path = dir.join(zip_name);
+        zip_with_db_entry(&backup_path, &fs::read(&db_path).unwrap());
+        backup_path
+    }
+
+    /// A backup whose `nswallet_items` is a view over a query without end.
+    fn endless_view_backup(dir: &Path) -> PathBuf {
+        zip_of_db(
+            dir,
+            "iwb-20261031-140053-manual.zip",
+            "CREATE TABLE nswallet_properties (database_id TEXT, version TEXT, email TEXT);
+             INSERT INTO nswallet_properties VALUES ('x', '6', NULL);
+             CREATE VIEW nswallet_items AS
+               WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r)
+               SELECT 'x' AS item_id, x'00' AS name, 0 AS deleted, 0 AS folder FROM r;
+             CREATE TABLE nswallet_fields (item_id TEXT, type TEXT, value BLOB, deleted INT);",
+        )
+    }
+
+    fn assert_quick_error<T: std::fmt::Debug>(what: &str, f: impl FnOnce() -> Result<T>) {
+        let started = std::time::Instant::now();
+        let r = f();
+        let took = started.elapsed();
+        assert!(r.is_err(), "{what} must fail, got {r:?}");
+        assert!(took < std::time::Duration::from_millis(500), "{what} took {took:?}");
+    }
+
+    #[test]
+    fn a_backup_with_an_endless_view_fails_fast_everywhere() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = endless_view_backup(temp_dir.path());
+        let base = temp_dir.path().join("tmp");
+
+        assert_quick_error("inspect", || inspect_backup_in(&backup_path, &base));
+        assert_quick_error("version", || get_backup_db_version_in(&backup_path, &base));
+        assert_quick_error("compatible", || is_backup_compatible_in(&backup_path, "6", &base));
+        assert_quick_error("password", || check_backup_password_in(&backup_path, "pw", &base));
+        // Nothing extracted is left behind.
+        assert_eq!(fs::read_dir(&base).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_backup_that_is_not_an_sqlite_database_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = create_test_backup(temp_dir.path());
+        let base = temp_dir.path().join("tmp");
+
+        assert!(matches!(inspect_backup_in(&backup_path, &base), Err(WalletError::BackupError(_))));
+        assert!(get_backup_db_version_in(&backup_path, &base).is_err());
+        assert!(check_backup_password_in(&backup_path, "pw", &base).is_err());
+    }
+
+    #[test]
+    fn a_backup_password_check_needs_something_to_verify_against() {
+        let temp_dir = TempDir::new().unwrap();
+        // A pre-v5 schema that `Wallet::open` would have migrated in place.
+        let backup_path = zip_of_db(
+            temp_dir.path(),
+            "old.zip",
+            &format!("{MINIMAL_WALLET_SCHEMA} INSERT INTO nswallet_properties VALUES ('id', '3', '0');"),
+        );
+        let base = temp_dir.path().join("tmp");
+        // No root and no data: the password cannot be verified.
+        assert!(check_backup_password_in(&backup_path, "pw", &base).is_err());
     }
 
     /// Test: CheckFutureVersionOfDb from C# BackupFixture

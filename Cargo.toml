@@ -16,7 +16,8 @@ exclude = ["docs", "fuzz"]
 
 [dependencies]
 # Database
-rusqlite = { version = "0.41.1", features = ["bundled"] }
+# `hooks`: the progress handler that bounds work on a backup's database.
+rusqlite = { version = "0.41.1", features = ["bundled", "hooks"] }
 
 # Crypto - current scheme (XChaCha20-Poly1305 + Argon2id)
 chacha20poly1305 = "0.11.0"

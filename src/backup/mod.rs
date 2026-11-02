@@ -4,6 +4,7 @@
 
 mod create;
 mod restore;
+pub(crate) mod untrusted;
 
 // Re-export version checking functions
 pub use restore::{
