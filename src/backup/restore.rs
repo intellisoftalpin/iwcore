@@ -39,9 +39,13 @@ fn entry_limit(max_bytes: u64, compressed_size: u64) -> u64 {
 /// grows past [`MAX_RESTORED_DB_BYTES`] or inflates more than 1000 times its
 /// compressed size (entries up to 1 MiB are exempt from the ratio). Only a
 /// complete, flushed copy replaces the database, by an atomic rename, so a
-/// failure at any point leaves the previous database untouched. Stale `-wal` /
-/// `-shm` files of the previous database are removed, since they do not
-/// belong to the restored one.
+/// failure at any point leaves the previous database untouched.
+///
+/// The `-wal`, `-shm` and `-journal` files of the previous database do not
+/// belong to the restored one. They are renamed aside before the rename and
+/// deleted after it; if the new database cannot be moved in, they are put
+/// back, so the previous database keeps everything it had. On Unix the
+/// folder is synced after the rename.
 ///
 /// The wallet using `db_path` must be closed while it is restored.
 pub fn restore_backup(backup_path: &Path, db_path: &Path) -> Result<()> {
@@ -49,6 +53,15 @@ pub fn restore_backup(backup_path: &Path, db_path: &Path) -> Result<()> {
 }
 
 fn restore_backup_capped(backup_path: &Path, db_path: &Path, max_bytes: u64) -> Result<()> {
+    restore_backup_with(backup_path, db_path, max_bytes, persist_temp)
+}
+
+fn restore_backup_with(
+    backup_path: &Path,
+    db_path: &Path,
+    max_bytes: u64,
+    persist: impl FnOnce(tempfile::NamedTempFile, &Path) -> io::Result<()>,
+) -> Result<()> {
     let file = File::open(backup_path)
         .map_err(|e| WalletError::BackupError(format!("Failed to open backup: {}", e)))?;
     let mut archive = ZipArchive::new(file)
@@ -102,24 +115,90 @@ fn restore_backup_capped(backup_path: &Path, db_path: &Path, max_bytes: u64) -> 
         .sync_all()
         .map_err(|e| WalletError::BackupError(format!("Failed to write database: {}", e)))?;
 
-    for suffix in ["-wal", "-shm"] {
-        let mut sidecar = db_path.as_os_str().to_owned();
-        sidecar.push(suffix);
-        match fs::remove_file(&sidecar) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(WalletError::BackupError(format!(
-                    "Failed to remove stale {} file: {}",
-                    suffix, e
-                )))
-            }
+    replace_database(temp, db_path, persist)
+}
+
+/// Files SQLite keeps beside a database. They belong to the database they
+/// were written for and must not survive into the restored one.
+const SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// Suffix of a sidecar moved aside while the database is replaced.
+const PARKED_SUFFIX: &str = ".pre-restore";
+
+/// `db_path` with `suffix` appended to its file name.
+fn with_suffix(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut name = db_path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Move the sidecars in `parked` back to their own names. Best effort: it
+/// runs only on a path that already reports an error.
+fn unpark(parked: &[(PathBuf, PathBuf)]) {
+    for (sidecar, aside) in parked.iter().rev() {
+        let _ = fs::rename(aside, sidecar);
+    }
+}
+
+/// Put `temp` in place of `db_path`. The previous database's sidecars are
+/// first renamed aside (`<name>-wal.pre-restore` and so on), then the new
+/// file is moved in, then the parked sidecars are deleted. If moving them
+/// aside or moving the new file in fails, the sidecars go back to their names,
+/// so the previous database stays complete.
+fn replace_database(
+    temp: tempfile::NamedTempFile,
+    db_path: &Path,
+    persist: impl FnOnce(tempfile::NamedTempFile, &Path) -> io::Result<()>,
+) -> Result<()> {
+    let mut parked: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for suffix in SIDECAR_SUFFIXES {
+        let sidecar = with_suffix(db_path, suffix);
+        if fs::symlink_metadata(&sidecar).is_err() {
+            continue;
         }
+        let aside = with_suffix(db_path, &format!("{suffix}{PARKED_SUFFIX}"));
+        let moved = match fs::remove_file(&aside) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => fs::rename(&sidecar, &aside),
+        };
+        if let Err(e) = moved {
+            unpark(&parked);
+            return Err(WalletError::BackupError(format!(
+                "Failed to move the {suffix} file aside: {e}"
+            )));
+        }
+        parked.push((sidecar, aside));
     }
 
-    temp.persist(db_path)
-        .map_err(|e| WalletError::BackupError(format!("Failed to write database: {}", e.error)))?;
+    if let Err(e) = persist(temp, db_path) {
+        unpark(&parked);
+        return Err(WalletError::BackupError(format!("Failed to write database: {e}")));
+    }
+    sync_parent_dir(db_path);
+
+    for (_, aside) in &parked {
+        let _ = fs::remove_file(aside);
+    }
     Ok(())
+}
+
+/// Move the finished temp file onto `db_path`.
+fn persist_temp(temp: tempfile::NamedTempFile, db_path: &Path) -> io::Result<()> {
+    temp.persist(db_path).map(drop).map_err(|e| e.error)
+}
+
+/// Flush the directory entry of a rename to disk, where the platform allows
+/// it. Best effort: the rename itself has already succeeded.
+fn sync_parent_dir(db_path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = db_path.parent() {
+        let dir = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+        if let Ok(f) = File::open(dir) {
+            let _ = f.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = db_path;
 }
 
 /// Extract a backup to a folder, returning the path to the extracted database
@@ -418,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_removes_stale_sidecars_of_the_previous_database() {
+    fn restore_removes_wal_and_shm_of_the_previous_database() {
         let temp_dir = TempDir::new().unwrap();
         let backup_path = create_test_backup(temp_dir.path());
         let db_path = temp_dir.path().join(DATABASE_FILENAME);
@@ -587,18 +666,127 @@ mod tests {
         assert_eq!(fs::read_to_string(&db_path).unwrap(), "OLD DATABASE");
     }
 
+    fn sidecar(dir: &Path, suffix: &str) -> PathBuf {
+        dir.join(format!("{DATABASE_FILENAME}{suffix}"))
+    }
+
+    /// An old database with all three sidecars, each holding its own name.
+    fn old_database_with_sidecars(dir: &Path) -> PathBuf {
+        let db_path = dir.join(DATABASE_FILENAME);
+        fs::write(&db_path, b"OLD DATABASE").unwrap();
+        for suffix in SIDECAR_SUFFIXES {
+            fs::write(sidecar(dir, suffix), suffix.as_bytes()).unwrap();
+        }
+        db_path
+    }
+
+    fn assert_old_database_intact(dir: &Path, db_path: &Path) {
+        assert_eq!(fs::read_to_string(db_path).unwrap(), "OLD DATABASE");
+        for suffix in SIDECAR_SUFFIXES {
+            assert_eq!(fs::read_to_string(sidecar(dir, suffix)).unwrap(), suffix, "{suffix}");
+            assert!(!sidecar(dir, &format!("{suffix}{PARKED_SUFFIX}")).exists(), "{suffix} parked");
+        }
+    }
+
     #[test]
-    fn a_sidecar_that_cannot_be_removed_fails_the_restore() {
+    fn restore_removes_every_sidecar_of_the_previous_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = create_test_backup(temp_dir.path());
+        let dir = temp_dir.path().join("w");
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = old_database_with_sidecars(&dir);
+
+        restore_backup(&backup_path, &db_path).unwrap();
+        assert_eq!(fs::read_to_string(&db_path).unwrap(), TEST_DB);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "only the database is left");
+    }
+
+    #[test]
+    fn a_failed_rename_keeps_the_previous_database_and_its_sidecars() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = create_test_backup(temp_dir.path());
+        let dir = temp_dir.path().join("w");
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = old_database_with_sidecars(&dir);
+
+        let err = restore_backup_with(&backup_path, &db_path, MAX_RESTORED_DB_BYTES, |_, _| {
+            Err(io::Error::other("simulated"))
+        })
+        .unwrap_err();
+        assert!(matches!(err, WalletError::BackupError(_)));
+        assert_old_database_intact(&dir, &db_path);
+        // The temp copy is gone as well.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1 + SIDECAR_SUFFIXES.len());
+    }
+
+    #[test]
+    fn a_sidecar_that_cannot_be_moved_aside_fails_the_restore() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = create_test_backup(temp_dir.path());
+        let dir = temp_dir.path().join("w");
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = old_database_with_sidecars(&dir);
+        // A non-empty folder where the parked `-shm` would go blocks it, after
+        // `-wal` has already been moved aside.
+        let blocker = sidecar(&dir, &format!("-shm{PARKED_SUFFIX}"));
+        fs::create_dir(&blocker).unwrap();
+        fs::write(blocker.join("x"), b"x").unwrap();
+
+        let err = restore_backup(&backup_path, &db_path).unwrap_err();
+        assert!(matches!(err, WalletError::BackupError(_)));
+        fs::remove_dir_all(&blocker).unwrap();
+        assert_old_database_intact(&dir, &db_path);
+    }
+
+    #[test]
+    fn a_stale_parked_sidecar_is_replaced() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = create_test_backup(temp_dir.path());
+        let dir = temp_dir.path().join("w");
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = old_database_with_sidecars(&dir);
+        fs::write(sidecar(&dir, &format!("-wal{PARKED_SUFFIX}")), b"stale").unwrap();
+
+        restore_backup(&backup_path, &db_path).unwrap();
+        assert_eq!(fs::read_to_string(&db_path).unwrap(), TEST_DB);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_parked_sidecar_that_cannot_be_deleted_does_not_fail_the_restore() {
         let temp_dir = TempDir::new().unwrap();
         let backup_path = create_test_backup(temp_dir.path());
         let db_path = temp_dir.path().join(DATABASE_FILENAME);
         fs::write(&db_path, b"OLD DATABASE").unwrap();
-        // A directory where the `-wal` file would be cannot be unlinked.
-        fs::create_dir(temp_dir.path().join(format!("{DATABASE_FILENAME}-wal"))).unwrap();
+        // A folder named like the `-wal` file is moved aside but is not a file.
+        fs::create_dir(sidecar(temp_dir.path(), "-wal")).unwrap();
 
-        let err = restore_backup(&backup_path, &db_path).unwrap_err();
-        assert!(matches!(err, WalletError::BackupError(_)));
-        assert_eq!(fs::read_to_string(&db_path).unwrap(), "OLD DATABASE");
+        restore_backup(&backup_path, &db_path).unwrap();
+        assert_eq!(fs::read_to_string(&db_path).unwrap(), TEST_DB);
+        assert!(!sidecar(temp_dir.path(), "-wal").exists());
+    }
+
+    #[test]
+    fn a_leftover_journal_of_the_previous_database_is_removed() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        // The backup: a database with one row.
+        let backup_path = zip_of_db(
+            dir,
+            "new.zip",
+            "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('restored');",
+        );
+        // The previous database plus a leftover rollback journal.
+        let db_path = dir.join("w").join(DATABASE_FILENAME);
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        fs::write(&db_path, b"OLD DATABASE").unwrap();
+        fs::write(with_suffix(&db_path, "-journal"), vec![0xD9u8; 4096]).unwrap();
+
+        restore_backup(&backup_path, &db_path).unwrap();
+        assert!(!with_suffix(&db_path, "-journal").exists());
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let v: String = conn.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, "restored");
     }
 
     #[test]
