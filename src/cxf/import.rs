@@ -19,11 +19,14 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use serde_json::{Map, Value};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use serde_json::value::RawValue;
 use zeroize::Zeroizing;
 
+use super::de::{Cred, Ef};
 use super::text::{self, Totp};
-use super::{parse, Header, Item, NEW_LABELS_MAX};
+use super::{parse, Header, Item, FIELDS_MAX, NEW_LABELS_MAX, SKIPPED_LISTED_MAX};
 use crate::autofill::identity;
 use crate::business::Wallet;
 use crate::error::{Result, WalletError};
@@ -49,6 +52,9 @@ pub struct KindCounts {
 }
 
 /// One credential that will not be imported, and why. Never carries a value.
+///
+/// A preview lists at most [`SKIPPED_LISTED_MAX`] of them; when there are more,
+/// one last entry with an empty title and type gives the number not listed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skipped {
     pub item_title: String,
@@ -112,15 +118,49 @@ struct PlannedFolder {
     parent: Option<usize>,
 }
 
+/// Skipped credentials: the first [`SKIPPED_LISTED_MAX`] one by one, the rest
+/// only counted.
+#[derive(Clone, Default)]
+struct SkipList {
+    listed: Vec<Skipped>,
+    more: usize,
+}
+
+impl SkipList {
+    fn push(&mut self, item_title: &str, credential_type: &str, reason: &str) {
+        if self.listed.len() < SKIPPED_LISTED_MAX {
+            self.listed.push(Skipped {
+                item_title: item_title.to_string(),
+                credential_type: credential_type.to_string(),
+                reason: reason.to_string(),
+            });
+        } else {
+            self.more = self.more.saturating_add(1);
+        }
+    }
+
+    fn into_vec(self) -> Vec<Skipped> {
+        let mut out = self.listed;
+        if self.more > 0 {
+            out.push(Skipped {
+                item_title: String::new(),
+                credential_type: String::new(),
+                reason: format!("{} more not listed", self.more),
+            });
+        }
+        out
+    }
+}
+
 struct Plan {
     exporter: String,
     folders: Vec<PlannedFolder>,
     items: Vec<PlannedItem>,
     counts: KindCounts,
-    skipped: Vec<Skipped>,
+    skipped: SkipList,
 }
 
-fn plan(header: &Header) -> Plan {
+fn plan(header: &Header<'_>) -> Result<Plan> {
     let date = chrono::DateTime::from_timestamp(header.timestamp as i64, 0)
         .filter(|_| header.timestamp > 0)
         .unwrap_or_else(chrono::Utc::now)
@@ -131,8 +171,9 @@ fn plan(header: &Header) -> Plan {
         folders: Vec::new(),
         items: Vec::new(),
         counts: KindCounts::default(),
-        skipped: Vec::new(),
+        skipped: SkipList::default(),
     };
+    let mut fields_total = 0usize;
     let several = header.accounts.len() > 1;
     for (n, account) in header.accounts.iter().enumerate() {
         let mut name = format!("Imported from {} {}", header.exporter_display_name, date);
@@ -145,11 +186,11 @@ fn plan(header: &Header) -> Plan {
 
         // An item linked from several collections lands in the first.
         let mut placement: HashMap<&str, usize> = HashMap::new();
-        fn walk<'a>(c: &'a super::Collection, parent: usize, p: &mut Plan, placement: &mut HashMap<&'a str, usize>) {
+        fn walk<'a>(c: &'a super::Collection<'_>, parent: usize, p: &mut Plan, placement: &mut HashMap<&'a str, usize>) {
             let idx = p.folders.len();
             p.folders.push(PlannedFolder { name: c.title.clone(), parent: Some(parent) });
             for id in &c.items {
-                placement.entry(id.as_str()).or_insert(idx);
+                placement.entry(id.as_ref()).or_insert(idx);
             }
             for s in &c.sub {
                 walk(s, idx, p, placement);
@@ -160,8 +201,12 @@ fn plan(header: &Header) -> Plan {
         }
 
         for item in &account.items {
-            let folder = placement.get(item.id.as_str()).copied().unwrap_or(top);
+            let folder = placement.get(item.id.as_ref()).copied().unwrap_or(top);
             let fields = map_item(item, &mut p.counts, &mut p.skipped);
+            fields_total = fields_total.saturating_add(fields.len());
+            if fields_total > FIELDS_MAX {
+                return Err(WalletError::InvalidInput("import would create more than 500 000 fields".into()));
+            }
             p.items.push(PlannedItem {
                 title: if item.title.is_empty() { "Untitled".into() } else { item.title.clone() },
                 folder,
@@ -169,14 +214,17 @@ fn plan(header: &Header) -> Plan {
             });
         }
     }
-    p
+    Ok(p)
 }
 
 /// The text of an editable field (`{"fieldType": ..., "value": ...}`).
-fn ef(cred: &Value, key: &str) -> Option<String> {
-    let v = cred.get(key)?.get("value")?.as_str()?;
+fn ef(cred: &Cred, key: &str) -> Option<String> {
+    ef_text(cred.ef(key)?)
+}
+
+fn ef_text(e: &Ef) -> Option<String> {
     // Values may span lines (an address, a recovery sheet); names never do.
-    let v = text::clean(v, text::VALUE_MAX, true);
+    let v = text::clean(e.value.as_deref()?, text::VALUE_MAX, true);
     (!v.trim().is_empty()).then_some(v)
 }
 
@@ -192,8 +240,8 @@ fn custom(name: &str, value_type: &'static str, value: String) -> PlannedField {
     }
 }
 
-fn skip(item: &Item, ty: &str, reason: &str, out: &mut Vec<Skipped>) {
-    out.push(Skipped { item_title: item.title.clone(), credential_type: ty.to_string(), reason: reason.to_string() });
+fn skip(item: &Item<'_>, ty: &str, reason: &str, out: &mut SkipList) {
+    out.push(&item.title, ty, reason);
 }
 
 /// Human label for a CXF member name: `issuingAuthority` → `Issuing authority`.
@@ -212,16 +260,19 @@ fn humanise(member: &str) -> String {
     out
 }
 
-fn map_item(item: &Item, counts: &mut KindCounts, skipped: &mut Vec<Skipped>) -> Vec<PlannedField> {
+fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) -> Vec<PlannedField> {
     let mut f: Vec<PlannedField> = Vec::new();
     for url in &item.urls {
+        let url = text::clean(url, text::VALUE_MAX, false);
         if !url.trim().is_empty() {
-            f.push(system("LINK", url.clone()));
+            f.push(system("LINK", url));
         }
     }
 
-    for cred in &item.credentials {
-        let ty = cred.get("type").and_then(Value::as_str).unwrap_or("");
+    for raw in &item.credentials {
+        // One credential at a time: only what this mapping reads is kept.
+        let cred = &Cred::read(raw);
+        let ty = cred.str("type").unwrap_or("");
         match ty {
             "basic-auth" => {
                 counts.logins += 1;
@@ -240,18 +291,18 @@ fn map_item(item: &Item, counts: &mut KindCounts, skipped: &mut Vec<Skipped>) ->
                 Err(reason) => skip(item, ty, &reason, skipped),
             },
             "totp" => {
-                let algorithm = cred.get("algorithm").and_then(Value::as_str).unwrap_or("sha1").to_ascii_uppercase();
-                let secret = cred.get("secret").and_then(Value::as_str).and_then(text::base32_secret);
+                let algorithm = cred.str("algorithm").unwrap_or("sha1").to_ascii_uppercase();
+                let secret = cred.str("secret").and_then(text::base32_secret);
                 match (secret, ["SHA1", "SHA256", "SHA512"].contains(&algorithm.as_str())) {
                     (Some(secret), true) => {
                         counts.totp += 1;
                         let t = Totp {
                             secret,
                             algorithm,
-                            digits: cred.get("digits").and_then(Value::as_u64).filter(|d| (4..=10).contains(d)).unwrap_or(6) as u32,
-                            period: cred.get("period").and_then(Value::as_u64).filter(|p| (1..=86_400).contains(p)).unwrap_or(30) as u32,
-                            issuer: cred.get("issuer").and_then(Value::as_str).map(text::name).filter(|s| !s.is_empty()),
-                            account: cred.get("username").and_then(Value::as_str).map(text::name).filter(|s| !s.is_empty()),
+                            digits: cred.u64("digits").filter(|d| (4..=10).contains(d)).unwrap_or(6) as u32,
+                            period: cred.u64("period").filter(|p| (1..=86_400).contains(p)).unwrap_or(30) as u32,
+                            issuer: cred.str("issuer").map(text::name).filter(|s| !s.is_empty()),
+                            account: cred.str("username").map(text::name).filter(|s| !s.is_empty()),
                         };
                         f.push(system("2FAC", text::totp_value(&t)));
                     }
@@ -260,7 +311,7 @@ fn map_item(item: &Item, counts: &mut KindCounts, skipped: &mut Vec<Skipped>) ->
                 }
             }
             "note" => {
-                if let Some(content) = cred.get("content").and_then(|c| c.get("value")).and_then(Value::as_str) {
+                if let Some(content) = cred.ef("content").and_then(|c| c.value.as_deref()) {
                     counts.notes += 1;
                     f.push(system("NOTE", text::clean(content, text::NOTE_MAX, true)));
                 }
@@ -347,15 +398,15 @@ fn map_item(item: &Item, counts: &mut KindCounts, skipped: &mut Vec<Skipped>) ->
                 }
             }
             "ssh-key" => {
-                let key = cred.get("privateKey").and_then(Value::as_str).and_then(|k| crate::passkey::b64::decode(k, "privateKey").ok());
+                let key = cred.str("privateKey").and_then(|k| crate::passkey::b64::decode(k, "privateKey").ok().map(Zeroizing::new));
                 match key {
                     Some(der) => {
                         counts.other += 1;
                         f.push(custom("SSH private key", "pass", text::pem_private_key(&der)));
-                        if let Some(t) = cred.get("keyType").and_then(Value::as_str) {
+                        if let Some(t) = cred.str("keyType") {
                             f.push(custom("Key type", "text", text::name(t)));
                         }
-                        if let Some(c) = cred.get("keyComment").and_then(Value::as_str) {
+                        if let Some(c) = cred.str("keyComment") {
                             f.push(custom("Key comment", "text", text::name(c)));
                         }
                         if let Some(d) = ef(cred, "creationDate") {
@@ -372,16 +423,19 @@ fn map_item(item: &Item, counts: &mut KindCounts, skipped: &mut Vec<Skipped>) ->
                 }
             }
             "drivers-license" | "passport" | "identity-document" => {
+                if cred.over {
+                    skip(item, ty, "more than 256 fields", skipped);
+                    continue;
+                }
                 counts.other += 1;
                 let number = match ty {
                     "drivers-license" => "licenseNumber",
                     "passport" => "passportNumber",
                     _ => "documentNumber",
                 };
-                let obj = cred.as_object().cloned().unwrap_or_default();
-                for (member, _) in obj.iter() {
-                    let Some(v) = ef(cred, member) else { continue };
-                    match member.as_str() {
+                for (member, e) in cred.efs() {
+                    let Some(v) = ef_text(e) else { continue };
+                    match member {
                         "fullName" => f.push(system("NAME", v)),
                         m if m == number => f.push(system("SNUM", v)),
                         "expiryDate" => f.push(system("EXPD", text::iso_date_to_vault(&v))),
@@ -392,25 +446,25 @@ fn map_item(item: &Item, counts: &mut KindCounts, skipped: &mut Vec<Skipped>) ->
                 }
             }
             "custom-fields" => {
-                let fields = cred.get("fields").and_then(Value::as_array).cloned().unwrap_or_default();
-                if fields.len() > super::CUSTOM_FIELDS_MAX {
+                let fields = cred.fields().map(|f| (f.list.as_slice(), f.over)).unwrap_or_default();
+                if fields.1 {
                     skip(item, ty, "more than 256 custom fields", skipped);
                     continue;
                 }
                 counts.other += 1;
-                let group = cred.get("label").and_then(Value::as_str).map(text::name).filter(|s| !s.is_empty());
-                for field in fields {
-                    let Some(v) = field.get("value").and_then(Value::as_str) else { continue };
+                let group = cred.str("label").map(text::name).filter(|s| !s.is_empty());
+                for field in fields.0 {
+                    let Some(v) = field.value.as_deref() else { continue };
                     let v = text::clean(v, text::VALUE_MAX, true);
                     let label = field
-                        .get("label")
-                        .and_then(Value::as_str)
+                        .label
+                        .as_deref()
                         .map(text::name)
                         .filter(|s| !s.is_empty())
                         .or_else(|| group.clone())
                         .unwrap_or_else(|| "Custom field".into());
                     // Unknown field types are read as text, so the data is kept.
-                    let (value_type, v) = match field.get("fieldType").and_then(Value::as_str) {
+                    let (value_type, v) = match field.field_type.as_deref() {
                         Some("concealed-string") => ("pass", v),
                         Some("date") => ("date", text::iso_date_to_vault(&v)),
                         _ => ("text", v),
@@ -418,7 +472,7 @@ fn map_item(item: &Item, counts: &mut KindCounts, skipped: &mut Vec<Skipped>) ->
                     f.push(custom(&label, value_type, v));
                 }
             }
-            "generated-password" => match cred.get("password").and_then(Value::as_str) {
+            "generated-password" => match cred.str("password") {
                 Some(p) if !p.is_empty() => {
                     counts.logins += 1;
                     f.push(custom("Generated password", "pass", text::clean(p, text::VALUE_MAX, false)));
@@ -436,10 +490,10 @@ fn map_item(item: &Item, counts: &mut KindCounts, skipped: &mut Vec<Skipped>) ->
         details.push(format!("Subtitle: {s}"));
     }
     if !item.tags.is_empty() {
-        details.push(format!("Tags: {}", item.tags.join(", ")));
+        details.push(format!("Tags: {}", item.tags.iter().map(|t| text::name(t)).collect::<Vec<_>>().join(", ")));
     }
     if !item.android_apps.is_empty() {
-        details.push(format!("Android apps: {}", item.android_apps.join(", ")));
+        details.push(format!("Android apps: {}", item.android_apps.iter().map(|a| text::name(a)).collect::<Vec<_>>().join(", ")));
     }
     if !details.is_empty() {
         f.push(custom("Imported details", "text", details.join("\n")));
@@ -447,24 +501,46 @@ fn map_item(item: &Item, counts: &mut KindCounts, skipped: &mut Vec<Skipped>) ->
     f
 }
 
+/// A CXF passkey as a stored record, before validation. Borrows every value.
+#[derive(Serialize)]
+struct CxfPasskey<'a> {
+    v: u64,
+    #[serde(rename = "credentialId")]
+    credential_id: &'a str,
+    #[serde(rename = "rpId")]
+    rp_id: &'a str,
+    #[serde(rename = "userName")]
+    user_name: &'a str,
+    #[serde(rename = "userDisplayName")]
+    user_display_name: &'a str,
+    #[serde(rename = "userHandle")]
+    user_handle: &'a str,
+    key: &'a str,
+    alg: i64,
+    #[serde(rename = "createdAt")]
+    created_at: i64,
+    #[serde(rename = "fido2Extensions", skip_serializing_if = "Option::is_none")]
+    fido2_extensions: Option<&'a RawValue>,
+}
+
 /// A CXF passkey as a `PKEY` field. Errors are reasons for the preview, never
 /// values.
-fn passkey_field(cred: &Value, item: &Item) -> std::result::Result<PlannedField, String> {
-    let s = |k: &str| cred.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
-    let mut stored = Map::new();
-    stored.insert("v".into(), 1.into());
-    stored.insert("credentialId".into(), s("credentialId").into());
-    stored.insert("rpId".into(), s("rpId").to_ascii_lowercase().into());
-    stored.insert("userName".into(), s("username").into());
-    stored.insert("userDisplayName".into(), s("userDisplayName").into());
-    stored.insert("userHandle".into(), s("userHandle").into());
-    stored.insert("key".into(), Zeroizing::new(s("key")).as_str().into());
-    stored.insert("alg".into(), crate::passkey::ALG_ES256.into());
-    stored.insert("createdAt".into(), item.creation_at.unwrap_or(0).into());
-    if let Some(ext) = cred.get("fido2Extensions").filter(|e| e.is_object()) {
-        stored.insert("fido2Extensions".into(), ext.clone());
-    }
-    let text = Zeroizing::new(Value::Object(stored).to_string());
+fn passkey_field(cred: &Cred, item: &Item<'_>) -> std::result::Result<PlannedField, String> {
+    let s = |k: &str| cred.str(k).unwrap_or_default();
+    let rp_id = s("rpId").to_ascii_lowercase();
+    let stored = CxfPasskey {
+        v: 1,
+        credential_id: s("credentialId"),
+        rp_id: &rp_id,
+        user_name: s("username"),
+        user_display_name: s("userDisplayName"),
+        user_handle: s("userHandle"),
+        key: s("key"),
+        alg: crate::passkey::ALG_ES256,
+        created_at: item.creation_at.unwrap_or(0),
+        fido2_extensions: cred.raw("fido2Extensions"),
+    };
+    let text = super::to_json(&stored).map_err(|_| "passkey could not be stored".to_string())?;
     match PasskeyRecord::from_field_value(&text) {
         Ok(r) => Ok(PlannedField {
             kind: Kind::System(FIELD_PASSKEY),
@@ -479,16 +555,38 @@ fn passkey_field(cred: &Value, item: &Item) -> std::result::Result<PlannedField,
 
 // --- against the vault --------------------------------------------------------
 
-/// Content fingerprint: the title plus every (field kind, value) pair, and
-/// passkeys by credential id. Two items with the same fingerprint hold the same
-/// data, however they were exported.
-type Fingerprint = (String, BTreeSet<(String, String)>);
+/// Content fingerprint: a digest of the title plus the set of (field kind,
+/// value) pairs, passkeys by credential id. Two items with the same
+/// fingerprint hold the same data, however they were exported. Only digests
+/// are kept, so comparing never copies a value.
+type Fingerprint = [u8; 32];
+
+/// Digest of one (field kind, value) pair.
+fn pair_digest(kind: &str, value: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update((kind.len() as u64).to_le_bytes());
+    h.update(kind.as_bytes());
+    h.update(value);
+    h.finalize().into()
+}
+
+/// Fingerprint of a title and its pair digests; a set, so order and
+/// repetition do not matter.
+fn fingerprint(title: &str, pairs: &BTreeSet<[u8; 32]>) -> Fingerprint {
+    let mut h = Sha256::new();
+    h.update((title.len() as u64).to_le_bytes());
+    h.update(title.as_bytes());
+    for p in pairs {
+        h.update(p);
+    }
+    h.finalize().into()
+}
 
 impl Wallet {
     /// Parse and map a CXF payload and compare it with the vault. Writes nothing.
     pub fn preview_cxf(&mut self, json: &str) -> Result<ImportPreview> {
         let header = parse(json)?;
-        let plan = plan(&header);
+        let plan = plan(&header)?;
         Ok(self.assess(&plan)?.0)
     }
 
@@ -496,7 +594,7 @@ impl Wallet {
     /// transaction. Existing items are never modified.
     pub fn import_cxf(&mut self, json: &str, options: &ImportOptions) -> Result<ImportReport> {
         let header = parse(json)?;
-        let mut plan = plan(&header);
+        let mut plan = plan(&header)?;
         let (preview, keep, drop_passkeys) = self.assess(&plan)?;
 
         let backup_path = crate::backup::BackupManager::new(&options.backup_folder)
@@ -529,9 +627,9 @@ impl Wallet {
             exporter: plan.exporter.clone(),
             destination_folders: plan.folders.iter().filter(|f| f.parent.is_none()).map(|f| f.name.clone()).collect(),
             counts: plan.counts.clone(),
-            skipped: plan.skipped.clone(),
             ..Default::default()
         };
+        let mut skipped = plan.skipped.clone();
         let mut keep = HashSet::new();
         let mut seen_in_payload: HashSet<Fingerprint> = HashSet::new();
         let mut new_labels: BTreeSet<(String, &'static str)> = BTreeSet::new();
@@ -546,11 +644,7 @@ impl Wallet {
                 if let Some(id) = &f.passkey_id
                     && held.contains(id)
                 {
-                    preview.skipped.push(Skipped {
-                        item_title: item.title.clone(),
-                        credential_type: "passkey".into(),
-                        reason: "this passkey is already in the vault".into(),
-                    });
+                    skipped.push(&item.title, "passkey", "this passkey is already in the vault");
                 }
                 if let Kind::Custom { name, value_type } = &f.kind
                     && !existing_custom.contains(&(name.to_lowercase(), value_type.to_string()))
@@ -563,6 +657,7 @@ impl Wallet {
             return Err(WalletError::InvalidInput("import would create more than 200 custom field labels".into()));
         }
         preview.items = keep.len();
+        preview.skipped = skipped.into_vec();
         preview.new_labels = plan
             .items
             .iter()
@@ -578,27 +673,30 @@ impl Wallet {
     }
 
     fn vault_fingerprints(&mut self, system: &HashSet<String>) -> Result<HashSet<Fingerprint>> {
-        let items: Vec<_> = self.get_items()?.iter().filter(|i| !i.deleted && !i.folder).cloned().collect();
-        let fields = self.get_fields()?.to_vec();
-        let mut by_item: HashMap<&str, BTreeSet<(String, String)>> = HashMap::new();
-        for f in fields.iter().filter(|f| !f.deleted) {
-            let key = if f.field_type == FIELD_PASSKEY {
-                let id = self
-                    .passkey_record(&f.item_id, &f.field_id)?
-                    .map(|r| crate::passkey::b64::encode(&r.credential_id))
-                    .unwrap_or_default();
-                (format!("sys:{FIELD_PASSKEY}"), id)
-            } else if system.contains(&f.field_type) {
-                (format!("sys:{}", f.field_type), f.value.clone())
-            } else {
-                (format!("custom:{}:{}", f.label.to_lowercase(), f.value_type), f.value.clone())
-            };
-            by_item.entry(f.item_id.as_str()).or_default().insert(key);
-        }
-        Ok(items
+        let items: Vec<(String, String)> =
+            self.get_items()?.iter().filter(|i| !i.deleted && !i.folder).map(|i| (i.item_id.clone(), i.name.clone())).collect();
+        // Passkeys by credential id, read before the fields are borrowed.
+        let pkeys: Vec<(String, String)> = self
+            .get_fields()?
             .iter()
-            .map(|i| (i.name.clone(), by_item.remove(i.item_id.as_str()).unwrap_or_default()))
-            .collect())
+            .filter(|f| !f.deleted && f.field_type == FIELD_PASSKEY)
+            .map(|f| (f.item_id.clone(), f.field_id.clone()))
+            .collect();
+        let mut by_item: HashMap<String, BTreeSet<[u8; 32]>> = HashMap::new();
+        let passkey_kind = format!("sys:{FIELD_PASSKEY}");
+        for (item_id, field_id) in pkeys {
+            let id = self.passkey_record(&item_id, &field_id)?.map(|r| crate::passkey::b64::encode(&r.credential_id)).unwrap_or_default();
+            by_item.entry(item_id).or_default().insert(pair_digest(&passkey_kind, id.as_bytes()));
+        }
+        for f in self.get_fields()?.iter().filter(|f| !f.deleted && f.field_type != FIELD_PASSKEY) {
+            let kind = if system.contains(&f.field_type) {
+                format!("sys:{}", f.field_type)
+            } else {
+                format!("custom:{}:{}", f.label.to_lowercase(), f.value_type)
+            };
+            by_item.entry(f.item_id.clone()).or_default().insert(pair_digest(&kind, f.value.as_bytes()));
+        }
+        Ok(items.iter().map(|(id, name)| fingerprint(name, &by_item.remove(id).unwrap_or_default())).collect())
     }
 
     /// Write the plan. Runs inside the import transaction.
@@ -676,19 +774,95 @@ impl Wallet {
 }
 
 fn planned_fingerprint(item: &PlannedItem) -> Fingerprint {
-    let set = item
+    let pairs = item
         .fields
         .iter()
         .map(|f| match (&f.kind, &f.passkey_id) {
-            (_, Some(id)) => (format!("sys:{FIELD_PASSKEY}"), crate::passkey::b64::encode(id)),
-            (Kind::System(code), None) => (format!("sys:{code}"), f.value.to_string()),
-            (Kind::Custom { name, value_type }, None) => (format!("custom:{}:{}", name.to_lowercase(), value_type), f.value.to_string()),
+            (_, Some(id)) => pair_digest(&format!("sys:{FIELD_PASSKEY}"), crate::passkey::b64::encode(id).as_bytes()),
+            (Kind::System(code), None) => pair_digest(&format!("sys:{code}"), f.value.as_bytes()),
+            (Kind::Custom { name, value_type }, None) => pair_digest(&format!("custom:{}:{}", name.to_lowercase(), value_type), f.value.as_bytes()),
         })
         .collect();
-    (item.title.clone(), set)
+    fingerprint(&item.title, &pairs)
 }
 
 /// Convenience for callers holding a path to the backup folder.
 pub fn options(backup_folder: &Path) -> ImportOptions {
     ImportOptions { backup_folder: backup_folder.to_path_buf() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(items: &str) -> String {
+        format!(r#"{{"version": {{"major": 1}}, "exporterDisplayName": "X", "accounts": [{{"id": "a", "items": [{items}]}}]}}"#)
+    }
+
+    #[test]
+    fn skipped_credentials_are_listed_up_to_the_limit_then_counted() {
+        let mut list = SkipList::default();
+        for _ in 0..SKIPPED_LISTED_MAX {
+            list.push("t", "file", "r");
+        }
+        assert_eq!(list.clone().into_vec().len(), SKIPPED_LISTED_MAX, "no summary at the limit");
+        list.push("t", "file", "r");
+        list.push("t", "file", "r");
+        let v = list.into_vec();
+        assert_eq!(v.len(), SKIPPED_LISTED_MAX + 1);
+        let last = v.last().unwrap();
+        assert_eq!((last.item_title.as_str(), last.credential_type.as_str(), last.reason.as_str()), ("", "", "2 more not listed"));
+    }
+
+    #[test]
+    fn the_plan_refuses_more_than_the_field_limit() {
+        let item = |urls: usize| format!(r#"{{"title": "t", "scope": {{"urls": [{}]}}}}"#, vec![r#""u""#; urls].join(","));
+        let per_item = 250;
+        let n = FIELDS_MAX / per_item;
+        let mut items = vec![item(per_item); n];
+        let at = doc(&items.join(","));
+        let p = plan(&parse(&at).unwrap()).unwrap();
+        assert_eq!(p.items.iter().map(|i| i.fields.len()).sum::<usize>(), FIELDS_MAX);
+        items.push(item(1));
+        let over = doc(&items.join(","));
+        assert!(matches!(plan(&parse(&over).unwrap()), Err(WalletError::InvalidInput(m)) if m.contains("500 000 fields")));
+    }
+
+    #[test]
+    fn an_identity_document_with_too_many_fields_is_skipped() {
+        let fields = |n: usize| (0..n).map(|i| format!(r#""m{i}": {{"value": "v"}}"#)).collect::<Vec<_>>().join(",");
+        let at = doc(&format!(r#"{{"title": "P", "credentials": [{{"type": "passport", {}}}]}}"#, fields(CUSTOM_FIELDS_MAX_FOR_TEST)));
+        let p = plan(&parse(&at).unwrap()).unwrap();
+        assert_eq!(p.items[0].fields.len(), CUSTOM_FIELDS_MAX_FOR_TEST);
+        assert_eq!(p.counts.other, 1);
+        let over = doc(&format!(r#"{{"title": "P", "credentials": [{{"type": "passport", {}}}]}}"#, fields(CUSTOM_FIELDS_MAX_FOR_TEST + 1)));
+        let p = plan(&parse(&over).unwrap()).unwrap();
+        assert!(p.items[0].fields.is_empty());
+        assert_eq!(p.counts.other, 0);
+        let skipped = p.skipped.into_vec();
+        assert_eq!((skipped[0].credential_type.as_str(), skipped[0].reason.as_str()), ("passport", "more than 256 fields"));
+    }
+
+    const CUSTOM_FIELDS_MAX_FOR_TEST: usize = super::super::CUSTOM_FIELDS_MAX;
+
+    #[test]
+    fn a_passkey_record_is_built_without_a_json_tree() {
+        // Extensions are carried over verbatim, and only when they are an object.
+        let c = r#"{"type": "passkey", "credentialId": "AAAAAAAAAAAAAAAAAAAAAA", "rpId": "Example.COM", "userHandle": "aA", "key": "x",
+                    "fido2Extensions": {"a": [1, 2]}}"#;
+        let raw: &RawValue = serde_json::from_str(c).unwrap();
+        let cred = Cred::read(raw);
+        let stored = CxfPasskey {
+            v: 1, credential_id: cred.str("credentialId").unwrap(), rp_id: "example.com", user_name: "", user_display_name: "",
+            user_handle: cred.str("userHandle").unwrap(), key: cred.str("key").unwrap(), alg: -7, created_at: 0,
+            fido2_extensions: cred.raw("fido2Extensions"),
+        };
+        let text = super::super::to_json(&stored).unwrap();
+        assert!(text.ends_with(r#""createdAt":0,"fido2Extensions":{"a": [1, 2]}}"#), "{}", &*text);
+        let item = Item::default();
+        // The key is not a P-256 key: refused with a reason that carries no value.
+        let reason = passkey_field(&cred, &item).err().unwrap();
+        assert!(reason.starts_with("passkey is not usable"), "{reason}");
+        assert!(!reason.contains("AAAAAAAA"));
+    }
 }
