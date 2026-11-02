@@ -90,16 +90,33 @@ fn legacy_encryption_count(email: Option<&str>) -> u32 {
     email.and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
+/// KDF name stored in the crypto record of a v6 vault.
+const KDF_ARGON2ID: &str = "argon2id";
+
 /// Derive the KEK from `password` using the record's stored params and try
 /// to unwrap the DEK. Returns the DEK on success, `None` on wrong password.
-fn unwrap_with_password(rec: &CryptoRecord, password: &str) -> Option<[u8; DEK_LEN]> {
+///
+/// The record is checked first: an unknown scheme or KDF, or cost parameters
+/// outside [`crypto::kdf::KdfParams::check_stored`], are an error and no
+/// derivation is attempted.
+fn unwrap_with_password(rec: &CryptoRecord, password: &str) -> Result<Option<[u8; DEK_LEN]>> {
+    if rec.scheme != CRYPTO_SCHEME_V6 {
+        return Err(WalletError::NotSupported(format!("crypto scheme {}", rec.scheme)));
+    }
+    if rec.kdf != KDF_ARGON2ID {
+        return Err(WalletError::NotSupported("key derivation function".to_string()));
+    }
     let params = crypto::kdf::KdfParams {
         m_cost_kib: rec.m_cost_kib,
         t_cost: rec.t_cost,
         p_cost: rec.p_cost,
     };
-    let kek = crypto::kdf::derive_kek(password.as_bytes(), &rec.salt, params).ok()?;
-    crypto::dek::unwrap_dek(&kek, &rec.dek_wrapped).ok()
+    params
+        .check_stored()
+        .map_err(|e| WalletError::InvalidInput(format!("crypto record: {e}")))?;
+    let kek = crypto::kdf::derive_kek(password.as_bytes(), &rec.salt, params)
+        .map_err(|e| WalletError::InvalidInput(format!("crypto record: {e}")))?;
+    Ok(crypto::dek::unwrap_dek(&kek, &rec.dek_wrapped).ok())
 }
 
 /// Verify a password against a sample of active data blobs (used when the
@@ -128,7 +145,7 @@ pub(crate) fn check_password_on(conn: &rusqlite::Connection, password: &str) -> 
     let root_blob = queries::get_root_item_raw(conn)?;
 
     if let Some(rec) = crypto_rec {
-        Ok(unwrap_with_password(&rec, password).is_some())
+        Ok(unwrap_with_password(&rec, password)?.is_some())
     } else {
         let encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()));
         let mut key_chain = crypto::legacy::LegacyKeyChain::new(password, encryption_count);
@@ -258,7 +275,7 @@ impl Wallet {
             queries::set_properties(conn, &db_id, lang, DB_VERSION, 0)?;
             queries::set_crypto_record(conn, &CryptoRecord {
                 scheme: CRYPTO_SCHEME_V6,
-                kdf: "argon2id".to_string(),
+                kdf: KDF_ARGON2ID.to_string(),
                 m_cost_kib: params.m_cost_kib,
                 t_cost: params.t_cost,
                 p_cost: params.p_cost,
@@ -297,7 +314,7 @@ impl Wallet {
 
         if let Some(rec) = crypto_rec {
             // v6 vault: derive KEK from the stored params and unwrap the DEK.
-            match unwrap_with_password(&rec, password) {
+            match unwrap_with_password(&rec, password)? {
                 Some(dek) => {
                     self.unlocked = Some(Unlocked { dek: Zeroizing::new(dek) });
                     self.clear_caches();
@@ -596,7 +613,7 @@ impl Wallet {
             .connection()?;
         queries::set_crypto_record(conn, &CryptoRecord {
             scheme: CRYPTO_SCHEME_V6,
-            kdf: "argon2id".to_string(),
+            kdf: KDF_ARGON2ID.to_string(),
             m_cost_kib: params.m_cost_kib,
             t_cost: params.t_cost,
             p_cost: params.p_cost,
@@ -819,7 +836,7 @@ impl Wallet {
 
             queries::set_crypto_record(conn, &CryptoRecord {
                 scheme: CRYPTO_SCHEME_V6,
-                kdf: "argon2id".to_string(),
+                kdf: KDF_ARGON2ID.to_string(),
                 m_cost_kib: params.m_cost_kib,
                 t_cost: params.t_cost,
                 p_cost: params.p_cost,
@@ -913,6 +930,48 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let wallet = Wallet::create(temp_dir.path(), "TestPassword123", "en").unwrap();
         (wallet, temp_dir)
+    }
+
+    /// A closed v6 wallet whose crypto record was then changed by `sql`.
+    fn wallet_with_crypto_record_changed(sql: &str) -> (TempDir, std::path::PathBuf) {
+        let (wallet, temp) = create_test_wallet();
+        let folder = wallet.folder().to_path_buf();
+        drop(wallet);
+        let conn = rusqlite::Connection::open(folder.join(DATABASE_FILENAME)).unwrap();
+        conn.execute_batch(sql).unwrap();
+        (temp, folder)
+    }
+
+    #[test]
+    fn a_crypto_record_outside_the_bounds_is_an_error_not_a_derivation() {
+        for sql in [
+            "UPDATE nswallet_crypto SET kdf_m_cost = 4194304",
+            "UPDATE nswallet_crypto SET kdf_t_cost = 1000000",
+            "UPDATE nswallet_crypto SET kdf_p_cost = 0",
+            "UPDATE nswallet_crypto SET kdf_p_cost = 255",
+            "UPDATE nswallet_crypto SET kdf_m_cost = -1",
+            "UPDATE nswallet_crypto SET kdf_t_cost = 4294967296",
+            "UPDATE nswallet_crypto SET kdf = 'scrypt'",
+            "UPDATE nswallet_crypto SET scheme = 2",
+            "UPDATE nswallet_crypto SET kdf_salt = x'00'",
+        ] {
+            let (_temp, folder) = wallet_with_crypto_record_changed(sql);
+            let mut wallet = Wallet::open(&folder).unwrap();
+            let started = std::time::Instant::now();
+            assert!(wallet.check_password("TestPassword123").is_err(), "{sql}");
+            assert!(wallet.unlock("TestPassword123").is_err(), "{sql}");
+            assert!(!wallet.is_unlocked());
+            assert!(started.elapsed() < std::time::Duration::from_secs(2), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_crypto_record_within_the_bounds_still_unlocks() {
+        let (_temp, folder) = wallet_with_crypto_record_changed("UPDATE nswallet_crypto SET kdf_p_cost = 1");
+        let mut wallet = Wallet::open(&folder).unwrap();
+        assert!(wallet.check_password("TestPassword123").unwrap());
+        assert!(!wallet.check_password("wrong").unwrap());
+        assert!(wallet.unlock("TestPassword123").unwrap());
     }
 
     #[test]

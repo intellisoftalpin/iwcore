@@ -83,3 +83,26 @@ fn verify_backup_rejects_non_zip() {
     let ok = mgr.verify_backup(&bad).unwrap_or(false);
     assert!(!ok, "a non-zip file must not verify as a valid backup");
 }
+
+#[test]
+fn check_backup_password_refuses_kdf_settings_outside_the_bounds() {
+    for sql in [
+        "UPDATE nswallet_crypto SET kdf_m_cost = 4194304",
+        "UPDATE nswallet_crypto SET kdf_t_cost = 1000000",
+        "UPDATE nswallet_crypto SET kdf_p_cost = -1",
+        "UPDATE nswallet_crypto SET kdf = 'pbkdf2'",
+    ] {
+        let (_t, folder) = wallet_with_data();
+        let db = folder.join("nswallet.dat");
+        rusqlite::Connection::open(&db).unwrap().execute_batch(sql).unwrap();
+        let backups = TempDir::new().unwrap();
+        let zip = BackupManager::new(backups.path())
+            .create_backup_from_path(&db, true)
+            .unwrap();
+
+        let tmp_base = TempDir::new().unwrap();
+        let started = std::time::Instant::now();
+        assert!(check_backup_password_in(&zip, PASSWORD, tmp_base.path()).is_err(), "{sql}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{sql}");
+    }
+}
