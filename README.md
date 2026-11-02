@@ -70,7 +70,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-iwcore = "0.5"
+iwcore = "0.6"
 ```
 
 Or use cargo:
