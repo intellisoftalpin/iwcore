@@ -38,13 +38,12 @@ pub fn prepare_key(password: &str, hash: Option<&str>, re_encryption_count: u32)
         derive_key_from_password(password, re_encryption_count)
     };
 
-    // Convert to UTF-8 bytes and ensure exactly 32 bytes
-    let key_bytes = key_string.as_bytes();
+    // Convert to UTF-8 bytes and ensure exactly 32 bytes: copy up to
+    // KEY_LENGTH bytes, zero-pad the rest.
     let mut key = [0u8; KEY_LENGTH];
-
-    // Copy up to KEY_LENGTH bytes
-    let copy_len = std::cmp::min(key_bytes.len(), KEY_LENGTH);
-    key[..copy_len].copy_from_slice(&key_bytes[..copy_len]);
+    for (dst, src) in key.iter_mut().zip(key_string.as_bytes()) {
+        *dst = *src;
+    }
 
     key
 }
@@ -114,6 +113,20 @@ mod tests {
         let hash = "12345678901234567890123456789012";
         let key = prepare_key("ignored", Some(hash), 1);
         assert_eq!(&key[..], hash.as_bytes());
+    }
+
+    #[test]
+    fn test_key_short_hash_is_zero_padded() {
+        let key = prepare_key("ignored", Some("abc"), 1);
+        assert_eq!(&key[..3], b"abc");
+        assert!(key[3..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn test_key_multibyte_password_truncates_to_32_bytes() {
+        // 32 Cyrillic chars = 64 UTF-8 bytes; only the first 32 bytes are kept.
+        let key = prepare_key("ж", None, 0);
+        assert_eq!(&key[..], "ж".repeat(16).as_bytes());
     }
 
     #[test]

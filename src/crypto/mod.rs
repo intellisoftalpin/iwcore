@@ -8,6 +8,8 @@
 //! original C# implementation - is retained under [`legacy`] solely for the
 //! one-time v5->v6 migration and for verifying not-yet-migrated vaults.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+
 mod aes;
 mod md5;
 mod key;

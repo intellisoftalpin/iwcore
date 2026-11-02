@@ -31,12 +31,8 @@ pub fn wrap_dek(kek: &[u8; KEY_LEN], dek: &[u8; DEK_LEN]) -> Result<Vec<u8>, Str
 /// incorrect) or the wrapped blob is malformed/tampered.
 pub fn unwrap_dek(kek: &[u8; KEY_LEN], wrapped: &[u8]) -> Result<[u8; DEK_LEN], String> {
     let pt = aead::open(kek, wrapped)?;
-    if pt.len() != DEK_LEN {
-        return Err("unwrapped DEK has wrong length".to_string());
-    }
-    let mut dek = [0u8; DEK_LEN];
-    dek.copy_from_slice(&pt);
-    Ok(dek)
+    <[u8; DEK_LEN]>::try_from(pt.as_slice())
+        .map_err(|_| "unwrapped DEK has wrong length".to_string())
 }
 
 #[cfg(test)]
