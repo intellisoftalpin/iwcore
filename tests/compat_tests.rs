@@ -340,7 +340,7 @@ fn a_restored_old_backup_gains_passkeys_and_backs_them_up() {
             record_id: "r".into(), op: PendingOp::CreatePasskey, item_id: None, title: "example.com".into(),
             url: "https://example.com".into(), identity_value: "bkv".into(), identity_hint: None,
             password: String::new(), totp_secret: None, created_at: 0,
-            passkey: Some(reg.record.to_field_value().unwrap().to_string()),
+            passkey: reg.pending_record("example.com", 0).unwrap().passkey,
         };
         let j = journal::seal_record(&record, &keys.journal_public, &keys.index_key).unwrap();
         let s = wallet.drain_autofill_journal(&j, &keys.journal_secret, None).unwrap();

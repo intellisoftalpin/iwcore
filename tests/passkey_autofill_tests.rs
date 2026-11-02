@@ -44,7 +44,7 @@ fn stage(keys: &AutofillKeys, rp: &str, user: &str, handle: &[u8]) -> (Vec<u8>, 
         password: String::new(),
         totp_secret: None,
         created_at: 1_793_433_600,
-        passkey: Some(reg.record.to_field_value().unwrap().to_string()),
+        passkey: reg.pending_record(rp, 1_793_433_600).unwrap().passkey,
     };
     let bytes = journal::seal_record(&record, &keys.journal_public, &keys.index_key).unwrap();
     (bytes, reg.record)

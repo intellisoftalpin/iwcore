@@ -69,6 +69,11 @@ proptest = "1.12.0"
 [features]
 default = []
 
+# `cargo fuzz` builds every crate with `--cfg fuzzing`; a few hooks for the
+# fuzz targets exist only then (never in a normal build).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
 # Mutation testing (release-gate.yml): the test build with optimisation, so the
 # Argon2id key derivation behind every test wallet takes milliseconds instead of
 # seconds and a full test run fits the per-mutant timeout.

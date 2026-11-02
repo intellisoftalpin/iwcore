@@ -12,7 +12,8 @@ use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use zeroize::Zeroizing;
 
 use super::record::{PasskeyRecord, PrfSecrets};
-use super::webauthn;
+use super::{b64, webauthn};
+use crate::autofill::{PendingOp, PendingRecord};
 use crate::error::{Result, WalletError};
 
 /// Length of the credential ids IntelliWallet creates.
@@ -47,6 +48,36 @@ pub struct Registration {
     pub public_key_cose: Vec<u8>,
     /// SubjectPublicKeyInfo DER, which Android's response JSON carries.
     pub public_key_spki: Vec<u8>,
+}
+
+impl Registration {
+    /// The AutoFill journal record that stages this passkey until the app
+    /// drains it into the vault.
+    ///
+    /// This is the only way the stored passkey (private key and PRF secrets
+    /// included) leaves the passkey module for a provider: straight into the
+    /// journal, which seals it. `title` is the item name to suggest (the
+    /// site's `rp.name`); an empty one falls back to the rpId. The account is
+    /// the passkey's user name, or its display name when the site sent no name.
+    pub fn pending_record(&self, title: &str, now: i64) -> Result<PendingRecord> {
+        let r = &self.record;
+        let mut stored = r.to_field_value()?;
+        let account = if r.user_name.is_empty() { &r.user_display_name } else { &r.user_name };
+        Ok(PendingRecord {
+            record_id: format!("passkey-{}", b64::encode(&self.credential_id)),
+            op: PendingOp::CreatePasskey,
+            item_id: None,
+            title: if title.is_empty() { r.rp_id.clone() } else { title.to_string() },
+            url: format!("https://{}", r.rp_id),
+            identity_value: account.clone(),
+            identity_hint: None,
+            password: String::new(),
+            totp_secret: None,
+            created_at: now,
+            // Moved out of the wiping wrapper, not copied.
+            passkey: Some(std::mem::take(&mut *stored)),
+        })
+    }
 }
 
 /// A sign-in response.
@@ -258,6 +289,31 @@ pub(crate) mod tests {
         assert!(assert(&reg.record, "sub.webauthn.example", &[0; 32], true).is_err());
         // Case does not matter for a domain name.
         assert!(assert(&reg.record, "WebAuthn.Example", &[0; 32], true).is_ok());
+    }
+
+    #[test]
+    fn pending_record_stages_the_whole_passkey() {
+        let reg = register(&input(&[], &[])).unwrap();
+        let p = reg.pending_record("WebAuthn Example", 42).unwrap();
+        assert_eq!(p.op, PendingOp::CreatePasskey);
+        assert_eq!(p.record_id, format!("passkey-{}", b64::encode(&reg.credential_id)));
+        assert_eq!(p.title, "WebAuthn Example");
+        assert_eq!(p.url, "https://webauthn.example");
+        assert_eq!(p.identity_value, "bkv");
+        assert_eq!(p.created_at, 42);
+        assert!(p.item_id.is_none() && p.password.is_empty() && p.totp_secret.is_none());
+        let back = PasskeyRecord::from_field_value(p.passkey.as_deref().unwrap()).unwrap();
+        assert_eq!(back.credential_id, reg.credential_id);
+        assert_eq!(back.pkcs8(), reg.record.pkcs8(), "the staged record carries the key");
+        assert_eq!(back.prf(), reg.record.prf());
+        // Defaults: rpId as the title, display name when there is no user name.
+        let mut no_name = input(&[], &[]);
+        no_name.user_name = "";
+        let reg = register(&no_name).unwrap();
+        let p = reg.pending_record("", 0).unwrap();
+        assert_eq!(p.title, "webauthn.example");
+        assert_eq!(p.identity_value, "B K V");
+        assert!(!format!("{p:?}").contains(&b64::encode(reg.record.pkcs8())));
     }
 
     #[test]
