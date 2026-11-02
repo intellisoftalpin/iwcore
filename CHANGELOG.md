@@ -4,6 +4,11 @@
 
 ### Hardening
 
+- **AutoFill index leaves no key copies behind.** Building the index grew its
+  JSON and padding buffers while writing, and every grow released a block that
+  still held passkey records in plain text. Both buffers are now sized before
+  anything is written. `tests/wipe_on_drop.rs` scans every block released
+  during the build, and during the drop of a passkey record, for the secret.
 - **Backups from outside.** The database inside a backup is checked before any
   query (SQLite header, `quick_check`, wallet tables must be real tables) and
   opened read-only with defensive mode, `trusted_schema` off, `query_only` on

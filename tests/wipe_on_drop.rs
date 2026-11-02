@@ -86,7 +86,7 @@ fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }
 
-/// A stored passkey whose private key and PRF secret are `key_b64` and `prf_b64`.
+/// A stored passkey with the PRF secret `prf_b64`, and its private key in base64.
 fn stored_record(prf_b64: &str) -> (String, String) {
     use p256::pkcs8::EncodePrivateKey;
     let bytes: [u8; 32] = core::array::from_fn(|i| 0x40 + i as u8);

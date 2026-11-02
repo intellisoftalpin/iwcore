@@ -215,6 +215,28 @@ pub struct IndexOptions {
     pub include_totp: bool,
 }
 
+/// Serialize into a buffer of exactly the right size, wiped on drop. The size
+/// is measured first, so the buffer never grows: a growing `Vec` would hand
+/// blocks still holding the plaintext back to the allocator.
+fn to_json_wiped<T: Serialize + ?Sized>(value: &T) -> Result<Zeroizing<Vec<u8>>> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let encode_err = |e: serde_json::Error| WalletError::EncryptionError(format!("index encode failed: {e}"));
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).map_err(encode_err)?;
+    let mut out = Zeroizing::new(Vec::with_capacity(count.0));
+    serde_json::to_writer(&mut *out, value).map_err(encode_err)?;
+    Ok(out)
+}
+
 /// Seal an index of logins only.
 pub fn build(
     entries: &[IndexEntry],
@@ -233,9 +255,8 @@ pub fn build_with_passkeys(
     index_key: &[u8; KEY_LEN],
     header: &IndexHeader,
 ) -> Result<Vec<u8>> {
-    let encode_err = |e: serde_json::Error| WalletError::EncryptionError(format!("index encode failed: {e}"));
-    let json = Zeroizing::new(match header.format_version {
-        1 if passkeys.is_empty() => serde_json::to_vec(entries).map_err(encode_err)?,
+    let json = match header.format_version {
+        1 if passkeys.is_empty() => to_json_wiped(entries)?,
         1 => return Err(WalletError::InvalidOperation("index format 1 cannot hold passkeys".into())),
         2 => {
             let raw = passkeys.iter().map(|p| RawRecord::new(&p.record)).collect::<Result<Vec<_>>>()?;
@@ -244,20 +265,23 @@ pub fn build_with_passkeys(
                 .zip(&raw)
                 .map(|(p, r)| PasskeyOut { item_id: &p.item_id, field_id: &p.field_id, title: &p.title, record: &r.0 })
                 .collect();
-            serde_json::to_vec(&BodyOut { logins: entries, passkeys: out }).map_err(encode_err)?
+            to_json_wiped(&BodyOut { logins: entries, passkeys: out })?
         }
         v => return Err(WalletError::InvalidVersion(format!("cannot write autofill index format {v}"))),
-    });
+    };
 
     let actual_len = u32::try_from(json.len())
         .map_err(|_| WalletError::EncryptionError("index is too large to frame".into()))?;
-    let mut padded = Zeroizing::new(Vec::with_capacity(json.len().saturating_add(4)));
+    let target = json
+        .len()
+        .checked_add(4)
+        .and_then(|n| n.checked_next_multiple_of(PAD_BLOCK))
+        .ok_or_else(|| WalletError::EncryptionError("index is too large to pad".into()))?;
+    // Sized up front: a growing buffer would leave copies of the plaintext
+    // in the blocks it gives back.
+    let mut padded = Zeroizing::new(Vec::with_capacity(target));
     padded.extend_from_slice(&actual_len.to_le_bytes());
     padded.extend_from_slice(&json);
-    let target = padded
-        .len()
-        .checked_next_multiple_of(PAD_BLOCK)
-        .ok_or_else(|| WalletError::EncryptionError("index is too large to pad".into()))?;
     padded.resize(target, 0);
 
     let header_bytes = encode_header(header)?;
