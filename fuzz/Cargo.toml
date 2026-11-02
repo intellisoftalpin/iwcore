@@ -50,3 +50,10 @@ path = "fuzz_targets/journal.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "autofill_index"
+path = "fuzz_targets/autofill_index.rs"
+test = false
+doc = false
+bench = false
