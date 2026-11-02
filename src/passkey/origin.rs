@@ -81,10 +81,21 @@ fn origin_host(origin: &str) -> Result<String> {
     }
 }
 
+/// Prefix of the WebAuthn origin of a native Android app.
+pub const ANDROID_ORIGIN_PREFIX: &str = "android:apk-key-hash:";
+
 /// The WebAuthn origin of a native Android app:
 /// `android:apk-key-hash:<base64url of the SHA-256 of its signing certificate>`.
 pub fn android_origin(cert_sha256: &[u8; 32]) -> String {
-    format!("android:apk-key-hash:{}", b64::encode(cert_sha256))
+    format!("{ANDROID_ORIGIN_PREFIX}{}", b64::encode(cert_sha256))
+}
+
+/// True for a native Android app's origin (`android:apk-key-hash:…`, any
+/// case of the scheme), as opposed to a browser's web origin.
+pub fn is_android_origin(origin: &str) -> bool {
+    origin
+        .get(..ANDROID_ORIGIN_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(ANDROID_ORIGIN_PREFIX))
 }
 
 /// Does this `assetlinks.json` let `package`, signed by `cert_sha256`, use the
@@ -208,6 +219,16 @@ mod tests {
         }
         for d in ["example.com", "bbc.co.uk", "bkv.github.io"] {
             assert!(!is_public_suffix(d), "{d}");
+        }
+    }
+
+    #[test]
+    fn android_origins_are_recognised() {
+        assert!(is_android_origin(&android_origin(&[1; 32])));
+        assert!(is_android_origin("ANDROID:APK-KEY-HASH:abc"));
+        assert!(is_android_origin(ANDROID_ORIGIN_PREFIX));
+        for o in ["https://example.com", "android:apk-key-has", "", "android:", "xandroid:apk-key-hash:a", "жжжжжжжжжжжж"] {
+            assert!(!is_android_origin(o), "{o}");
         }
     }
 
