@@ -177,9 +177,11 @@ pub fn get_crypto_record(conn: &Connection) -> Result<Option<CryptoRecord>> {
                 Ok(CryptoRecord {
                     scheme: row.get(0)?,
                     kdf: row.get(1)?,
-                    m_cost_kib: row.get::<_, i64>(2)? as u32,
-                    t_cost: row.get::<_, i64>(3)? as u32,
-                    p_cost: row.get::<_, i64>(4)? as u32,
+                    // Range-checked: a negative or oversized value is an error,
+                    // never wrapped into a different number.
+                    m_cost_kib: row.get::<_, u32>(2)?,
+                    t_cost: row.get::<_, u32>(3)?,
+                    p_cost: row.get::<_, u32>(4)?,
                     salt: row.get(5)?,
                     dek_wrapped: row.get(6)?,
                 })
@@ -1207,6 +1209,34 @@ pub struct RawLabel {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Datelike, Timelike};
+
+    #[test]
+    fn crypto_record_costs_outside_u32_are_an_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_crypto_table(&conn).unwrap();
+        let rec = CryptoRecord {
+            scheme: 1,
+            kdf: "argon2id".to_string(),
+            m_cost_kib: 65_536,
+            t_cost: 3,
+            p_cost: 1,
+            salt: vec![0; 16],
+            dek_wrapped: vec![0; 72],
+        };
+        set_crypto_record(&conn, &rec).unwrap();
+        assert_eq!(get_crypto_record(&conn).unwrap().unwrap().m_cost_kib, 65_536);
+
+        for (column, value) in [
+            ("kdf_m_cost", -1i64),
+            ("kdf_t_cost", -3),
+            ("kdf_p_cost", 1 << 32),
+            ("kdf_m_cost", i64::MAX),
+        ] {
+            set_crypto_record(&conn, &rec).unwrap();
+            conn.execute(&format!("UPDATE nswallet_crypto SET {column} = ?"), [value]).unwrap();
+            assert!(get_crypto_record(&conn).is_err(), "{column} = {value}");
+        }
+    }
 
     #[test]
     fn test_format_timestamp() {

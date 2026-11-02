@@ -2,8 +2,11 @@
 //!
 //! Handles creation and restoration of ZIP backup files.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+
 mod create;
 mod restore;
+pub(crate) mod untrusted;
 
 // Re-export version checking functions
 pub use restore::{
@@ -199,19 +202,15 @@ pub struct BackupInfo {
 fn parse_backup_filename(filename: &str, path: &Path) -> Option<BackupInfo> {
     // Format: {iwb|nswb}-YYYYMMDD-HHMMSS-{auto|manual|imported}.zip
     let parts: Vec<&str> = filename.split('-').collect();
-
-    if parts.len() != 4 {
+    let [prefix, date_str, time_str, type_part] = parts.as_slice() else {
         return None;
-    }
+    };
 
-    if parts[0] != BACKUP_PREFIX && parts[0] != BACKUP_PREFIX_LEGACY {
+    if *prefix != BACKUP_PREFIX && *prefix != BACKUP_PREFIX_LEGACY {
         return None;
     }
 
     // Parse date and time
-    let date_str = parts[1];
-    let time_str = parts[2];
-
     if date_str.len() != 8 || time_str.len() != 6 {
         return None;
     }
@@ -221,7 +220,7 @@ fn parse_backup_filename(filename: &str, path: &Path) -> Option<BackupInfo> {
     let timestamp = Utc.from_utc_datetime(&ndt);
 
     // Parse type
-    let type_str = parts[3].trim_end_matches(".zip");
+    let type_str = type_part.trim_end_matches(".zip");
     let backup_type = match type_str {
         BACKUP_MANUAL => BackupType::Manual,
         BACKUP_IMPORTED => BackupType::Imported,
@@ -246,13 +245,9 @@ pub fn get_date_from_backup_filename(filename: &str) -> Option<DateTime<Utc>> {
         .and_then(|n| n.to_str())?;
 
     let parts: Vec<&str> = name.split('-').collect();
-
-    if parts.len() < 3 {
+    let [_, date_str, time_str, ..] = parts.as_slice() else {
         return None;
-    }
-
-    let date_str = parts[1];
-    let time_str = parts[2];
+    };
 
     if date_str.len() != 8 || time_str.len() != 6 {
         return None;
@@ -361,6 +356,28 @@ mod tests {
         assert!(get_date_from_backup_filename("path/a/b/nswb-20171203-113108-auto.zip").is_some());
         // But invalid format should fail
         assert!(get_date_from_backup_filename("invalid-format.zip").is_none());
+    }
+
+    #[test]
+    fn backup_file_names_of_any_shape_parse_or_return_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("x.zip");
+        std::fs::write(&path, b"test").unwrap();
+        for name in [
+            "", "-", "---", "----", "iwb", "iwb-20171203", "iwb-20171203-113108",
+            "iwb-20171203-113108-auto-extra.zip", "xyz-20171203-113108-auto.zip",
+            "iwb-2017120-113108-auto.zip", "iwb-20171203-11310-auto.zip",
+            "iwb-20171303-113108-auto.zip", "iwb-ñññññññ-113108-auto.zip",
+        ] {
+            assert!(parse_backup_filename(name, &path).is_none(), "{name:?}");
+        }
+        assert!(parse_backup_filename("iwb-20171203-113108-auto.zip", &temp_dir.path().join("gone")).is_none());
+
+        for name in ["", "-", "--", "a-b", "iwb-20171203", "x-2017120-113108", "x-20171203-11310"] {
+            assert!(get_date_from_backup_filename(name).is_none(), "{name:?}");
+        }
+        assert!(get_date_from_backup_filename("x-20171203-113108").is_some());
+        assert!(get_date_from_backup_filename("x-20171203-113108-a-b-c").is_some());
     }
 
     #[test]
