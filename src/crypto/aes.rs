@@ -11,8 +11,12 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 use aes::Aes256;
-use cbc::{Encryptor, Decryptor};
-use cbc::cipher::{BlockModeEncrypt, BlockModeDecrypt, KeyIvInit};
+#[cfg(test)]
+use cbc::Encryptor;
+#[cfg(test)]
+use cbc::cipher::BlockModeEncrypt;
+use cbc::Decryptor;
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
 use block_padding::Pkcs7;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -29,6 +33,7 @@ const ZERO_IV: [u8; IV_SIZE] = [0u8; IV_SIZE];
 /// MD5 hex string length
 const MD5_HEX_LENGTH: usize = 32;
 
+#[cfg(test)]
 type Aes256CbcEnc = Encryptor<Aes256>;
 type Aes256CbcDec = Decryptor<Aes256>;
 
@@ -44,7 +49,11 @@ type Aes256CbcDec = Decryptor<Aes256>;
 /// # Returns
 ///
 /// Encrypted bytes on success, or error message on failure
-pub fn encrypt(
+///
+/// Test-only: the legacy scheme is never written, it is only read for the
+/// migration. Tests use this to build legacy fixtures.
+#[cfg(test)]
+pub(crate) fn encrypt(
     plaintext: &str,
     password: &str,
     re_encryption_count: u32,
@@ -90,7 +99,11 @@ pub fn encrypt(
 /// # Returns
 ///
 /// Decrypted plaintext on success, or error message on failure
-pub fn decrypt(
+///
+/// Test-only reference for the single stored-count derivation; the migration
+/// reads through [`LegacyKeyChain`], which tries this key first.
+#[cfg(test)]
+pub(crate) fn decrypt(
     ciphertext: &[u8],
     password: &str,
     re_encryption_count: u32,
@@ -110,6 +123,7 @@ pub fn decrypt(
 
 /// Length of a PKCS7-padded buffer for `len` bytes of input: the next
 /// multiple of the block size strictly greater than `len`.
+#[cfg(test)]
 fn padded_len(len: usize) -> Option<usize> {
     len.checked_div(IV_SIZE)?.checked_add(1)?.checked_mul(IV_SIZE)
 }
@@ -174,8 +188,9 @@ fn raw_password_key(password: &str) -> [u8; KEY_LENGTH] {
 /// AES passes once the vault's real mode is known.
 ///
 /// For `re_encryption_count == 0` all three C# modes collapse into one key,
-/// so the chain holds a single candidate and behaves exactly like the plain
-/// [`decrypt`] — zero change for the healthy majority of vaults.
+/// so the chain holds a single candidate and behaves exactly like a one-shot
+/// decrypt with the stored count — zero change for the healthy majority of
+/// vaults.
 ///
 /// Every candidate key is wiped when the chain is dropped.
 pub struct LegacyKeyChain {
