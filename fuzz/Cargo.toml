@@ -58,3 +58,10 @@ path = "fuzz_targets/restore_inspect.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "autofill_index"
+path = "fuzz_targets/autofill_index.rs"
+test = false
+doc = false
+bench = false

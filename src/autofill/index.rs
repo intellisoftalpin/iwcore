@@ -29,9 +29,12 @@
 //! the minimum needed to fill a login form and not one field more.
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::database::models::{IWField, IWItem};
 use crate::error::{Result, WalletError};
+use crate::passkey::{PasskeyRecord, PasskeySummary};
 
 use super::crypto::{self, KEY_LEN};
 use super::domain;
@@ -46,6 +49,9 @@ pub const FORMAT_VERSION: u8 = 2;
 pub const OLDEST_READABLE_VERSION: u8 = 1;
 /// The body is padded up to a multiple of this before sealing.
 pub const PAD_BLOCK: usize = 4096;
+/// Header bytes before the database id: magic, version, generation,
+/// timestamp, id length.
+const HEADER_FIXED_LEN: usize = 4 + 1 + 8 + 8 + 1;
 
 /// One fillable login. `Debug` redacts the password and TOTP secret.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,16 +86,42 @@ impl std::fmt::Debug for IndexEntry {
     }
 }
 
-/// One passkey the provider can sign with: the stored `PKEY` record (private
-/// key and PRF secrets included) plus where it lives in the vault. `Debug` shows
-/// only where it lives.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One passkey the provider can sign with, and where it lives in the vault.
+///
+/// The record itself (private key and PRF secrets included) is not a public
+/// field. It is held as a [`PasskeyRecord`], whose key material is zeroized
+/// and never handed out: sign with it through [`super::passkeys`] (or
+/// [`crate::passkey::sign::assert`] on [`Self::record`]), and show
+/// [`Self::summary`] in lists. `Debug` shows only where it lives.
+#[derive(Clone)]
 pub struct PasskeyIndexEntry {
     pub item_id: String,
     pub field_id: String,
     pub title: String,
-    /// The `PKEY` field value, as stored. See `passkey::record`.
-    pub record: serde_json::Value,
+    record: PasskeyRecord,
+}
+
+impl PasskeyIndexEntry {
+    pub fn new(
+        item_id: impl Into<String>,
+        field_id: impl Into<String>,
+        title: impl Into<String>,
+        record: PasskeyRecord,
+    ) -> Self {
+        Self { item_id: item_id.into(), field_id: field_id.into(), title: title.into(), record }
+    }
+
+    /// The passkey, to sign with inside the crate's API. Its key is not
+    /// readable through it.
+    pub fn record(&self) -> &PasskeyRecord {
+        &self.record
+    }
+
+    /// What may be shown about this passkey: never the key, never the PRF
+    /// secrets.
+    pub fn summary(&self) -> PasskeySummary {
+        self.record.summary(&self.item_id, &self.field_id)
+    }
 }
 
 impl std::fmt::Debug for PasskeyIndexEntry {
@@ -104,17 +136,66 @@ impl std::fmt::Debug for PasskeyIndexEntry {
 }
 
 /// Everything an index carries.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct IndexContents {
     pub logins: Vec<IndexEntry>,
+    /// Readable passkeys only: an entry whose record does not validate is
+    /// left out when the index is opened.
     pub passkeys: Vec<PasskeyIndexEntry>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct BodyV2 {
+/// Format-2 body as written. The passkey record is embedded as the raw JSON
+/// object it is stored as, so it is never decoded into an intermediate value
+/// that could not be wiped.
+#[derive(Serialize)]
+struct BodyOut<'a> {
+    logins: &'a [IndexEntry],
+    passkeys: Vec<PasskeyOut<'a>>,
+}
+
+#[derive(Serialize)]
+struct PasskeyOut<'a> {
+    item_id: &'a str,
+    field_id: &'a str,
+    title: &'a str,
+    record: &'a RawValue,
+}
+
+/// Format-2 body as read; the record is borrowed from the decrypted buffer.
+#[derive(Deserialize)]
+struct BodyIn<'a> {
     logins: Vec<IndexEntry>,
-    #[serde(default)]
-    passkeys: Vec<PasskeyIndexEntry>,
+    #[serde(default, borrow)]
+    passkeys: Vec<PasskeyIn<'a>>,
+}
+
+#[derive(Deserialize)]
+struct PasskeyIn<'a> {
+    item_id: String,
+    field_id: String,
+    title: String,
+    #[serde(borrow)]
+    record: &'a RawValue,
+}
+
+/// A passkey record as raw JSON text, wiped when dropped.
+struct RawRecord(Box<RawValue>);
+
+impl RawRecord {
+    fn new(record: &PasskeyRecord) -> Result<Self> {
+        let text = record.to_field_value()?;
+        let raw = RawValue::from_string(String::clone(&text))
+            .map_err(|e| WalletError::EncryptionError(format!("index encode failed: {e}")))?;
+        Ok(Self(raw))
+    }
+}
+
+impl Drop for RawRecord {
+    fn drop(&mut self) {
+        let raw = std::mem::replace(&mut self.0, RawValue::NULL.to_owned());
+        let text: Box<str> = raw.into();
+        String::from(text).zeroize();
+    }
 }
 
 /// Plaintext header of an index file.
@@ -152,26 +233,37 @@ pub fn build_with_passkeys(
     index_key: &[u8; KEY_LEN],
     header: &IndexHeader,
 ) -> Result<Vec<u8>> {
-    let json = match header.format_version {
-        1 if passkeys.is_empty() => serde_json::to_vec(entries),
+    let encode_err = |e: serde_json::Error| WalletError::EncryptionError(format!("index encode failed: {e}"));
+    let json = Zeroizing::new(match header.format_version {
+        1 if passkeys.is_empty() => serde_json::to_vec(entries).map_err(encode_err)?,
         1 => return Err(WalletError::InvalidOperation("index format 1 cannot hold passkeys".into())),
-        2 => serde_json::to_vec(&BodyV2 { logins: entries.to_vec(), passkeys: passkeys.to_vec() }),
+        2 => {
+            let raw = passkeys.iter().map(|p| RawRecord::new(&p.record)).collect::<Result<Vec<_>>>()?;
+            let out = passkeys
+                .iter()
+                .zip(&raw)
+                .map(|(p, r)| PasskeyOut { item_id: &p.item_id, field_id: &p.field_id, title: &p.title, record: &r.0 })
+                .collect();
+            serde_json::to_vec(&BodyOut { logins: entries, passkeys: out }).map_err(encode_err)?
+        }
         v => return Err(WalletError::InvalidVersion(format!("cannot write autofill index format {v}"))),
-    }
-    .map_err(|e| WalletError::EncryptionError(format!("index encode failed: {e}")))?;
+    });
 
     let actual_len = u32::try_from(json.len())
         .map_err(|_| WalletError::EncryptionError("index is too large to frame".into()))?;
-    let mut padded = Vec::with_capacity(4 + json.len());
+    let mut padded = Zeroizing::new(Vec::with_capacity(json.len().saturating_add(4)));
     padded.extend_from_slice(&actual_len.to_le_bytes());
     padded.extend_from_slice(&json);
-    let target = padded.len().div_ceil(PAD_BLOCK) * PAD_BLOCK;
+    let target = padded
+        .len()
+        .checked_next_multiple_of(PAD_BLOCK)
+        .ok_or_else(|| WalletError::EncryptionError("index is too large to pad".into()))?;
     padded.resize(target, 0);
 
     let header_bytes = encode_header(header)?;
     let sealed = crypto::seal(index_key, &padded, &header_bytes)?;
 
-    let mut out = Vec::with_capacity(header_bytes.len() + sealed.len());
+    let mut out = Vec::with_capacity(header_bytes.len().saturating_add(sealed.len()));
     out.extend_from_slice(&header_bytes);
     out.extend_from_slice(&sealed);
     Ok(out)
@@ -186,24 +278,33 @@ pub fn open(bytes: &[u8], index_key: &[u8; KEY_LEN]) -> Result<(IndexHeader, Vec
 /// Open a sealed index of either format and return logins and passkeys.
 pub fn open_all(bytes: &[u8], index_key: &[u8; KEY_LEN]) -> Result<(IndexHeader, IndexContents)> {
     let (header, header_len) = decode_header(bytes)?;
-    let sealed = &bytes[header_len..];
+    let (header_bytes, sealed) = bytes
+        .split_at_checked(header_len)
+        .ok_or_else(|| WalletError::DecryptionError("index header is malformed".into()))?;
 
-    let padded = crypto::open(index_key, sealed, &bytes[..header_len])?;
-    if padded.len() < 4 {
-        return Err(WalletError::DecryptionError("index body is truncated".into()));
-    }
-    let actual_len =
-        u32::from_le_bytes([padded[0], padded[1], padded[2], padded[3]]) as usize;
-    let json = padded
-        .get(4..4 + actual_len)
+    let padded = Zeroizing::new(crypto::open(index_key, sealed, header_bytes)?);
+    let (prefix, rest) = padded
+        .split_first_chunk::<4>()
+        .ok_or_else(|| WalletError::DecryptionError("index body is truncated".into()))?;
+    let json = usize::try_from(u32::from_le_bytes(*prefix))
+        .ok()
+        .and_then(|actual_len| rest.get(..actual_len))
         .ok_or_else(|| WalletError::DecryptionError("index body length is out of range".into()))?;
 
     let decode_err = |e: serde_json::Error| WalletError::DecryptionError(format!("index decode failed: {e}"));
     let contents = if header.format_version == 1 {
         IndexContents { logins: serde_json::from_slice(json).map_err(decode_err)?, passkeys: Vec::new() }
     } else {
-        let body: BodyV2 = serde_json::from_slice(json).map_err(decode_err)?;
-        IndexContents { logins: body.logins, passkeys: body.passkeys }
+        let body: BodyIn<'_> = serde_json::from_slice(json).map_err(decode_err)?;
+        let passkeys = body
+            .passkeys
+            .into_iter()
+            .filter_map(|p| {
+                let record = PasskeyRecord::from_field_value(p.record.get()).ok()?;
+                Some(PasskeyIndexEntry::new(p.item_id, p.field_id, p.title, record))
+            })
+            .collect();
+        IndexContents { logins: body.logins, passkeys }
     };
     Ok((header, contents))
 }
@@ -220,7 +321,7 @@ fn encode_header(header: &IndexHeader) -> Result<Vec<u8>> {
     let id_len = u8::try_from(id.len())
         .map_err(|_| WalletError::EncryptionError("database id is too long".into()))?;
 
-    let mut out = Vec::with_capacity(4 + 1 + 8 + 8 + 1 + id.len());
+    let mut out = Vec::with_capacity(id.len().saturating_add(HEADER_FIXED_LEN));
     out.extend_from_slice(MAGIC);
     out.push(header.format_version);
     out.extend_from_slice(&header.generation.to_le_bytes());
@@ -233,29 +334,34 @@ fn encode_header(header: &IndexHeader) -> Result<Vec<u8>> {
 fn decode_header(bytes: &[u8]) -> Result<(IndexHeader, usize)> {
     let malformed = || WalletError::DecryptionError("index header is malformed".into());
 
-    if bytes.len() < 4 + 1 + 8 + 8 + 1 || &bytes[..4] != MAGIC {
+    let (fixed, rest) = bytes
+        .split_first_chunk::<HEADER_FIXED_LEN>()
+        .ok_or_else(malformed)?;
+    let (magic, fixed) = fixed.split_first_chunk::<4>().ok_or_else(malformed)?;
+    if magic != MAGIC {
         return Err(malformed());
     }
-    let format_version = bytes[4];
+    let (&format_version, fixed) = fixed.split_first().ok_or_else(malformed)?;
     if !(OLDEST_READABLE_VERSION..=FORMAT_VERSION).contains(&format_version) {
         return Err(WalletError::InvalidVersion(format!(
             "unsupported autofill index format {format_version}"
         )));
     }
-    let generation = u64::from_le_bytes(bytes[5..13].try_into().map_err(|_| malformed())?);
-    let built_at = i64::from_le_bytes(bytes[13..21].try_into().map_err(|_| malformed())?);
-    let id_len = bytes[21] as usize;
-    let id = bytes.get(22..22 + id_len).ok_or_else(malformed)?;
+    let (generation, fixed) = fixed.split_first_chunk::<8>().ok_or_else(malformed)?;
+    let (built_at, fixed) = fixed.split_first_chunk::<8>().ok_or_else(malformed)?;
+    let (&id_len, _) = fixed.split_first().ok_or_else(malformed)?;
+    let id_len = usize::from(id_len);
+    let id = rest.get(..id_len).ok_or_else(malformed)?;
     let database_id = String::from_utf8(id.to_vec()).map_err(|_| malformed())?;
 
     Ok((
         IndexHeader {
             format_version,
-            generation,
-            built_at,
+            generation: u64::from_le_bytes(*generation),
+            built_at: i64::from_le_bytes(*built_at),
             database_id,
         },
-        22 + id_len,
+        HEADER_FIXED_LEN.saturating_add(id_len),
     ))
 }
 
@@ -529,12 +635,11 @@ mod tests {
     }
 
     fn passkey_entry() -> PasskeyIndexEntry {
-        PasskeyIndexEntry {
-            item_id: "item-1".into(),
-            field_id: "field-1".into(),
-            title: "Example".into(),
-            record: serde_json::json!({ "private_key": "super-secret-key-material" }),
-        }
+        PasskeyIndexEntry::new("item-1", "field-1", "Example", crate::passkey::record::tests::sample(true))
+    }
+
+    fn key_b64(entry: &PasskeyIndexEntry) -> String {
+        crate::passkey::b64::encode(entry.record().pkcs8())
     }
 
     fn format_1_header() -> IndexHeader {
@@ -557,7 +662,50 @@ mod tests {
         assert!(shown.contains("field-1"));
         assert!(shown.contains("Example"));
         assert!(shown.contains(crate::utils::REDACTED));
-        assert!(!shown.contains("super-secret-key-material"));
+        assert!(!shown.contains(&key_b64(&passkey_entry())));
+    }
+
+    #[test]
+    fn passkeys_round_trip_and_still_sign() {
+        let keys = generate_keys().unwrap();
+        let pk = passkey_entry();
+        let sealed = build_with_passkeys(&[entry("i1", "example.com")], std::slice::from_ref(&pk), &keys.index_key, &header())
+            .unwrap();
+        let (_, contents) = open_all(&sealed, &keys.index_key).unwrap();
+        assert_eq!(contents.logins.len(), 1);
+        let [got] = contents.passkeys.as_slice() else { panic!("one passkey") };
+        assert_eq!((got.item_id.as_str(), got.field_id.as_str(), got.title.as_str()), ("item-1", "field-1", "Example"));
+        assert_eq!(got.summary(), pk.summary());
+        assert_eq!(key_b64(got), key_b64(&pk));
+        let rp = got.summary().rp_id;
+        crate::passkey::sign::assert(got.record(), &rp, &[1; 32], true).unwrap();
+    }
+
+    /// The wire format is unchanged: the record is the stored `PKEY` object,
+    /// embedded as JSON, exactly what earlier builds and the Swift extension read.
+    #[test]
+    fn a_passkey_is_embedded_as_its_stored_json_object() {
+        let keys = generate_keys().unwrap();
+        let pk = passkey_entry();
+        let sealed = build_with_passkeys(&[], std::slice::from_ref(&pk), &keys.index_key, &header()).unwrap();
+        let header_len = 22 + header().database_id.len();
+        let padded = crypto::open(&keys.index_key, &sealed[header_len..], &sealed[..header_len]).unwrap();
+        let len = u32::from_le_bytes(padded[..4].try_into().unwrap()) as usize;
+        let body: serde_json::Value = serde_json::from_slice(&padded[4..4 + len]).unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&pk.record().to_field_value().unwrap()).unwrap();
+        assert_eq!(body["passkeys"][0]["record"], stored);
+        assert_eq!(body["passkeys"][0]["item_id"], "item-1");
+    }
+
+    #[test]
+    fn an_unreadable_passkey_record_is_left_out_not_fatal() {
+        let keys = generate_keys().unwrap();
+        let body = br#"{"logins":[],"passkeys":[{"item_id":"i","field_id":"f","title":"t","record":{"v":1}}]}"#;
+        let mut padded = u32::try_from(body.len()).unwrap().to_le_bytes().to_vec();
+        padded.extend_from_slice(body);
+        let sealed = seal_raw_body(&keys.index_key, &padded);
+        let (_, contents) = open_all(&sealed, &keys.index_key).unwrap();
+        assert!(contents.passkeys.is_empty());
     }
 
     #[test]

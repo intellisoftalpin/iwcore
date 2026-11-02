@@ -2,7 +2,7 @@
 //! contain the secret, in either `{:?}` or `{:#?}` form. Apps log `{:?}` freely;
 //! a password must never end up in a log because of it.
 
-use iwcore::autofill::{journal, IndexOptions, PendingOp, PendingRecord, generate_keys, index};
+use iwcore::autofill::{journal, IndexOptions, PendingRecord, generate_keys, index};
 use iwcore::Wallet;
 use tempfile::TempDir;
 
@@ -72,24 +72,14 @@ fn index_entries_are_redacted() {
 
 #[test]
 fn pending_records_are_redacted() {
-    let record = PendingRecord {
-        record_id: "r1".into(),
-        op: PendingOp::Create,
-        item_id: None,
-        title: "Example".into(),
-        url: "https://example.com".into(),
-        identity_value: "someone".into(),
-        identity_hint: None,
-        password: PASSWORD.into(),
-        totp_secret: Some(TOTP.into()),
-        created_at: 0,
-        passkey: None,
-    };
+    let mut record = PendingRecord::new_login("r1", "Example", "https://example.com", "someone", PASSWORD, 0);
+    record.totp_secret = Some(TOTP.into());
     assert_hidden("PendingRecord", format!("{record:?}"));
 
     let keys = generate_keys().unwrap();
-    let sealed = journal::seal_record(&record, &keys.journal_public, &keys.index_key).unwrap();
-    let opened = journal::open_with_journal_key(&sealed, &keys.journal_secret);
+    let sealed = journal::seal_record(&record, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
+    let dk = journal::DrainKeys { journal_secret: &keys.journal_secret, auth_key: &keys.journal_auth_key, legacy_wrap_keys: &[] };
+    let opened = journal::open_for_drain(&sealed, &dk).records;
     assert_eq!(opened.len(), 1);
     assert_hidden("PendingRecord opened", format!("{opened:#?}"));
 }

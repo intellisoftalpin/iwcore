@@ -377,9 +377,9 @@ fn export_then_import_into_an_empty_vault_round_trips() {
     assert_eq!(list[0].credential_id, record.credential_id);
     let sealed = fresh.build_autofill_index(&[5; 32], 1, 0, Default::default()).unwrap();
     let (_, contents) = iwcore::autofill::index::open_all(&sealed, &[5; 32]).unwrap();
-    let back = PasskeyRecord::from_field_value(&contents.passkeys[0].record.to_string()).unwrap();
-    sign::assert(&back, "github.com", &[1; 32], true).unwrap();
-    assert_eq!(prf::evaluate_salts(&back, &[3; 32], None, true), prf::evaluate_salts(&record, &[3; 32], None, true));
+    let back = contents.passkeys[0].record();
+    sign::assert(back, "github.com", &[1; 32], true).unwrap();
+    assert_eq!(prf::evaluate_salts(back, &[3; 32], None, true), prf::evaluate_salts(&record, &[3; 32], None, true));
 }
 
 #[test]

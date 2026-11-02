@@ -14,6 +14,9 @@
 //! - **the journal** ([`journal`]): logins created in the provider, appended
 //!   there and drained into the vault by the app on its next unlock.
 //!
+//! Passkeys in either file are signed with through [`passkeys`], so a provider
+//! never decodes a passkey record or holds its private key itself.
+//!
 //! Everything in this module is platform neutral. Nothing here touches the
 //! filesystem, the Keychain, or the Android Keystore: callers supply keys and
 //! receive bytes, so the same code serves both platforms.
@@ -25,6 +28,25 @@
 //! belongs in on the way in, and the same priority governs which one is chosen
 //! on the way out, so an entry that round-trips out through the index and back
 //! through the journal keeps its shape. There is a test asserting exactly that.
+//!
+//! # Untrusted input
+//!
+//! The index and the journal are files in storage another process can write,
+//! so every parser here treats them as hostile: lengths are checked with
+//! checked arithmetic and slices are taken with `get`, never by indexing. The
+//! lints below hold the whole module to that, on 32-bit targets too, where a
+//! `usize` sum of two file-supplied lengths can wrap.
+
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic
+    )
+)]
 
 pub mod crypto;
 pub mod domain;
@@ -32,14 +54,16 @@ pub mod identity;
 pub mod index;
 pub mod journal;
 pub mod keys;
+pub mod passkeys;
 pub mod wallet;
 
 pub use domain::{MatchTier, normalize_host, registrable_domain};
 pub use identity::{IdentityKind, classify};
 pub use index::{IndexEntry, IndexHeader, IndexOptions};
-pub use journal::{PendingOp, PendingRecord};
+pub use journal::{DrainKeys, PendingOp, PendingRecord};
 pub use keys::{AutofillKeys, generate_keys};
-pub use wallet::DrainSummary;
+pub use passkeys::{HeldPasskeys, PasskeyCandidate, SignRequest, SignedAssertion, sign_from_index};
+pub use wallet::{DrainSummary, PasskeyReplacement};
 
 /// Field type holding a login password.
 pub const FIELD_PASSWORD: &str = "PASS";
