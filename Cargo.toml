@@ -33,7 +33,8 @@ block-padding = "0.4.2"
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
 # raw_value: the AutoFill index carries passkey records as raw JSON text, so
-# they go straight from and into zeroized buffers (see autofill::index).
+# they go straight from and into zeroized buffers (see autofill::index), and
+# CXF credentials stay slices of the payload until they are read.
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 
 # Utilities
