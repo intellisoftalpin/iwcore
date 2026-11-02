@@ -50,3 +50,10 @@ path = "fuzz_targets/journal.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "cxf_import_apply"
+path = "fuzz_targets/cxf_import_apply.rs"
+test = false
+doc = false
+bench = false

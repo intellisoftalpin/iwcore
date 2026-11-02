@@ -60,7 +60,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [cxf_preview, passkey_request, passkey_record, assetlinks, journal]
+        target: [cxf_preview, cxf_import_apply, passkey_request, passkey_record, assetlinks, journal]
+        # libFuzzer caps inputs at 4 KiB by default; CXF payloads get room to
+        # reach the per-value and per-item limits (64 KiB values, 1 MiB notes,
+        # 64 credentials and 256 custom fields per item, 200 new labels).
+        # Both start from the valid payloads in fuzz/seeds/cxf.
+        include:
+          - target: cxf_preview
+            max_len: 1048576
+            seeds: seeds/cxf
+          - target: cxf_import_apply
+            max_len: 1048576
+            seeds: seeds/cxf
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -71,9 +82,11 @@ jobs:
         working-directory: fuzz
         # The prebuilt cargo-fuzz is a static musl binary and would otherwise
         # build the fuzzer for musl, where the sanitizers cannot run.
-        run: >
-          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }}
-          -- -max_total_time=1800 -rss_limit_mb=2048
+        run: |
+          mkdir -p corpus/${{ matrix.target }}
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} \
+            corpus/${{ matrix.target }} ${{ matrix.seeds }} \
+            -- -max_total_time=1800 -rss_limit_mb=2048 -max_len=${{ matrix.max_len || 4096 }}
       - name: Keep the crashing input
         if: failure()
         uses: actions/upload-artifact@v7
