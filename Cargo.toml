@@ -12,7 +12,7 @@ description = "IntelliWallet Core - Password manager library with authenticated 
 keywords = ["password-manager", "encryption", "argon2", "security", "vault"]
 categories = ["cryptography", "database"]
 readme = "README.md"
-exclude = ["docs", "fuzz"]
+exclude = ["docs", "fuzz", "scripts"]
 
 [dependencies]
 # Database

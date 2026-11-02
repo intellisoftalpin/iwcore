@@ -7,6 +7,8 @@ name: Release gate
 on:
   pull_request:
     branches: [main]
+  schedule:
+    - cron: '0 1 * * 0' # Sunday 01:00 UTC: full mutation run on main
   workflow_dispatch:
 
 concurrency:
@@ -124,36 +126,54 @@ jobs:
         run: gh run cancel ${{ github.run_id }} -R ${{ github.repository }}
 
   mutants:
-    name: Mutation testing (shard ${{ matrix.shard }}/8)
+    # Pull requests mutate only the code they change; the weekly run and a
+    # manual run mutate everything. Shards are sized for about 60 mutants
+    # each (public repository: runners cost nothing, wall time does).
+    name: Mutation testing (${{ matrix.area }} ${{ matrix.shard }}/${{ matrix.shards }})
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       fail-fast: true
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        include:
+          - { area: cxf, shard: 0, shards: 8 }
+          - { area: cxf, shard: 1, shards: 8 }
+          - { area: cxf, shard: 2, shards: 8 }
+          - { area: cxf, shard: 3, shards: 8 }
+          - { area: cxf, shard: 4, shards: 8 }
+          - { area: cxf, shard: 5, shards: 8 }
+          - { area: cxf, shard: 6, shards: 8 }
+          - { area: cxf, shard: 7, shards: 8 }
+          - { area: passkey, shard: 0, shards: 5 }
+          - { area: passkey, shard: 1, shards: 5 }
+          - { area: passkey, shard: 2, shards: 5 }
+          - { area: passkey, shard: 3, shards: 5 }
+          - { area: passkey, shard: 4, shards: 5 }
+          - { area: autofill, shard: 0, shards: 4 }
+          - { area: autofill, shard: 1, shards: 4 }
+          - { area: autofill, shard: 2, shards: 4 }
+          - { area: autofill, shard: 3, shards: 4 }
+          - { area: restore, shard: 0, shards: 1 }
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants,cargo-nextest
-      - name: Mutate the passkey, CXF, AutoFill and restore code
-        # A mutant can turn a loop into an endless allocation that starves the
-        # runner long before the timeout. Capping every process at 6 GiB, two
-        # tests at a time, makes such a mutant fail its test (caught) instead.
+      - name: Changed code of this pull request
+        if: github.event_name == 'pull_request'
+        run: git diff "origin/${{ github.base_ref }}...HEAD" -- src > "$RUNNER_TEMP/pr.diff"
+      - name: Mutate
         env:
-          NEXTEST_TEST_THREADS: 2
-        run: >
-          ulimit -v 6291456 &&
-          cargo mutants --test-tool=nextest --profile=mutants --timeout 300 --shard ${{ matrix.shard }}/8
-          -f 'src/passkey/**' -f 'src/cxf/**'
-          -f src/autofill/wallet.rs -f src/autofill/index.rs -f src/autofill/journal.rs
-          -f src/backup/restore.rs
+          DIFF: ${{ github.event_name == 'pull_request' && format('{0}/pr.diff', runner.temp) || '' }}
+        run: scripts/mutants.sh ${{ matrix.area }} ${{ matrix.shard }} ${{ matrix.shards }} ${DIFF:+"$DIFF"}
       - name: Missed mutants
         if: always()
         run: |
           {
-            echo "### Shard ${{ matrix.shard }}/8"
+            echo "### ${{ matrix.area }} ${{ matrix.shard }}/${{ matrix.shards }}"
             for f in caught missed timeout unviable; do
               echo "- $f: $(wc -l < mutants.out/$f.txt 2>/dev/null || echo 0)"
             done
@@ -164,7 +184,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: mutants-shard-${{ matrix.shard }}
+          name: mutants-${{ matrix.area }}-${{ matrix.shard }}
           path: mutants.out/
       # The first failing job stops the whole run instead of waiting hours for
       # the other fuzz targets and mutation shards. Keep this step last.
