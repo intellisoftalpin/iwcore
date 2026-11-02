@@ -4,24 +4,44 @@
 
 use std::path::{Path, PathBuf};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use zip::ZipArchive;
 use crate::error::{Result, WalletError};
 use crate::DATABASE_FILENAME;
+use super::untrusted::{has_sqlite_header, SQLITE_HEADER};
 
-/// Largest database a backup may restore. Far above any real wallet; it exists so
-/// that a crafted backup (a "zip bomb" that claims or inflates to gigabytes)
-/// fails with an error instead of exhausting memory or disk.
-pub const MAX_RESTORED_DB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Largest database a backup may restore. Real vaults are kilobytes to a few
+/// megabytes; the limit keeps a crafted backup that inflates far beyond its
+/// own size from filling the device's storage.
+pub const MAX_RESTORED_DB_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Highest compression ratio accepted for the database entry. Deflate cannot
+/// go much beyond about 1030:1, and real databases stay far below this.
+const MAX_COMPRESSION_RATIO: u64 = 1000;
+
+/// Entries up to this size are not held to [`MAX_COMPRESSION_RATIO`].
+const RATIO_EXEMPT_BYTES: u64 = 1024 * 1024;
+
+/// How many bytes the database entry may inflate to, given the size limit
+/// and its compressed size.
+fn entry_limit(max_bytes: u64, compressed_size: u64) -> u64 {
+    compressed_size
+        .saturating_mul(MAX_COMPRESSION_RATIO)
+        .max(RATIO_EXEMPT_BYTES)
+        .min(max_bytes)
+}
 
 /// Restore a backup to the database path.
 ///
-/// The database entry is streamed into a temporary file beside `db_path`,
-/// never held in memory as a whole, and refused if it grows past
-/// [`MAX_RESTORED_DB_BYTES`]. Only a complete, flushed copy replaces the
-/// database, by an atomic rename, so a failure at any point leaves the
-/// previous database untouched. Stale `-wal` / `-shm` files of the previous
-/// database are removed, since they do not belong to the restored one.
+/// The database entry must start with the SQLite header, which is checked
+/// before anything is written. The entry is then streamed into a temporary
+/// file beside `db_path`, never held in memory as a whole, and refused if it
+/// grows past [`MAX_RESTORED_DB_BYTES`] or inflates more than 1000 times its
+/// compressed size (entries up to 1 MiB are exempt from the ratio). Only a
+/// complete, flushed copy replaces the database, by an atomic rename, so a
+/// failure at any point leaves the previous database untouched. Stale `-wal` /
+/// `-shm` files of the previous database are removed, since they do not
+/// belong to the restored one.
 ///
 /// The wallet using `db_path` must be closed while it is restored.
 pub fn restore_backup(backup_path: &Path, db_path: &Path) -> Result<()> {
@@ -33,14 +53,26 @@ fn restore_backup_capped(backup_path: &Path, db_path: &Path, max_bytes: u64) -> 
         .map_err(|e| WalletError::BackupError(format!("Failed to open backup: {}", e)))?;
     let mut archive = ZipArchive::new(file)
         .map_err(|e| WalletError::BackupError(format!("Failed to read backup: {}", e)))?;
-    let db_file = archive.by_name(DATABASE_FILENAME)
+    let mut db_file = archive.by_name(DATABASE_FILENAME)
         .map_err(|e| WalletError::BackupError(format!("Database not found in backup: {}", e)))?;
-    if db_file.size() > max_bytes {
+    let limit = entry_limit(max_bytes, db_file.compressed_size());
+    if db_file.size() > limit {
         return Err(WalletError::BackupError(format!(
             "Database in backup is too large ({} bytes, limit {})",
             db_file.size(),
-            max_bytes
+            limit
         )));
+    }
+
+    // Nothing is written unless the entry starts like an SQLite database.
+    let mut head = [0u8; SQLITE_HEADER.len()];
+    db_file.read_exact(&mut head).map_err(|_| {
+        WalletError::BackupError("The backup does not hold a wallet database: the entry is too short".to_string())
+    })?;
+    if !has_sqlite_header(&head) {
+        return Err(WalletError::BackupError(
+            "The backup does not hold a wallet database: the entry is not an SQLite database".to_string(),
+        ));
     }
 
     let parent = match db_path.parent() {
@@ -52,13 +84,18 @@ fn restore_backup_capped(backup_path: &Path, db_path: &Path, max_bytes: u64) -> 
     // Same folder as the target, so the final rename is atomic.
     let mut temp = tempfile::NamedTempFile::new_in(&parent)
         .map_err(|e| WalletError::BackupError(format!("Failed to create temp file: {}", e)))?;
+    temp.as_file_mut()
+        .write_all(&head)
+        .map_err(|e| WalletError::BackupError(format!("Failed to write database: {}", e)))?;
     // The declared size can lie; the limit is enforced on the bytes read.
-    let copied = io::copy(&mut db_file.take(max_bytes + 1), temp.as_file_mut())
+    let head_len = head.len() as u64;
+    let rest_limit = limit.saturating_sub(head_len).saturating_add(1);
+    let copied = io::copy(&mut db_file.take(rest_limit), temp.as_file_mut())
         .map_err(|e| WalletError::BackupError(format!("Failed to read database from backup: {}", e)))?;
-    if copied > max_bytes {
+    if head_len.saturating_add(copied) > limit {
         return Err(WalletError::BackupError(format!(
             "Database in backup is larger than the limit of {} bytes",
-            max_bytes
+            limit
         )));
     }
     temp.as_file_mut()
@@ -271,6 +308,9 @@ mod tests {
     use tempfile::TempDir;
     use std::io::Write;
 
+    /// Entry content of [`create_test_backup`]: the SQLite header and a tail.
+    const TEST_DB: &str = "SQLite format 3\0test database content";
+
     fn create_test_backup(dir: &Path) -> PathBuf {
         use zip::write::SimpleFileOptions;
         use zip::ZipWriter;
@@ -281,7 +321,7 @@ mod tests {
 
         let options = SimpleFileOptions::default();
         zip.start_file(DATABASE_FILENAME, options).unwrap();
-        zip.write_all(b"test database content").unwrap();
+        zip.write_all(TEST_DB.as_bytes()).unwrap();
         zip.finish().unwrap();
 
         backup_path
@@ -305,7 +345,7 @@ mod tests {
 
         assert!(db_path.exists());
         let content = fs::read_to_string(&db_path).unwrap();
-        assert_eq!(content, "test database content");
+        assert_eq!(content, TEST_DB);
     }
 
     #[test]
@@ -318,7 +358,7 @@ mod tests {
 
         assert!(db_path.exists());
         let content = fs::read_to_string(&db_path).unwrap();
-        assert_eq!(content, "test database content");
+        assert_eq!(content, TEST_DB);
     }
 
     #[test]
@@ -330,7 +370,7 @@ mod tests {
         fs::write(&db_path, b"OLD DATABASE").unwrap();
 
         restore_backup(&backup_path, &db_path).unwrap();
-        assert_eq!(fs::read_to_string(&db_path).unwrap(), "test database content");
+        assert_eq!(fs::read_to_string(&db_path).unwrap(), TEST_DB);
     }
 
     #[test]
@@ -341,8 +381,8 @@ mod tests {
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         fs::write(&db_path, b"OLD DATABASE").unwrap();
 
-        // "test database content" is 21 bytes.
-        let err = restore_backup_capped(&backup_path, &db_path, 20).unwrap_err();
+        // TEST_DB is 37 bytes.
+        let err = restore_backup_capped(&backup_path, &db_path, 36).unwrap_err();
         assert!(matches!(err, WalletError::BackupError(_)));
         assert_eq!(fs::read_to_string(&db_path).unwrap(), "OLD DATABASE");
         // No temp file left behind.
@@ -350,8 +390,8 @@ mod tests {
         assert_eq!(leftovers.len(), 1);
 
         // Exactly at the limit is fine.
-        restore_backup_capped(&backup_path, &db_path, 21).unwrap();
-        assert_eq!(fs::read_to_string(&db_path).unwrap(), "test database content");
+        restore_backup_capped(&backup_path, &db_path, 37).unwrap();
+        assert_eq!(fs::read_to_string(&db_path).unwrap(), TEST_DB);
     }
 
     #[test]
@@ -390,7 +430,7 @@ mod tests {
 
         restore_backup(&backup_path, &db_path).unwrap();
         assert!(!wal.exists() && !shm.exists());
-        assert_eq!(fs::read_to_string(&db_path).unwrap(), "test database content");
+        assert_eq!(fs::read_to_string(&db_path).unwrap(), TEST_DB);
     }
 
     #[test]
@@ -423,21 +463,126 @@ mod tests {
     }
 
     #[test]
-    fn the_restore_limit_is_two_gibibytes() {
-        assert_eq!(MAX_RESTORED_DB_BYTES, 2 << 30);
+    fn the_restore_limit_is_256_mebibytes() {
+        assert_eq!(MAX_RESTORED_DB_BYTES, 256 << 20);
+    }
+
+    #[test]
+    fn the_entry_limit_follows_size_and_ratio() {
+        let max = MAX_RESTORED_DB_BYTES;
+        // Small entries are exempt from the ratio.
+        assert_eq!(entry_limit(max, 0), RATIO_EXEMPT_BYTES);
+        assert_eq!(entry_limit(max, 100), RATIO_EXEMPT_BYTES);
+        assert_eq!(entry_limit(max, 4096), 4096 * MAX_COMPRESSION_RATIO);
+        assert_eq!(entry_limit(max, u64::MAX), max);
+        // The size cap always wins.
+        assert_eq!(entry_limit(20, 0), 20);
+    }
+
+    /// Write a zip whose database entry is `head` followed by `zeros` zero
+    /// bytes, deflated.
+    fn deflated_zip(path: &Path, head: &[u8], zeros: usize) {
+        let mut zip = zip::ZipWriter::new(File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .compression_level(Some(9));
+        zip.start_file(DATABASE_FILENAME, options).unwrap();
+        zip.write_all(head).unwrap();
+        let chunk = vec![0u8; 1 << 20];
+        let mut left = zeros;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            zip.write_all(&chunk[..n]).unwrap();
+            left -= n;
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn an_entry_that_is_not_sqlite_is_refused_before_anything_is_written() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = temp_dir.path().join("zeros.zip");
+        deflated_zip(&backup_path, b"", 32 << 20);
+        let target = temp_dir.path().join("w");
+        fs::create_dir_all(&target).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = restore_backup(&backup_path, &target.join(DATABASE_FILENAME)).unwrap_err();
+        assert!(matches!(err, WalletError::BackupError(_)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // The header is checked before the temp file exists.
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+
+        // Through the preview path too, nothing stays behind.
+        let base = temp_dir.path().join("tmp");
+        assert!(inspect_backup_in(&backup_path, &base).is_err());
+        assert_eq!(fs::read_dir(&base).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_entry_shorter_than_the_header_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = temp_dir.path().join("short.zip");
+        zip_with_db_entry(&backup_path, b"SQLite");
+        let db_path = temp_dir.path().join(DATABASE_FILENAME);
+        assert!(matches!(restore_backup(&backup_path, &db_path), Err(WalletError::BackupError(_))));
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn an_entry_that_inflates_beyond_the_ratio_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = temp_dir.path().join("ratio.zip");
+        deflated_zip(&backup_path, SQLITE_HEADER, 8 << 20);
+        let db_path = temp_dir.path().join("w").join(DATABASE_FILENAME);
+
+        let err = restore_backup(&backup_path, &db_path).unwrap_err();
+        assert!(matches!(err, WalletError::BackupError(_)), "{err:?}");
+        assert!(!db_path.parent().unwrap().exists());
+
+        // The same when the entry declares a small size: the bytes read count.
+        declare_uncompressed_size(&backup_path, 16);
+        let err = restore_backup(&backup_path, &db_path).unwrap_err();
+        assert!(matches!(err, WalletError::BackupError(_)), "{err:?}");
+        assert!(!db_path.exists());
+        assert_eq!(fs::read_dir(db_path.parent().unwrap()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_entry_declared_larger_than_the_limit_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = create_test_backup(temp_dir.path());
+        declare_uncompressed_size(&backup_path, u32::MAX);
+        let db_path = temp_dir.path().join(DATABASE_FILENAME);
+        let err = restore_backup(&backup_path, &db_path).unwrap_err();
+        assert!(matches!(err, WalletError::BackupError(_)));
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn a_real_vault_backup_restores() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("src").join(DATABASE_FILENAME);
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let db = crate::database::Database::create(&db_path).unwrap();
+        let backup = super::super::create::create_backup(&temp_dir.path().join("b"), &db, true).unwrap();
+        drop(db);
+        let target = temp_dir.path().join("dst").join(DATABASE_FILENAME);
+        restore_backup(&backup, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), fs::read(&db_path).unwrap());
     }
 
     #[test]
     fn restore_enforces_the_limit_on_the_bytes_read_when_the_declared_size_lies() {
         let temp_dir = TempDir::new().unwrap();
         let backup_path = create_test_backup(temp_dir.path());
-        declare_uncompressed_size(&backup_path, 20);
+        declare_uncompressed_size(&backup_path, 36);
         let db_path = temp_dir.path().join("w").join(DATABASE_FILENAME);
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         fs::write(&db_path, b"OLD DATABASE").unwrap();
 
-        // Declares exactly the limit, inflates to 21.
-        let err = restore_backup_capped(&backup_path, &db_path, 20).unwrap_err();
+        // Declares exactly the limit, inflates to 37.
+        let err = restore_backup_capped(&backup_path, &db_path, 36).unwrap_err();
         assert!(matches!(err, WalletError::BackupError(_)));
         assert_eq!(fs::read_to_string(&db_path).unwrap(), "OLD DATABASE");
     }
