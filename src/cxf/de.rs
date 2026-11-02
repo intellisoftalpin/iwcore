@@ -950,6 +950,17 @@ mod tests {
     }
 
     #[test]
+    fn an_object_where_a_scalar_is_wanted_is_read_through_and_skipped() {
+        // The whole object is consumed, so reading goes on after it.
+        let v: Vec<Loose<u64>> = serde_json::from_str(r#"[{"a": 1, "b": [2, {"c": 3}]}, 4]"#).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].0, None);
+        assert_eq!(v[1].0, Some(4));
+        let s: Loose<Cow<str>> = serde_json::from_str(r#"{"k": "v"}"#).unwrap();
+        assert_eq!(s.0, None);
+    }
+
+    #[test]
     fn numbers_and_strings_of_every_kind_are_skipped_where_not_wanted() {
         let h = read(
             r#"{"version": {"major": 1}, "timestamp": 7, "accounts": [-1, 2.5, false, {"items": -1, "collections": 2.5, "id": "a"},

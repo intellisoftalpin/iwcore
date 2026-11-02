@@ -1,0 +1,66 @@
+[
+  {
+    "diff": "--- src/cxf/de.rs\n+++ replace Shape::from_map -> Result<Option<Self>, A::Error> with Ok(None)\n@@ -110,17 +110,17 @@\n     }\n     fn from_i64(_: i64) -> Option<Self> {\n         None\n     }\n     fn from_seq<A: SeqAccess<'de>>(seq: A) -> Result<Option<Self>, A::Error> {\n         drain_seq(seq).map(|()| None)\n     }\n     fn from_map<A: MapAccess<'de>>(map: A) -> Result<Option<Self>, A::Error> {\n-        drain_map(map).map(|()| None)\n+        Ok(None) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// `Some` when the value had the expected shape.\n pub(crate) struct Loose<T>(pub Option<T>);\n \n impl<'de, T: Shape<'de>> Deserialize<'de> for Loose<T> {\n     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {\n",
+    "file": "src/cxf/de.rs",
+    "function": {
+      "function_name": "Shape::from_map",
+      "return_type": "-> Result<Option<Self>, A::Error>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 119
+        },
+        "start": {
+          "column": 5,
+          "line": 117
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/cxf/de.rs:118:9: replace Shape::from_map -> Result<Option<Self>, A::Error> with Ok(None)",
+    "package": "iwcore",
+    "replacement": "Ok(None)",
+    "span": {
+      "end": {
+        "column": 38,
+        "line": 118
+      },
+      "start": {
+        "column": 9,
+        "line": 118
+      }
+    }
+  },
+  {
+    "diff": "--- src/cxf/de.rs\n+++ replace Shape::from_map -> Result<Option<Self>, A::Error> with Ok(Some(Default::default()))\n@@ -110,17 +110,17 @@\n     }\n     fn from_i64(_: i64) -> Option<Self> {\n         None\n     }\n     fn from_seq<A: SeqAccess<'de>>(seq: A) -> Result<Option<Self>, A::Error> {\n         drain_seq(seq).map(|()| None)\n     }\n     fn from_map<A: MapAccess<'de>>(map: A) -> Result<Option<Self>, A::Error> {\n-        drain_map(map).map(|()| None)\n+        Ok(Some(Default::default())) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// `Some` when the value had the expected shape.\n pub(crate) struct Loose<T>(pub Option<T>);\n \n impl<'de, T: Shape<'de>> Deserialize<'de> for Loose<T> {\n     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {\n",
+    "file": "src/cxf/de.rs",
+    "function": {
+      "function_name": "Shape::from_map",
+      "return_type": "-> Result<Option<Self>, A::Error>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 119
+        },
+        "start": {
+          "column": 5,
+          "line": 117
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/cxf/de.rs:118:9: replace Shape::from_map -> Result<Option<Self>, A::Error> with Ok(Some(Default::default()))",
+    "package": "iwcore",
+    "replacement": "Ok(Some(Default::default()))",
+    "span": {
+      "end": {
+        "column": 38,
+        "line": 118
+      },
+      "start": {
+        "column": 9,
+        "line": 118
+      }
+    }
+  }
+]

@@ -1,0 +1,163 @@
+{
+  "outcomes": [
+    {
+      "scenario": "Baseline",
+      "summary": "Success",
+      "log_path": "log/baseline.log",
+      "diff_path": null,
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 8.396287967,
+          "process_status": "Success",
+          "argv": [
+            "/home/hermes/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=iwcore@0.6.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 183.379226696,
+          "process_status": "Success",
+          "argv": [
+            "/home/hermes/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=iwcore@0.6.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/cxf/de.rs:118:9: replace Shape::from_map -> Result<Option<Self>, A::Error> with Ok(Some(Default::default()))",
+          "package": "iwcore",
+          "file": "src/cxf/de.rs",
+          "function": {
+            "function_name": "Shape::from_map",
+            "return_type": "-> Result<Option<Self>, A::Error>",
+            "span": {
+              "start": {
+                "line": 117,
+                "column": 5
+              },
+              "end": {
+                "line": 119,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 118,
+              "column": 9
+            },
+            "end": {
+              "line": 118,
+              "column": 38
+            }
+          },
+          "replacement": "Ok(Some(Default::default()))",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/src__cxf__de.rs_line_118_col_9_001.log",
+      "diff_path": "diff/src__cxf__de.rs_line_118_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.078445723,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/hermes/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=iwcore@0.6.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/cxf/de.rs:118:9: replace Shape::from_map -> Result<Option<Self>, A::Error> with Ok(None)",
+          "package": "iwcore",
+          "file": "src/cxf/de.rs",
+          "function": {
+            "function_name": "Shape::from_map",
+            "return_type": "-> Result<Option<Self>, A::Error>",
+            "span": {
+              "start": {
+                "line": 117,
+                "column": 5
+              },
+              "end": {
+                "line": 119,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 118,
+              "column": 9
+            },
+            "end": {
+              "line": 118,
+              "column": 38
+            }
+          },
+          "replacement": "Ok(None)",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__cxf__de.rs_line_118_col_9.log",
+      "diff_path": "diff/src__cxf__de.rs_line_118_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 2.613983364,
+          "process_status": "Success",
+          "argv": [
+            "/home/hermes/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=iwcore@0.6.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 94.423161763,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/hermes/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=iwcore@0.6.0"
+          ]
+        }
+      ]
+    }
+  ],
+  "total_mutants": 2,
+  "missed": 0,
+  "caught": 1,
+  "timeout": 0,
+  "unviable": 1,
+  "success": 0,
+  "start_time": "2026-11-02T15:14:01.141284125Z",
+  "end_time": "2026-11-02T15:18:51.710124702Z",
+  "cargo_mutants_version": "27.1.0"
+}
