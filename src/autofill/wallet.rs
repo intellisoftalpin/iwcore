@@ -301,9 +301,10 @@ impl Wallet {
     ///    the new one as a replacement, but a journal record alone is not
     ///    enough to drop a working passkey. The staged one is stored on the
     ///    same item, straight into the trash, and reported for confirmation;
-    /// 3. a live login whose `LINK` is the rpId's host or registrable domain
-    ///    **and** whose identity equals the user name (ignoring ASCII case): the
-    ///    passkey is added to that item;
+    /// 3. a live login whose `LINK` is the rpId's host, or shares its
+    ///    registrable domain under the full Public Suffix List (not the
+    ///    curated list login ranking uses), **and** whose identity equals the
+    ///    user name (ignoring ASCII case): the passkey is added to that item;
     /// 4. otherwise a new item in the `AutoFill` folder.
     fn apply_staged_passkey(
         &mut self,
@@ -350,8 +351,7 @@ impl Wallet {
         if !user.is_empty()
             && let Some(entry) = known.iter().find(|e| {
                 e.username.trim().eq_ignore_ascii_case(user)
-                    && index::rank(e, &passkey.rp_id)
-                        .is_some_and(|t| t >= super::domain::MatchTier::RegistrableDomain)
+                    && e.hosts.iter().any(|h| super::domain::passkey_matches_host(h, &passkey.rp_id))
             })
         {
             let item_id = entry.item_id.clone();
@@ -1094,6 +1094,63 @@ mod tests {
         assert!(summary.created.is_empty());
         assert!(summary.updated.is_empty());
         assert_eq!(summary.skipped, 0);
+    }
+
+    // ---- where a staged passkey attaches -------------------------------------
+
+    fn staged_passkey_for(keys: &crate::autofill::AutofillKeys, id: &str, rp_id: &str, user: &str) -> Vec<u8> {
+        let reg = crate::passkey::sign::register(&crate::passkey::sign::RegisterInput {
+            rp_id,
+            user_name: user,
+            user_display_name: user,
+            user_handle: id.as_bytes(),
+            exclude_credentials: &[],
+            held_credential_ids: &[],
+            user_verified: true,
+            now: 1,
+        })
+        .unwrap();
+        let mut r = record(id, user);
+        r.op = PendingOp::CreatePasskey;
+        r.password = String::new();
+        r.passkey = Some(reg.record.to_field_value().unwrap());
+        journal::seal_record(&r, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap()
+    }
+
+    #[test]
+    fn a_passkey_never_attaches_to_a_login_of_another_site_under_a_hosting_suffix() {
+        let (mut w, _dir) = wallet();
+        let theirs = login(&mut w, "Theirs", "https://theirs.onrender.com/login", "bkv", "pw");
+        let keys = generate_keys().unwrap();
+        let j = staged_passkey_for(&keys, "p-ours", "ours.onrender.com", "bkv");
+
+        let summary = w.drain_autofill_journal(&j, &dk(&keys), None).unwrap();
+        assert_eq!(summary.passkeys_added, 1);
+        assert!(summary.updated.is_empty(), "{summary:?}");
+        assert_eq!(summary.created.len(), 1);
+        assert_ne!(summary.created[0], theirs);
+        let on_theirs = w.list_passkeys().unwrap().into_iter().filter(|p| p.item_id == theirs).count();
+        assert_eq!(on_theirs, 0);
+    }
+
+    #[test]
+    fn a_passkey_attaches_to_a_login_on_its_registrable_domain_or_exact_host() {
+        let (mut w, _dir) = wallet();
+        let parent = login(&mut w, "Example", "https://example.com", "bkv", "pw");
+        let exact = login(&mut w, "Render", "https://mine.onrender.com", "bkv", "pw");
+        let keys = generate_keys().unwrap();
+        let mut j = staged_passkey_for(&keys, "p-sub", "login.example.com", "BKV");
+        j.extend(staged_passkey_for(&keys, "p-exact", "mine.onrender.com", "bkv"));
+
+        let summary = w.drain_autofill_journal(&j, &dk(&keys), None).unwrap();
+        assert_eq!(summary.passkeys_added, 2);
+        assert!(summary.created.is_empty(), "{summary:?}");
+        assert_eq!(summary.updated, vec![parent.clone(), exact.clone()]);
+        let mut holders: Vec<_> = w.list_passkeys().unwrap().into_iter().map(|p| p.item_id).collect();
+        holders.sort();
+        let mut want = vec![parent, exact];
+        want.sort();
+        assert_eq!(holders, want);
     }
 
     // ---- reconciliation of unattributed create records ----------------------

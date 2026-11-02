@@ -250,6 +250,37 @@ fn is_plausible_host(host: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_' || b == b':')
 }
 
+/// Registrable domain of a normalized host under the full Public Suffix List
+/// (ICANN and private sections, `psl` crate), as WebAuthn scopes passkeys.
+///
+/// The curated list above is enough to rank logins, but a passkey is bound to
+/// its rpId: two hosts under a hosting suffix the curated list does not carry
+/// (`a.onrender.com`, `b.onrender.com`) belong to different owners. Returns
+/// `None` for IP literals and for hosts that are themselves public suffixes.
+pub(crate) fn psl_registrable_domain(host: &str) -> Option<&str> {
+    if host.is_empty() || is_ip_literal(host) {
+        return None;
+    }
+    psl::domain_str(host)
+}
+
+/// May a passkey for `rp_id` sit on a login stored for `stored_host`?
+///
+/// Yes when both normalize to the same host, or when both have the same
+/// registrable domain under the full Public Suffix List.
+pub(crate) fn passkey_matches_host(stored_host: &str, rp_id: &str) -> bool {
+    let (Some(stored), Some(rp)) = (normalize_host(stored_host), normalize_host(rp_id)) else {
+        return false;
+    };
+    if stored == rp {
+        return true;
+    }
+    matches!(
+        (psl_registrable_domain(&stored), psl_registrable_domain(&rp)),
+        (Some(a), Some(b)) if a == b
+    )
+}
+
 fn is_ip_literal(host: &str) -> bool {
     // IPv6 (already unbracketed by strip_port) always contains a colon.
     if host.contains(':') {
@@ -578,5 +609,37 @@ mod tests {
         // And no accidental substring matching.
         assert_eq!(match_tier("example.com", "notexample.com"), None);
         assert_eq!(match_tier("example.com", "example.com.evil.net"), None);
+    }
+
+    #[test]
+    fn passkeys_match_by_exact_host_or_the_full_public_suffix_list() {
+        // Exact host, after normalization.
+        assert!(passkey_matches_host("https://www.Example.com/login", "example.com"));
+        assert!(passkey_matches_host("localhost", "localhost"));
+        // Same registrable domain under the full list.
+        assert!(passkey_matches_host("example.com", "login.example.com"));
+        assert!(passkey_matches_host("app.example.co.uk", "example.co.uk"));
+        // Hosting suffixes the curated list does not carry still separate owners.
+        assert!(!is_public_suffix("onrender.com"), "the curated list lacks it; the full list is what matters");
+        assert!(!passkey_matches_host("theirs.onrender.com", "ours.onrender.com"));
+        assert!(!passkey_matches_host("alice.github.io", "mallory.github.io"));
+        assert!(!passkey_matches_host("example.co.uk", "other.co.uk"));
+        // A public suffix, an IP literal or junk never matches by domain.
+        assert!(!passkey_matches_host("onrender.com", "ours.onrender.com"));
+        assert!(!passkey_matches_host("10.0.0.1", "10.0.0.2"));
+        assert!(!passkey_matches_host("", "example.com"));
+        assert!(!passkey_matches_host("example.com", "javascript:alert(1)"));
+        assert!(!passkey_matches_host("example.com", "notexample.com"));
+    }
+
+    #[test]
+    fn psl_registrable_domain_refuses_suffixes_and_ip_literals() {
+        assert_eq!(psl_registrable_domain("a.b.example.com"), Some("example.com"));
+        assert_eq!(psl_registrable_domain("ours.onrender.com"), Some("ours.onrender.com"));
+        assert_eq!(psl_registrable_domain("onrender.com"), None);
+        assert_eq!(psl_registrable_domain("co.uk"), None);
+        assert_eq!(psl_registrable_domain("192.168.1.1"), None);
+        assert_eq!(psl_registrable_domain("::1"), None);
+        assert_eq!(psl_registrable_domain(""), None);
     }
 }
