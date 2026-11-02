@@ -116,7 +116,7 @@ fn has_v6_backup(backup_folder: &Path, temp_base: &Path) -> Result<bool> {
 /// The record is checked first: an unknown scheme or KDF, or cost parameters
 /// outside [`crypto::kdf::KdfParams::check_stored`], are an error and no
 /// derivation is attempted.
-fn unwrap_with_password(rec: &CryptoRecord, password: &str) -> Result<Option<[u8; DEK_LEN]>> {
+fn unwrap_with_password(rec: &CryptoRecord, password: &str) -> Result<Option<Zeroizing<[u8; DEK_LEN]>>> {
     if rec.scheme != CRYPTO_SCHEME_V6 {
         return Err(WalletError::NotSupported(format!("crypto scheme {}", rec.scheme)));
     }
@@ -333,7 +333,7 @@ impl Wallet {
             // v6 vault: derive KEK from the stored params and unwrap the DEK.
             match unwrap_with_password(&rec, password)? {
                 Some(dek) => {
-                    self.unlocked = Some(Unlocked { dek: Zeroizing::new(dek) });
+                    self.unlocked = Some(Unlocked { dek });
                     self.clear_caches();
                     self.add_system_labels()?;
                     Ok(true)
@@ -417,7 +417,7 @@ impl Wallet {
     /// strict no-op. Repeatable any number of times.
     pub fn recover_quarantined(&mut self, password: &str) -> Result<RecoveryResult> {
         self.ensure_unlocked()?;
-        let dek = *self.dek()?;
+        let dek = Zeroizing::new(*self.dek()?);
         let mut chain = crypto::legacy::LegacyKeyChain::new(password, self.encryption_count);
 
         let rows = {
@@ -617,7 +617,7 @@ impl Wallet {
     pub fn change_password(&mut self, new_password: &str) -> Result<bool> {
         self.ensure_unlocked()?;
 
-        let dek = *self.dek()?;
+        let dek = Zeroizing::new(*self.dek()?);
         let params = crypto::kdf::KdfParams::current();
         let salt = random_bytes(KDF_SALT_LEN)?;
         let kek = crypto::kdf::derive_kek(new_password.as_bytes(), &salt, params)

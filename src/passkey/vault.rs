@@ -293,9 +293,9 @@ mod tests {
     fn exports_show_one_line_and_no_secret() {
         let (mut w, _t, _item, _field, record) = wallet_with_passkey();
         let outputs = [
-            String::from_utf8(w.export_csv().unwrap()).unwrap(),
-            String::from_utf8(w.export_json().unwrap()).unwrap(),
-            String::from_utf8(w.export_xml().unwrap()).unwrap(),
+            String::from_utf8(w.export_csv().unwrap().to_vec()).unwrap(),
+            String::from_utf8(w.export_json().unwrap().to_vec()).unwrap(),
+            String::from_utf8(w.export_xml().unwrap().to_vec()).unwrap(),
         ];
         for out in &outputs {
             assert_no_secret("export", out, &record);

@@ -71,8 +71,9 @@ fn legacy_snapshot(db_path: &Path, password: &str) -> Snapshot {
             .unwrap()
             .map(|x| x.unwrap())
             .collect();
+        let mut chain = legacy::LegacyKeyChain::new(password, enc_count);
         for (id, blob, deleted) in rows {
-            if let Ok(pt) = legacy::decrypt(&blob, password, enc_count, None) {
+            if let Ok(pt) = chain.decrypt(&blob) {
                 if deleted != 0 {
                     deleted_items.insert(id, pt);
                 } else {
@@ -93,8 +94,9 @@ fn legacy_snapshot(db_path: &Path, password: &str) -> Snapshot {
             .unwrap()
             .map(|x| x.unwrap())
             .collect();
+        let mut chain = legacy::LegacyKeyChain::new(password, enc_count);
         for (iid, fid, blob, deleted) in rows {
-            if let Ok(pt) = legacy::decrypt(&blob, password, enc_count, None) {
+            if let Ok(pt) = chain.decrypt(&blob) {
                 if deleted != 0 {
                     deleted_fields.insert((iid, fid), pt);
                 } else {
@@ -498,7 +500,7 @@ fn undecryptable_deleted_records_are_purged() {
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))
         .unwrap()
         .map(|x| x.unwrap())
-        .filter(|(_, blob)| legacy::decrypt(blob, TEST_PASSWORD, enc_count, None).is_err())
+        .filter(|(_, blob)| legacy::LegacyKeyChain::new(TEST_PASSWORD, enc_count).decrypt(blob).is_err())
         .map(|(id, _)| id)
         .collect();
     drop(stmt);

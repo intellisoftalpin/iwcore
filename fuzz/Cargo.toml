@@ -65,3 +65,17 @@ path = "fuzz_targets/autofill_index.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "legacy_decrypt"
+path = "fuzz_targets/legacy_decrypt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "origin_check"
+path = "fuzz_targets/origin_check.rs"
+test = false
+doc = false
+bench = false

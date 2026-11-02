@@ -7,7 +7,7 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     let Ok(text) = std::str::from_utf8(data) else { return };
     if let Ok(r) = PasskeyRecord::from_field_value(text) {
-        let again = PasskeyRecord::from_field_value(&r.to_field_value().unwrap()).unwrap();
+        let again = r.fuzz_round_trip().unwrap();
         assert_eq!(again.credential_id, r.credential_id);
         let _ = iwcore::passkey::sign::assert(&r, &r.rp_id, &[0; 32], true);
     }

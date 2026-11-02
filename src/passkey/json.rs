@@ -7,8 +7,9 @@
 //!
 //! - [`CreationOptions::parse`] / [`RequestOptions::parse`]: the
 //!   `PublicKeyCredentialCreationOptionsJSON` / `RequestOptionsJSON` documents;
-//! - [`client_data_json`]: the exact `clientDataJSON` bytes and their SHA-256,
-//!   for callers that do not supply a `clientDataHash` (native apps);
+//! - [`client_data`]: what gets signed for a caller: a privileged browser's own
+//!   `clientDataHash`, or `clientDataJSON` built here, always for a native app;
+//! - [`client_data_json`]: the exact `clientDataJSON` bytes and their SHA-256;
 //! - [`registration_response_json`] / [`assertion_response_json`]: the
 //!   `PublicKeyCredential` JSON returned to the system.
 
@@ -17,6 +18,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::b64;
+use super::origin::is_android_origin;
 use super::prf::{PrfInputs, PrfOutputs, INPUT_MAX};
 use super::record::{validate_rp_id, CREDENTIAL_ID_MAX, USER_HANDLE_MAX, USER_NAME_MAX};
 use super::sign::{Assertion, Registration};
@@ -211,7 +213,7 @@ pub enum Ceremony {
 /// Field order as WebAuthn's serialisation defines it: type, challenge, origin,
 /// crossOrigin, then the Android extra.
 #[derive(Serialize)]
-struct ClientData<'a> {
+struct ClientDataDoc<'a> {
     #[serde(rename = "type")]
     kind: &'a str,
     challenge: String,
@@ -230,7 +232,7 @@ pub fn client_data_json(
     origin: &str,
     android_package_name: Option<&str>,
 ) -> Result<(Vec<u8>, [u8; 32])> {
-    let data = ClientData {
+    let data = ClientDataDoc {
         kind: match ceremony {
             Ceremony::Create => "webauthn.create",
             Ceremony::Get => "webauthn.get",
@@ -244,6 +246,55 @@ pub fn client_data_json(
         .map_err(|e| WalletError::EncryptionError(format!("clientDataJSON encode failed: {e}")))?;
     let hash = Sha256::digest(&bytes).into();
     Ok((bytes, hash))
+}
+
+/// What a response is bound to: the `clientDataJSON` to return (when it was
+/// built here) and the `clientDataHash` to sign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientData {
+    /// `clientDataJSON` for the response, or `None` when a privileged browser
+    /// built it itself and only handed over its hash.
+    pub json: Option<Vec<u8>>,
+    /// The hash that [`super::sign::assert`] signs.
+    pub hash: [u8; 32],
+}
+
+/// Decide what is signed for a caller at `origin`, which must come from the
+/// system (Android's `getOrigin` for a privileged browser, or
+/// [`super::origin::android_origin`] for an app verified through asset links).
+///
+/// - **Native app** (`android:apk-key-hash:` origin): an app never chooses the
+///   signed bytes. A `supplied_hash` is refused, `android_package_name` is
+///   required, and `clientDataJSON` is built here with the app's package.
+/// - **Browser** (web origin): its own `clientDataHash` is signed as given
+///   (it built `clientDataJSON` itself); without one, `clientDataJSON` is
+///   built here. A package name is refused: it belongs to apps only.
+pub fn client_data(
+    ceremony: Ceremony,
+    challenge: &[u8],
+    origin: &str,
+    android_package_name: Option<&str>,
+    supplied_hash: Option<&[u8; 32]>,
+) -> Result<ClientData> {
+    let package = android_package_name.filter(|p| !p.is_empty());
+    if is_android_origin(origin) {
+        if supplied_hash.is_some() {
+            return Err(invalid("an app may not supply its own clientDataHash"));
+        }
+        let package = package.ok_or_else(|| invalid("an app origin needs its package name"))?;
+        let (json, hash) = client_data_json(ceremony, challenge, origin, Some(package))?;
+        return Ok(ClientData { json: Some(json), hash });
+    }
+    if package.is_some() {
+        return Err(invalid("a package name belongs to an app origin only"));
+    }
+    match supplied_hash {
+        Some(hash) => Ok(ClientData { json: None, hash: *hash }),
+        None => {
+            let (json, hash) = client_data_json(ceremony, challenge, origin, None)?;
+            Ok(ClientData { json: Some(json), hash })
+        }
+    }
 }
 
 /// PRF result of a creation: whether the passkey supports PRF, and the outputs
@@ -622,6 +673,47 @@ mod tests {
         assert_eq!(v["origin"], "android:apk-key-hash:abc\"},\"x\":\"", "quotes stay inside the value");
         assert_eq!(v["androidPackageName"], "com.example");
         assert!(v.get("x").is_none());
+    }
+
+    #[test]
+    fn an_app_never_supplies_its_own_client_data_hash() {
+        let app = crate::passkey::origin::android_origin(&[0xA5; 32]);
+        for ceremony in [Ceremony::Create, Ceremony::Get] {
+            let refused = client_data(ceremony, &[1; 16], &app, Some("com.example.app"), Some(&[7; 32]));
+            assert!(matches!(refused, Err(WalletError::InvalidInput(_))), "{ceremony:?}");
+            // Built here instead, naming the app's package.
+            let cd = client_data(ceremony, &[1; 16], &app, Some("com.example.app"), None).unwrap();
+            let json = cd.json.clone().unwrap();
+            assert_eq!(cd.hash, <[u8; 32]>::from(Sha256::digest(&json)));
+            let v: Value = serde_json::from_slice(&json).unwrap();
+            assert_eq!(v["origin"], app.as_str());
+            assert_eq!(v["androidPackageName"], "com.example.app");
+            assert_eq!(
+                (json, cd.hash),
+                client_data_json(ceremony, &[1; 16], &app, Some("com.example.app")).unwrap()
+            );
+        }
+        // The rule holds whatever the case of the origin's scheme.
+        let upper = app.replacen("android:apk-key-hash:", "ANDROID:APK-KEY-HASH:", 1);
+        assert!(client_data(Ceremony::Get, &[1; 16], &upper, Some("p"), Some(&[7; 32])).is_err());
+        // An app origin without its package is refused too.
+        assert!(client_data(Ceremony::Get, &[1; 16], &app, None, None).is_err());
+        assert!(client_data(Ceremony::Get, &[1; 16], &app, Some(""), None).is_err());
+    }
+
+    #[test]
+    fn a_browser_may_supply_its_own_client_data_hash() {
+        let web = "https://login.example.com";
+        let cd = client_data(Ceremony::Get, &[1; 16], web, None, Some(&[7; 32])).unwrap();
+        assert_eq!(cd, ClientData { json: None, hash: [7; 32] });
+        let built = client_data(Ceremony::Create, &[1; 16], web, Some(""), None).unwrap();
+        assert_eq!(
+            (built.json.unwrap(), built.hash),
+            client_data_json(Ceremony::Create, &[1; 16], web, None).unwrap()
+        );
+        // A package name belongs to an app origin only.
+        assert!(client_data(Ceremony::Get, &[1; 16], web, Some("com.example"), None).is_err());
+        assert!(client_data(Ceremony::Get, &[1; 16], web, Some("com.example"), Some(&[7; 32])).is_err());
     }
 
     #[test]

@@ -34,7 +34,9 @@ impl Default for IWProperties {
 }
 
 /// Wallet item (folder or entry)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` prints `[redacted]` in place of the decrypted name.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct IWItem {
     /// Unique item ID (8 chars)
     pub item_id: String,
@@ -52,6 +54,21 @@ pub struct IWItem {
     pub change_timestamp: DateTime<Utc>,
     /// Soft delete flag
     pub deleted: bool,
+}
+
+impl std::fmt::Debug for IWItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IWItem")
+            .field("item_id", &self.item_id)
+            .field("parent_id", &self.parent_id)
+            .field("name", &crate::utils::REDACTED)
+            .field("icon", &self.icon)
+            .field("folder", &self.folder)
+            .field("create_timestamp", &self.create_timestamp)
+            .field("change_timestamp", &self.change_timestamp)
+            .field("deleted", &self.deleted)
+            .finish()
+    }
 }
 
 impl IWItem {
@@ -237,6 +254,25 @@ mod tests {
         assert!(props.database_id.is_empty());
         assert!(props.sync_timestamp.is_none());
         assert!(props.update_timestamp.is_none());
+    }
+
+    #[test]
+    fn item_debug_redacts_the_name() {
+        let item = IWItem {
+            item_id: "abcd1234".into(),
+            parent_id: Some(crate::ROOT_ID.into()),
+            name: "My secret bank".into(),
+            icon: "bank".into(),
+            folder: false,
+            create_timestamp: Utc::now(),
+            change_timestamp: Utc::now(),
+            deleted: false,
+        };
+        for text in [format!("{item:?}"), format!("{item:#?}")] {
+            assert!(!text.contains("My secret bank"), "{text}");
+            assert!(text.contains(crate::utils::REDACTED));
+            assert!(text.contains("abcd1234"), "ids stay visible");
+        }
     }
 
     #[test]

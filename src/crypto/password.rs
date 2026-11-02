@@ -19,6 +19,7 @@
 //! structure. Use the random mode for high-value secrets.
 
 use rand::rngs::{StdRng, SysRng};
+use rand::seq::IndexedRandom;
 use rand::{RngExt, SeedableRng};
 
 use super::wordlist::WORDS;
@@ -30,8 +31,18 @@ use super::wordlist::WORDS;
 /// `getrandom(2)` on modern Linux, `BCryptGenRandom` on Windows).
 /// We re-seed per call so password generation always reflects the current
 /// OS entropy state, never thread-local cached state.
+///
+/// The generators return a plain `String`, so a failing OS entropy source
+/// (no usable source at all, e.g. a broken sandbox) is the one condition that
+/// still aborts here: there is no safe password to return without it.
+#[allow(clippy::expect_used)]
 fn csprng() -> StdRng {
     StdRng::try_from_rng(&mut SysRng).expect("OS entropy source (SysRng) unavailable")
+}
+
+/// A uniformly random element of `items`, or `fallback` when it is empty.
+fn pick(items: &[char], rng: &mut StdRng, fallback: char) -> char {
+    items.choose(rng).copied().unwrap_or(fallback)
 }
 
 const LOWER_LETTERS: &str = "qwertyuiopasdfghjklzxcvbnm";
@@ -178,8 +189,7 @@ pub fn generate_password(options: &PasswordOptions) -> String {
     let remaining = options.length - required.len();
     let mut password_chars: Vec<char> = required;
     for _ in 0..remaining {
-        let idx = rng.random_range(0..pool_chars.len());
-        password_chars.push(pool_chars[idx]);
+        password_chars.push(pick(&pool_chars, &mut rng, 'a'));
     }
 
     // Shuffle so the guaranteed chars aren't always at the start.
@@ -196,11 +206,7 @@ fn pick_from_class(class: &str, avoid_ambiguous: bool, rng: &mut StdRng) -> Opti
         .chars()
         .filter(|c| !avoid_ambiguous || !AMBIGUOUS_CHARS.contains(*c))
         .collect();
-    if candidates.is_empty() {
-        None
-    } else {
-        Some(candidates[rng.random_range(0..candidates.len())])
-    }
+    candidates.choose(rng).copied()
 }
 
 /// Fisher-Yates shuffle in place using the given CSPRNG.
@@ -248,17 +254,18 @@ pub fn generate_clever_password(pattern: &str) -> String {
     let mut password = String::with_capacity(pattern.len());
 
     for ch in pattern.chars() {
-        let generated_char = if LOWER_LETTERS.contains(ch) {
-            lower_chars[rng.random_range(0..lower_chars.len())]
+        let class = if LOWER_LETTERS.contains(ch) {
+            &lower_chars
         } else if UPPER_LETTERS.contains(ch) {
-            upper_chars[rng.random_range(0..upper_chars.len())]
+            &upper_chars
         } else if DIGITS.contains(ch) {
-            digit_chars[rng.random_range(0..digit_chars.len())]
+            &digit_chars
         } else if SPECIAL_SYMBOLS.contains(ch) {
-            special_chars[rng.random_range(0..special_chars.len())]
+            &special_chars
         } else {
-            all_chars[rng.random_range(0..all_chars.len())]
+            &all_chars
         };
+        let generated_char = pick(class, &mut rng, 'a');
         password.push(generated_char);
     }
 
@@ -325,11 +332,11 @@ pub fn generate_memorable_password(opts: &MemorableOptions) -> String {
     }
 
     for _ in 0..opts.num_words {
-        let word = WORDS[rng.random_range(0..WORDS.len())];
+        let word = WORDS.choose(&mut rng).copied().unwrap_or_default();
         let mut s = apply_caps(word, opts.caps);
         for _ in 0..opts.digits_per_word {
             let digit = rng.random_range(0..10u32);
-            s.push(char::from_digit(digit, 10).unwrap());
+            s.push(char::from_digit(digit, 10).unwrap_or('0'));
         }
         segments.push(s);
     }
@@ -339,27 +346,22 @@ pub fn generate_memorable_password(opts: &MemorableOptions) -> String {
 
 fn apply_caps(word: &str, caps: MemorableCaps) -> String {
     let chars: Vec<char> = word.chars().collect();
-    if chars.is_empty() {
+    let split = match caps {
+        MemorableCaps::First => chars.split_first().map(|(c, rest)| (rest, *c, true)),
+        MemorableCaps::Last => chars.split_last().map(|(c, rest)| (rest, *c, false)),
+    };
+    let Some((rest, cap, cap_first)) = split else {
         return String::new();
+    };
+    let mut out = String::with_capacity(word.len());
+    if cap_first {
+        out.push(cap.to_ascii_uppercase());
     }
-    match caps {
-        MemorableCaps::First => {
-            let mut out = String::with_capacity(word.len());
-            out.push(chars[0].to_ascii_uppercase());
-            for &c in &chars[1..] {
-                out.push(c);
-            }
-            out
-        }
-        MemorableCaps::Last => {
-            let mut out = String::with_capacity(word.len());
-            for &c in &chars[..chars.len() - 1] {
-                out.push(c);
-            }
-            out.push(chars[chars.len() - 1].to_ascii_uppercase());
-            out
-        }
+    out.extend(rest.iter());
+    if !cap_first {
+        out.push(cap.to_ascii_uppercase());
     }
+    out
 }
 
 #[cfg(test)]
@@ -795,5 +797,23 @@ mod tests {
         // password.rs alone still trips the regression guard if the wordlist
         // is swapped out.
         assert_eq!(WORDS.len(), 1024);
+    }
+
+    #[test]
+    fn apply_caps_handles_short_words() {
+        assert_eq!(apply_caps("", MemorableCaps::First), "");
+        assert_eq!(apply_caps("", MemorableCaps::Last), "");
+        assert_eq!(apply_caps("a", MemorableCaps::First), "A");
+        assert_eq!(apply_caps("a", MemorableCaps::Last), "A");
+        assert_eq!(apply_caps("word", MemorableCaps::First), "Word");
+        assert_eq!(apply_caps("word", MemorableCaps::Last), "worD");
+        assert_eq!(apply_caps("жук", MemorableCaps::First), "жук");
+    }
+
+    #[test]
+    fn pick_falls_back_on_an_empty_class() {
+        let mut rng = csprng();
+        assert_eq!(pick(&[], &mut rng, 'q'), 'q');
+        assert_eq!(pick(&['x'], &mut rng, 'q'), 'x');
     }
 }

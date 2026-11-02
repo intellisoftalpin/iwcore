@@ -11,6 +11,7 @@
 //! what makes future hardening a cheap DEK re-wrap rather than a data re-encrypt.
 
 use argon2::{Algorithm, Argon2, Params, Version};
+use zeroize::Zeroizing;
 
 /// KEK length (32 bytes = 256 bits).
 pub const KEK_LEN: usize = 32;
@@ -85,14 +86,14 @@ impl KdfParams {
 }
 
 /// Derive a 32-byte KEK from a password and salt using Argon2id with the given
-/// parameters.
-pub fn derive_kek(password: &[u8], salt: &[u8], params: KdfParams) -> Result<[u8; KEK_LEN], String> {
+/// parameters. The KEK is wiped when the returned value is dropped.
+pub fn derive_kek(password: &[u8], salt: &[u8], params: KdfParams) -> Result<Zeroizing<[u8; KEK_LEN]>, String> {
     let p = Params::new(params.m_cost_kib, params.t_cost, params.p_cost, Some(KEK_LEN))
         .map_err(|e| format!("Argon2 params invalid: {e}"))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, p);
-    let mut out = [0u8; KEK_LEN];
+    let mut out = Zeroizing::new([0u8; KEK_LEN]);
     argon
-        .hash_password_into(password, salt, &mut out)
+        .hash_password_into(password, salt, out.as_mut_slice())
         .map_err(|e| format!("Argon2 derivation failed: {e}"))?;
     Ok(out)
 }
@@ -135,6 +136,12 @@ mod tests {
         let a = derive_kek(b"pw", salt, KdfParams { m_cost_kib: 256, t_cost: 1, p_cost: 1 }).unwrap();
         let b = derive_kek(b"pw", salt, KdfParams { m_cost_kib: 512, t_cost: 2, p_cost: 1 }).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn kek_is_returned_in_a_wiping_wrapper() {
+        let k: Zeroizing<[u8; KEK_LEN]> = derive_kek(b"pw", b"0123456789abcdef", fast()).unwrap();
+        assert_ne!(*k, [0u8; KEK_LEN]);
     }
 
     #[test]

@@ -1,4 +1,10 @@
 //! Multi-format export functionality (PDF, CSV, JSON, XML)
+//!
+//! Every export is the plaintext vault. It is returned in a buffer that is
+//! wiped on drop; callers hand it to the user (share sheet, save dialog) and
+//! must not keep or persist their own copy.
+
+use zeroize::Zeroizing;
 
 use crate::error::Result;
 use super::wallet::Wallet;
@@ -6,50 +12,50 @@ use super::wallet::Wallet;
 impl Wallet {
     /// Export all wallet data as a PDF document.
     ///
-    /// Returns the PDF file contents as bytes.
-    pub fn export_pdf(&mut self) -> Result<Vec<u8>> {
+    /// Returns the PDF file contents as bytes, wiped on drop.
+    pub fn export_pdf(&mut self) -> Result<Zeroizing<Vec<u8>>> {
         self.ensure_unlocked()?;
 
         let items = self.get_items()?.to_vec();
         let fields = self.export_fields()?;
 
-        crate::export::generate_pdf(&items, &fields)
+        crate::export::generate_pdf(&items, &fields).map(Zeroizing::new)
     }
 
     /// Export all wallet data as an RFC 4180 CSV document.
     ///
-    /// Returns the CSV file contents as UTF-8 bytes.
-    pub fn export_csv(&mut self) -> Result<Vec<u8>> {
+    /// Returns the CSV file contents as UTF-8 bytes, wiped on drop.
+    pub fn export_csv(&mut self) -> Result<Zeroizing<Vec<u8>>> {
         self.ensure_unlocked()?;
 
         let items = self.get_items()?.to_vec();
         let fields = self.export_fields()?;
 
-        crate::export::generate_csv(&items, &fields)
+        crate::export::generate_csv(&items, &fields).map(Zeroizing::new)
     }
 
     /// Export all wallet data as a JSON document.
     ///
-    /// Returns pretty-printed JSON as UTF-8 bytes.
-    pub fn export_json(&mut self) -> Result<Vec<u8>> {
+    /// Returns pretty-printed JSON as UTF-8 bytes, wiped on drop.
+    pub fn export_json(&mut self) -> Result<Zeroizing<Vec<u8>>> {
         self.ensure_unlocked()?;
 
         let items = self.get_items()?.to_vec();
         let fields = self.export_fields()?;
 
-        crate::export::generate_json(&items, &fields)
+        crate::export::generate_json(&items, &fields).map(Zeroizing::new)
     }
 
     /// Export all wallet data as an XML document.
     ///
-    /// Returns the XML file contents as UTF-8 bytes.
-    pub fn export_xml(&mut self) -> Result<Vec<u8>> {
+    /// Returns the XML file contents as UTF-8 bytes, wiped on drop.
+    pub fn export_xml(&mut self) -> Result<Zeroizing<Vec<u8>>> {
         self.ensure_unlocked()?;
 
         let items = self.get_items()?.to_vec();
         let fields = self.export_fields()?;
 
-        crate::export::generate_xml(&items, &fields)
+        crate::export::generate_xml(&items, &fields).map(Zeroizing::new)
     }
 
     /// Fields as exports show them: a passkey becomes one readable line,
@@ -93,7 +99,7 @@ mod tests {
     #[test]
     fn export_csv_contains_values() {
         let (mut wallet, _t) = populated();
-        let csv = String::from_utf8(wallet.export_csv().unwrap()).unwrap();
+        let csv = String::from_utf8(wallet.export_csv().unwrap().to_vec()).unwrap();
         assert!(csv.contains("My Bank"));
         assert!(csv.contains("user@example.com"));
         assert!(csv.contains("s3cr3t!"));
@@ -102,7 +108,7 @@ mod tests {
     #[test]
     fn export_json_is_valid_and_contains_values() {
         let (mut wallet, _t) = populated();
-        let json = String::from_utf8(wallet.export_json().unwrap()).unwrap();
+        let json = String::from_utf8(wallet.export_json().unwrap().to_vec()).unwrap();
         assert!(json.contains("user@example.com"));
         // Must be syntactically valid JSON.
         let _: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -111,12 +117,24 @@ mod tests {
     #[test]
     fn export_xml_contains_values_and_escapes_specials() {
         let (mut wallet, _t) = populated();
-        let xml = String::from_utf8(wallet.export_xml().unwrap()).unwrap();
+        let xml = String::from_utf8(wallet.export_xml().unwrap().to_vec()).unwrap();
         assert!(xml.contains("user@example.com"));
         // The raw `<` and `&` from the note value must be entity-escaped.
         assert!(xml.contains("&lt;"));
         assert!(xml.contains("&amp;"));
         assert!(!xml.contains("a<b & c"), "raw specials must not appear unescaped");
+    }
+
+    #[test]
+    fn exports_are_returned_in_wiping_buffers() {
+        let (mut wallet, _t) = populated();
+        let csv: zeroize::Zeroizing<Vec<u8>> = wallet.export_csv().unwrap();
+        let json: zeroize::Zeroizing<Vec<u8>> = wallet.export_json().unwrap();
+        let xml: zeroize::Zeroizing<Vec<u8>> = wallet.export_xml().unwrap();
+        let pdf: zeroize::Zeroizing<Vec<u8>> = wallet.export_pdf().unwrap();
+        for out in [&csv, &json, &xml, &pdf] {
+            assert!(!out.is_empty());
+        }
     }
 
     #[test]

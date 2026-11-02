@@ -8,10 +8,17 @@
 //! **IMPORTANT**: The zero IV is a security weakness but is required for
 //! backward compatibility with existing encrypted data.
 
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
 use aes::Aes256;
-use cbc::{Encryptor, Decryptor};
-use cbc::cipher::{BlockModeEncrypt, BlockModeDecrypt, KeyIvInit};
+#[cfg(test)]
+use cbc::Encryptor;
+#[cfg(test)]
+use cbc::cipher::BlockModeEncrypt;
+use cbc::Decryptor;
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
 use block_padding::Pkcs7;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::key::{prepare_key, KEY_LENGTH};
 use super::md5::md5_hex;
@@ -26,6 +33,7 @@ const ZERO_IV: [u8; IV_SIZE] = [0u8; IV_SIZE];
 /// MD5 hex string length
 const MD5_HEX_LENGTH: usize = 32;
 
+#[cfg(test)]
 type Aes256CbcEnc = Encryptor<Aes256>;
 type Aes256CbcDec = Decryptor<Aes256>;
 
@@ -41,7 +49,11 @@ type Aes256CbcDec = Decryptor<Aes256>;
 /// # Returns
 ///
 /// Encrypted bytes on success, or error message on failure
-pub fn encrypt(
+///
+/// Test-only: the legacy scheme is never written, it is only read for the
+/// migration. Tests use this to build legacy fixtures.
+#[cfg(test)]
+pub(crate) fn encrypt(
     plaintext: &str,
     password: &str,
     re_encryption_count: u32,
@@ -55,13 +67,11 @@ pub fn encrypt(
     let full_text = format!("{}{}", md5_checksum, plaintext);
     let data = full_text.as_bytes();
 
-    // Calculate padded length (must be multiple of 16)
-    let block_size = 16;
-    let padded_len = ((data.len() / block_size) + 1) * block_size;
-
-    // Create buffer with space for padding
-    let mut buffer = vec![0u8; padded_len];
-    buffer[..data.len()].copy_from_slice(data);
+    // Buffer with room for the PKCS7 padding (always 1..=16 extra bytes).
+    let padded_len = padded_len(data.len())
+        .ok_or_else(|| "Encryption failed: plaintext too long".to_string())?;
+    let mut buffer = data.to_vec();
+    buffer.resize(padded_len, 0);
 
     // Create encryptor and encrypt
     let encryptor = Aes256CbcEnc::new(&key.into(), &ZERO_IV.into());
@@ -89,7 +99,11 @@ pub fn encrypt(
 /// # Returns
 ///
 /// Decrypted plaintext on success, or error message on failure
-pub fn decrypt(
+///
+/// Test-only reference for the single stored-count derivation; the migration
+/// reads through [`LegacyKeyChain`], which tries this key first.
+#[cfg(test)]
+pub(crate) fn decrypt(
     ciphertext: &[u8],
     password: &str,
     re_encryption_count: u32,
@@ -102,11 +116,26 @@ pub fn decrypt(
         Ok(plaintext) => Ok(plaintext),
         Err(_) => {
             // Try iOS workaround: zero first byte of key
-            let mut ios_key = key;
-            ios_key[0] = 0;
-            decrypt_with_key(ciphertext, &ios_key)
+            decrypt_with_key(ciphertext, &ios_variant(key))
         }
     }
+}
+
+/// Length of a PKCS7-padded buffer for `len` bytes of input: the next
+/// multiple of the block size strictly greater than `len`.
+#[cfg(test)]
+fn padded_len(len: usize) -> Option<usize> {
+    len.checked_div(IV_SIZE)?.checked_add(1)?.checked_mul(IV_SIZE)
+}
+
+/// The iOS-workaround variant of a key: the same key with its first byte
+/// zeroed.
+fn ios_variant(key: [u8; KEY_LENGTH]) -> [u8; KEY_LENGTH] {
+    let mut k = key;
+    if let Some(first) = k.first_mut() {
+        *first = 0;
+    }
+    k
 }
 
 /// Key-derivation modes the original C# app effectively used over its life.
@@ -144,10 +173,10 @@ impl LegacyKeyMode {
 /// path; C# threw for shorter passwords, zero-padding just makes the attempt
 /// harmless).
 fn raw_password_key(password: &str) -> [u8; KEY_LENGTH] {
-    let bytes = password.as_bytes();
     let mut key = [0u8; KEY_LENGTH];
-    let n = bytes.len().min(KEY_LENGTH);
-    key[..n].copy_from_slice(&bytes[..n]);
+    for (dst, src) in key.iter_mut().zip(password.as_bytes()) {
+        *dst = *src;
+    }
     key
 }
 
@@ -159,8 +188,11 @@ fn raw_password_key(password: &str) -> [u8; KEY_LENGTH] {
 /// AES passes once the vault's real mode is known.
 ///
 /// For `re_encryption_count == 0` all three C# modes collapse into one key,
-/// so the chain holds a single candidate and behaves exactly like the plain
-/// [`decrypt`] — zero change for the healthy majority of vaults.
+/// so the chain holds a single candidate and behaves exactly like a one-shot
+/// decrypt with the stored count — zero change for the healthy majority of
+/// vaults.
+///
+/// Every candidate key is wiped when the chain is dropped.
 pub struct LegacyKeyChain {
     /// (mode, normal key, iOS-workaround key)
     candidates: Vec<(LegacyKeyMode, [u8; KEY_LENGTH], [u8; KEY_LENGTH])>,
@@ -170,6 +202,26 @@ pub struct LegacyKeyChain {
     prefer_ios: bool,
 }
 
+impl Zeroize for LegacyKeyChain {
+    fn zeroize(&mut self) {
+        for (_, key, ios_key) in self.candidates.iter_mut() {
+            key.zeroize();
+            ios_key.zeroize();
+        }
+        self.candidates.clear();
+        self.preferred = 0;
+        self.prefer_ios = false;
+    }
+}
+
+impl Drop for LegacyKeyChain {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for LegacyKeyChain {}
+
 impl LegacyKeyChain {
     /// The historical default iteration count of the C# app (`// 200` in its
     /// model). Tried as an extra MD5-chain candidate even when the stored
@@ -178,11 +230,7 @@ impl LegacyKeyChain {
     const DEFAULT_HISTORICAL_COUNT: u32 = 200;
 
     pub fn new(password: &str, re_encryption_count: u32) -> Self {
-        let ios = |key: [u8; KEY_LENGTH]| {
-            let mut k = key;
-            k[0] = 0;
-            k
-        };
+        let ios = ios_variant;
 
         let mut candidates = Vec::with_capacity(4);
         if re_encryption_count > 0 {
@@ -211,21 +259,25 @@ impl LegacyKeyChain {
 
     /// The mode of the candidate that decrypted the most recent blob.
     pub fn preferred_mode(&self) -> LegacyKeyMode {
-        self.candidates[self.preferred].0
+        // `preferred` is only ever set to an index of `candidates`.
+        self.candidates
+            .get(self.preferred)
+            .map_or(LegacyKeyMode::NoChain, |c| c.0)
     }
 
     /// Decrypt a legacy blob, trying the last-successful candidate/variant
     /// first, then every remaining candidate (normal then iOS variant).
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<String, String> {
         // Preferred candidate, preferred variant first.
-        let (_, key, ios_key) = &self.candidates[self.preferred];
-        let (first, second) = if self.prefer_ios { (ios_key, key) } else { (key, ios_key) };
-        if let Ok(plaintext) = decrypt_with_key(ciphertext, first) {
-            return Ok(plaintext);
-        }
-        if let Ok(plaintext) = decrypt_with_key(ciphertext, second) {
-            self.prefer_ios = !self.prefer_ios;
-            return Ok(plaintext);
+        if let Some((_, key, ios_key)) = self.candidates.get(self.preferred) {
+            let (first, second) = if self.prefer_ios { (ios_key, key) } else { (key, ios_key) };
+            if let Ok(plaintext) = decrypt_with_key(ciphertext, first) {
+                return Ok(plaintext);
+            }
+            if let Ok(plaintext) = decrypt_with_key(ciphertext, second) {
+                self.prefer_ios = !self.prefer_ios;
+                return Ok(plaintext);
+            }
         }
 
         // Remaining candidates in declaration order. Only the final failure
@@ -259,8 +311,9 @@ fn decrypt_with_key(ciphertext: &[u8], key: &[u8; KEY_LENGTH]) -> Result<String,
         return Err("Empty ciphertext".to_string());
     }
 
-    // Create a mutable copy for in-place decryption
-    let mut buffer = ciphertext.to_vec();
+    // Create a mutable copy for in-place decryption; it ends up holding the
+    // plaintext, so it is wiped on drop.
+    let mut buffer = Zeroizing::new(ciphertext.to_vec());
 
     // Create decryptor and decrypt
     let decryptor = Aes256CbcDec::new(key.into(), &ZERO_IV.into());
@@ -269,16 +322,21 @@ fn decrypt_with_key(ciphertext: &[u8], key: &[u8; KEY_LENGTH]) -> Result<String,
         .decrypt_padded::<Pkcs7>(&mut buffer)
         .map_err(|e| format!("Decryption failed: {:?}", e))?;
 
-    // Convert to UTF-8 string
-    let full_text = String::from_utf8(decrypted.to_vec())
+    // Validate UTF-8 in place (no further copy of the plaintext).
+    let full_text = std::str::from_utf8(decrypted)
         .map_err(|e| format!("Invalid UTF-8: {}", e))?;
 
-    // Verify MD5 checksum
+    // Verify MD5 checksum. The checksum is 32 ASCII hex characters; a
+    // plaintext that is shorter, or whose 32nd byte is inside a multi-byte
+    // character, is malformed and refused.
     if full_text.len() < MD5_HEX_LENGTH {
         return Err("Decrypted text too short".to_string());
     }
-
-    let (checksum, plaintext) = full_text.split_at(MD5_HEX_LENGTH);
+    let (Some(checksum), Some(plaintext)) =
+        (full_text.get(..MD5_HEX_LENGTH), full_text.get(MD5_HEX_LENGTH..))
+    else {
+        return Err("Malformed checksum prefix".to_string());
+    };
     let computed_checksum = md5_hex(plaintext);
 
     if checksum != computed_checksum {
@@ -399,6 +457,89 @@ mod tests {
             .to_vec()
     }
 
+    /// Encrypt raw bytes under `key` with no checksum prefix, so a test can
+    /// choose exactly what the decrypted plaintext looks like.
+    fn encrypt_raw_bytes(data: &[u8], key: &[u8; KEY_LENGTH]) -> Vec<u8> {
+        let mut buffer = data.to_vec();
+        buffer.resize(padded_len(data.len()).unwrap(), 0);
+        Aes256CbcEnc::new(key.into(), &ZERO_IV.into())
+            .encrypt_padded::<Pkcs7>(&mut buffer, data.len())
+            .unwrap()
+            .to_vec()
+    }
+
+    fn odd_plaintexts() -> Vec<(&'static str, Vec<u8>)> {
+        let mut split_char = vec![b'a'; 31];
+        split_char.extend_from_slice("ж tail".as_bytes()); // byte 32 is inside 'ж'
+        let mut split_emoji = vec![b'0'; 30];
+        split_emoji.extend_from_slice("😀".as_bytes()); // 4-byte char over byte 32
+        vec![
+            ("empty", Vec::new()),
+            ("one byte", b"x".to_vec()),
+            ("31 bytes", vec![b'f'; 31]),
+            ("multi-byte char across byte 32", split_char),
+            ("4-byte char across byte 32", split_emoji),
+            ("only multi-byte chars", "жжжжжжжжжжжжжжжжжжжж".as_bytes().to_vec()),
+            ("invalid utf-8", vec![0xff; 40]),
+            ("32 bytes, wrong checksum", vec![b'0'; 32]),
+            ("non-hex 32 bytes", vec![b'z'; 48]),
+        ]
+    }
+
+    #[test]
+    fn odd_legacy_plaintexts_are_errors_not_panics() {
+        let password = "TestPassword123!";
+        let key = prepare_key(password, None, 0);
+        for (name, data) in odd_plaintexts() {
+            let blob = encrypt_raw_bytes(&data, &key);
+            assert!(decrypt_with_key(&blob, &key).is_err(), "{name}");
+            assert!(decrypt(&blob, password, 0, None).is_err(), "{name}");
+            assert!(decrypt(&blob, password, 200, Some(password)).is_err(), "{name}");
+            let mut chain = LegacyKeyChain::new(password, 200);
+            assert!(chain.decrypt(&blob).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn checksum_prefix_split_inside_a_character_is_refused() {
+        let key = prepare_key("pw", None, 0);
+        let mut data = vec![b'a'; 31];
+        data.extend_from_slice("жж".as_bytes());
+        let err = decrypt_with_key(&encrypt_raw_bytes(&data, &key), &key).unwrap_err();
+        assert_eq!(err, "Malformed checksum prefix");
+        let short = decrypt_with_key(&encrypt_raw_bytes(b"abc", &key), &key).unwrap_err();
+        assert_eq!(short, "Decrypted text too short");
+    }
+
+    #[test]
+    fn exactly_a_checksum_decrypts_to_empty() {
+        let key = prepare_key("pw", None, 0);
+        let blob = encrypt_raw_bytes(md5_hex("").as_bytes(), &key);
+        assert_eq!(decrypt_with_key(&blob, &key).unwrap(), "");
+    }
+
+    #[test]
+    fn malformed_ciphertexts_are_errors() {
+        let password = "pw";
+        let mut chain = LegacyKeyChain::new(password, 7);
+        for blob in [vec![], vec![0u8; 1], vec![0u8; 15], vec![0u8; 16], vec![0xAB; 33], vec![0u8; 64]] {
+            assert!(decrypt(&blob, password, 0, None).is_err());
+            assert!(chain.decrypt(&blob).is_err());
+        }
+        assert_eq!(chain.preferred_mode(), LegacyKeyMode::Md5Chain);
+    }
+
+    #[test]
+    fn padding_length_and_ios_variant() {
+        assert_eq!(padded_len(0), Some(16));
+        assert_eq!(padded_len(15), Some(16));
+        assert_eq!(padded_len(16), Some(32));
+        assert_eq!(padded_len(usize::MAX), None);
+        let v = ios_variant([7u8; KEY_LENGTH]);
+        assert_eq!(v[0], 0);
+        assert!(v[1..].iter().all(|b| *b == 7));
+    }
+
     #[test]
     fn test_key_chain_matches_decrypt_for_md5_chain_data() {
         // Synthetic vaults whose data really was written with the MD5 chain
@@ -434,6 +575,19 @@ mod tests {
         // other count: stored chain + no-chain + default chain + raw.
         let chain33 = LegacyKeyChain::new("TestPassword123!", 33);
         assert_eq!(chain33.candidates.len(), 4);
+    }
+
+    #[test]
+    fn test_key_chain_empty_password_returns() {
+        // An empty password builds every candidate and fails cleanly on
+        // foreign or empty input instead of hanging.
+        for count in [0u32, 7, 200] {
+            let mut chain = LegacyKeyChain::new("", count);
+            assert!(chain.decrypt(&[]).is_err());
+            assert!(chain.decrypt(&[0u8; 32]).is_err());
+        }
+        let blob = encrypt("empty password data", "", 0, None).unwrap();
+        assert_eq!(LegacyKeyChain::new("", 0).decrypt(&blob).unwrap(), "empty password data");
     }
 
     #[test]
@@ -526,6 +680,22 @@ mod tests {
         // Even with all three candidates active, a wrong password never
         // passes the MD5 checksum.
         assert!(LegacyKeyChain::new("wrong_password", 200).decrypt(&encrypted).is_err());
+    }
+
+    #[test]
+    fn key_chain_zeroize_wipes_every_candidate() {
+        let mut chain = LegacyKeyChain::new("TestPassword123!", 33);
+        assert_eq!(chain.candidates.len(), 4);
+        chain.zeroize();
+        assert!(chain.candidates.is_empty());
+        assert_eq!(chain.preferred, 0);
+        assert!(!chain.prefer_ios);
+        // A wiped chain decrypts nothing, and does not panic.
+        let blob = encrypt("x", "TestPassword123!", 0, None).unwrap();
+        assert!(chain.decrypt(&blob).is_err());
+        assert_eq!(chain.preferred_mode(), LegacyKeyMode::NoChain);
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<LegacyKeyChain>();
     }
 
     #[test]

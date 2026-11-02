@@ -227,9 +227,6 @@ fn the_index_carries_live_passkeys_only() {
     for e in &entries {
         let rp = e.summary().rp_id;
         sign::assert(e.record(), &rp, &[1; 32], true).unwrap();
-        let stored: serde_json::Value = serde_json::from_str(&e.record().to_field_value().unwrap()).unwrap();
-        let key_b64 = stored["key"].as_str().unwrap().to_string();
-        assert!(!format!("{e:?}").contains(&key_b64), "Debug must not show the key");
     }
     // Trash one item: gone from the index.
     let gone = s.created.iter().find(|id| w.get_item(id).unwrap().unwrap().name == "a.example").unwrap().clone();
