@@ -10,6 +10,11 @@
 //!    plan in **one transaction**. Existing items are never modified: imports
 //!    land in a new folder per account, named after the exporter.
 //!
+//! Passkeys are never replaced by an import: a passkey whose credential id or
+//! whose account (rpId + user handle) the vault already holds is skipped, and
+//! so is a second copy of the same credential id inside the payload. Each is
+//! listed with its reason.
+//!
 //! Mapping rule: a value goes into an IntelliWallet system field only when the
 //! meaning is exact; anything else becomes a clearly named custom field, so
 //! nothing is dropped silently. Credentials that cannot be stored at all
@@ -103,8 +108,16 @@ enum Kind {
 struct PlannedField {
     kind: Kind,
     value: Zeroizing<String>,
-    /// Credential id, for a passkey.
-    passkey_id: Option<Vec<u8>>,
+    /// Who the passkey is for, for a passkey.
+    passkey: Option<PasskeyKey>,
+}
+
+/// What identifies a passkey: its credential id, and the account it signs in
+/// to (rpId + user handle).
+struct PasskeyKey {
+    id: Vec<u8>,
+    rp_id: String,
+    user_handle: Vec<u8>,
 }
 
 struct PlannedItem {
@@ -229,14 +242,14 @@ fn ef_text(e: &Ef) -> Option<String> {
 }
 
 fn system(code: &'static str, value: String) -> PlannedField {
-    PlannedField { kind: Kind::System(code), value: Zeroizing::new(value), passkey_id: None }
+    PlannedField { kind: Kind::System(code), value: Zeroizing::new(value), passkey: None }
 }
 
 fn custom(name: &str, value_type: &'static str, value: String) -> PlannedField {
     PlannedField {
         kind: Kind::Custom { name: text::name(name), value_type },
         value: Zeroizing::new(value),
-        passkey_id: None,
+        passkey: None,
     }
 }
 
@@ -545,7 +558,7 @@ fn passkey_field(cred: &Cred, item: &Item<'_>) -> std::result::Result<PlannedFie
         Ok(r) => Ok(PlannedField {
             kind: Kind::System(FIELD_PASSKEY),
             value: r.to_field_value().map_err(|_| "passkey could not be stored".to_string())?,
-            passkey_id: Some(r.credential_id.clone()),
+            passkey: Some(PasskeyKey { id: r.credential_id.clone(), rp_id: r.rp_id.clone(), user_handle: r.user_handle.clone() }),
         }),
         Err(WalletError::InvalidInput(m)) if m.contains("P-256") => Err("only P-256 (ES256) passkeys are supported".into()),
         Err(WalletError::InvalidInput(m)) => Err(format!("passkey is not usable: {m}")),
@@ -560,6 +573,10 @@ fn passkey_field(cred: &Cred, item: &Item<'_>) -> std::result::Result<PlannedFie
 /// fingerprint hold the same data, however they were exported. Only digests
 /// are kept, so comparing never copies a value.
 type Fingerprint = [u8; 32];
+
+/// The preview, the plan items to keep, and the `(item, field)` plan indexes
+/// of fields to leave out.
+type Assessment = (ImportPreview, HashSet<usize>, HashSet<(usize, usize)>);
 
 /// Digest of one (field kind, value) pair.
 fn pair_digest(kind: &str, value: &[u8]) -> [u8; 32] {
@@ -595,23 +612,33 @@ impl Wallet {
     pub fn import_cxf(&mut self, json: &str, options: &ImportOptions) -> Result<ImportReport> {
         let header = parse(json)?;
         let mut plan = plan(&header)?;
-        let (preview, keep, drop_passkeys) = self.assess(&plan)?;
+        let (preview, keep, dropped) = self.assess(&plan)?;
 
         let backup_path = crate::backup::BackupManager::new(&options.backup_folder)
             .create_backup(self.database()?, true)?;
 
         for (i, item) in plan.items.iter_mut().enumerate() {
-            if keep.contains(&i) {
-                item.fields.retain(|f| f.passkey_id.as_ref().is_none_or(|id| !drop_passkeys.contains(id)));
-            }
+            let mut fi = 0usize;
+            item.fields.retain(|_| {
+                let keep_field = !dropped.contains(&(i, fi));
+                fi = fi.saturating_add(1);
+                keep_field
+            });
         }
 
         let (folder_ids, item_ids) = self.in_transaction(|w| w.apply(&plan, &keep))?;
         Ok(ImportReport { preview, folder_ids, item_ids, backup_path })
     }
 
-    /// The preview, which items to keep, and passkeys already in the vault.
-    fn assess(&mut self, plan: &Plan) -> Result<(ImportPreview, HashSet<usize>, HashSet<Vec<u8>>)> {
+    /// The preview, which items to keep, and which fields of them to leave out
+    /// (`(item, field)` indexes into the plan).
+    ///
+    /// A passkey is left out, with a reason, when the vault already holds its
+    /// credential id or a passkey for the same account (rpId + user handle),
+    /// or when an earlier item of the import carries the same credential id.
+    /// An import never replaces a passkey. An item left with no field at all
+    /// counts as a duplicate.
+    fn assess(&mut self, plan: &Plan) -> Result<Assessment> {
         let labels = self.get_labels()?;
         let system: HashSet<String> = labels.iter().filter(|l| l.system).map(|l| l.field_type.clone()).collect();
         let existing_custom: HashSet<(String, String)> = labels
@@ -621,7 +648,12 @@ impl Wallet {
             .collect();
 
         let vault_prints = self.vault_fingerprints(&system)?;
-        let held: HashSet<Vec<u8>> = self.live_passkeys()?.into_iter().map(|(_, _, r)| r.credential_id).collect();
+        let mut held_ids: HashSet<Vec<u8>> = HashSet::new();
+        let mut held_accounts: HashSet<(String, Vec<u8>)> = HashSet::new();
+        for (_, _, r) in self.live_passkeys()? {
+            held_accounts.insert((r.rp_id.clone(), r.user_handle.clone()));
+            held_ids.insert(r.credential_id.clone());
+        }
 
         let mut preview = ImportPreview {
             exporter: plan.exporter.clone(),
@@ -631,21 +663,45 @@ impl Wallet {
         };
         let mut skipped = plan.skipped.clone();
         let mut keep = HashSet::new();
+        let mut dropped: HashSet<(usize, usize)> = HashSet::new();
         let mut seen_in_payload: HashSet<Fingerprint> = HashSet::new();
+        let mut seen_ids: HashSet<&[u8]> = HashSet::new();
         let mut new_labels: BTreeSet<(String, &'static str)> = BTreeSet::new();
         for (i, item) in plan.items.iter().enumerate() {
             let fp = planned_fingerprint(item);
             if vault_prints.contains(&fp) || !seen_in_payload.insert(fp) {
-                preview.duplicates += 1;
+                preview.duplicates = preview.duplicates.saturating_add(1);
                 continue;
             }
+            let mut dropped_here = Vec::new();
+            let mut ids_here: Vec<&[u8]> = Vec::new();
+            for (fi, f) in item.fields.iter().enumerate() {
+                let Some(pk) = &f.passkey else { continue };
+                let reason = if held_ids.contains(&pk.id) {
+                    Some("this passkey is already in the vault")
+                } else if held_accounts.contains(&(pk.rp_id.clone(), pk.user_handle.clone())) {
+                    Some("the vault already has a passkey for this account on this site")
+                } else if seen_ids.contains(pk.id.as_slice()) || ids_here.contains(&pk.id.as_slice()) {
+                    Some("this passkey appears more than once in the import")
+                } else {
+                    None
+                };
+                match reason {
+                    Some(reason) => {
+                        skipped.push(&item.title, "passkey", reason);
+                        dropped_here.push(fi);
+                    }
+                    None => ids_here.push(&pk.id),
+                }
+            }
+            if !dropped_here.is_empty() && dropped_here.len() == item.fields.len() {
+                preview.duplicates = preview.duplicates.saturating_add(1);
+                continue;
+            }
+            seen_ids.extend(ids_here);
+            dropped.extend(dropped_here.iter().map(|&fi| (i, fi)));
             keep.insert(i);
             for f in &item.fields {
-                if let Some(id) = &f.passkey_id
-                    && held.contains(id)
-                {
-                    skipped.push(&item.title, "passkey", "this passkey is already in the vault");
-                }
                 if let Kind::Custom { name, value_type } = &f.kind
                     && !existing_custom.contains(&(name.to_lowercase(), value_type.to_string()))
                 {
@@ -669,7 +725,7 @@ impl Wallet {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        Ok((preview, keep, held))
+        Ok((preview, keep, dropped))
     }
 
     fn vault_fingerprints(&mut self, system: &HashSet<String>) -> Result<HashSet<Fingerprint>> {
@@ -777,8 +833,8 @@ fn planned_fingerprint(item: &PlannedItem) -> Fingerprint {
     let pairs = item
         .fields
         .iter()
-        .map(|f| match (&f.kind, &f.passkey_id) {
-            (_, Some(id)) => pair_digest(&format!("sys:{FIELD_PASSKEY}"), crate::passkey::b64::encode(id).as_bytes()),
+        .map(|f| match (&f.kind, &f.passkey) {
+            (_, Some(pk)) => pair_digest(&format!("sys:{FIELD_PASSKEY}"), crate::passkey::b64::encode(&pk.id).as_bytes()),
             (Kind::System(code), None) => pair_digest(&format!("sys:{code}"), f.value.as_bytes()),
             (Kind::Custom { name, value_type }, None) => pair_digest(&format!("custom:{}:{}", name.to_lowercase(), value_type), f.value.as_bytes()),
         })
@@ -864,5 +920,84 @@ mod tests {
         let reason = passkey_field(&cred, &item).err().unwrap();
         assert!(reason.starts_with("passkey is not usable"), "{reason}");
         assert!(!reason.contains("AAAAAAAA"));
+    }
+
+    // --- passkeys met twice ---------------------------------------------------
+
+    use crate::business::wallet::tests::create_test_wallet;
+    use crate::passkey::sign::{self, RegisterInput};
+
+    /// A CXF passkey credential for `rp` and `handle`, freshly registered.
+    fn cxf_passkey(rp: &str, handle: &[u8]) -> String {
+        let reg = sign::register(&RegisterInput {
+            rp_id: rp, user_name: "bkv", user_display_name: "B", user_handle: handle,
+            exclude_credentials: &[], held_credential_ids: &[], user_verified: true, now: 0,
+        })
+        .unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&reg.record.to_field_value().unwrap()).unwrap();
+        serde_json::json!({"type": "passkey", "credentialId": stored["credentialId"], "rpId": rp, "username": "bkv",
+            "userDisplayName": "B", "userHandle": stored["userHandle"], "key": stored["key"]})
+        .to_string()
+    }
+
+    fn import(w: &mut Wallet, t: &tempfile::TempDir, items: &str) -> ImportReport {
+        w.import_cxf(&doc(items), &options(&t.path().join("backups"))).unwrap()
+    }
+
+    fn reasons(r: &ImportReport) -> Vec<&str> {
+        r.preview.skipped.iter().map(|s| s.reason.as_str()).collect()
+    }
+
+    #[test]
+    fn a_passkey_carried_by_two_items_is_imported_once() {
+        let (mut w, t) = create_test_wallet();
+        let pk = cxf_passkey("example.com", b"h1");
+        let note = r#"{"type": "note", "content": {"fieldType": "string", "value": "n"}}"#;
+        let items = format!(
+            r#"{{"title": "A", "credentials": [{pk}]}}, {{"title": "B", "credentials": [{pk}]}}, {{"title": "C", "credentials": [{pk}, {note}]}}"#
+        );
+        assert_eq!(w.preview_cxf(&doc(&items)).unwrap().items, 2);
+        let r = import(&mut w, &t, &items);
+        assert_eq!(r.item_ids.len(), 2, "B holds nothing else and is left out; C keeps its note");
+        assert_eq!(r.preview.duplicates, 1);
+        assert_eq!(reasons(&r), ["this passkey appears more than once in the import"; 2]);
+        assert_eq!(r.preview.skipped[0].item_title, "B");
+        assert_eq!(w.list_passkeys().unwrap().len(), 1);
+        let c = w.get_fields_by_item(&r.item_ids[1]).unwrap();
+        assert!(c.iter().all(|f| f.field_type != FIELD_PASSKEY) && c.iter().any(|f| f.field_type == "NOTE"));
+        // The same credential twice inside one item.
+        let (mut w, t) = create_test_wallet();
+        let r = import(&mut w, &t, &format!(r#"{{"title": "A", "credentials": [{pk}, {pk}, {note}]}}"#));
+        assert_eq!(reasons(&r), ["this passkey appears more than once in the import"]);
+        assert_eq!(w.list_passkeys().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_account_with_a_passkey_in_the_vault_is_not_replaced_by_an_import() {
+        let (mut w, t) = create_test_wallet();
+        import(&mut w, &t, &format!(r#"{{"title": "A", "credentials": [{}]}}"#, cxf_passkey("example.com", b"h1")));
+        let before = w.list_passkeys().unwrap();
+
+        // Same site and user handle, another credential id.
+        let r = import(&mut w, &t, &format!(r#"{{"title": "A2", "credentials": [{}]}}"#, cxf_passkey("example.com", b"h1")));
+        assert!(r.item_ids.is_empty());
+        assert_eq!(reasons(&r), ["the vault already has a passkey for this account on this site"]);
+        let after = w.list_passkeys().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].credential_id, before[0].credential_id);
+
+        // Another user on the same site, or the same user handle on another site, is new.
+        let r = import(
+            &mut w,
+            &t,
+            &format!(
+                r#"{{"title": "U2", "credentials": [{}]}}, {{"title": "S2", "credentials": [{}]}}"#,
+                cxf_passkey("example.com", b"h2"),
+                cxf_passkey("other.example", b"h1")
+            ),
+        );
+        assert_eq!(r.item_ids.len(), 2);
+        assert!(r.preview.skipped.is_empty());
+        assert_eq!(w.list_passkeys().unwrap().len(), 3);
     }
 }
