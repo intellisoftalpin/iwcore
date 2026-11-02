@@ -10,10 +10,10 @@
 
 use crate::business::Wallet;
 use crate::error::{Result, WalletError};
-use crate::passkey::{PasskeyRecord, FIELD_PASSKEY};
+use crate::passkey::{PasskeyRecord, PasskeySummary, FIELD_PASSKEY};
 
 use super::index::{self, IndexHeader, IndexOptions};
-use super::journal::{self, PendingOp, PendingRecord};
+use super::journal::{self, DrainKeys, PendingOp, PendingRecord};
 use super::{AUTOFILL_FOLDER_NAME, FIELD_LINK, FIELD_OLD_PASSWORD, FIELD_PASSWORD, FIELD_TOTP};
 
 /// Outcome of one drain.
@@ -34,18 +34,44 @@ pub struct DrainSummary {
     pub skipped: usize,
     /// Staged passkeys added to the vault (on a matching login or a new item).
     pub passkeys_added: usize,
-    /// Staged passkeys that replaced one for the same site and account; the
-    /// replaced passkey is in the trash, recoverable.
-    pub passkeys_replaced: usize,
+    /// Staged passkeys that would replace a live passkey for the same site and
+    /// account. None of them has replaced anything: each is stored in the
+    /// trash, on the item of the passkey it would replace, until the user
+    /// confirms with [`Wallet::confirm_passkey_replacement`].
+    pub pending_replacements: Vec<PasskeyReplacement>,
+    /// Well-framed records refused because they could not prove they were
+    /// written by the provider (see [`journal::open_for_drain`]). Never
+    /// applied. Nonzero means the journal was written by something else, or
+    /// tagged under a key from before a rotation.
+    pub unauthenticated: usize,
+}
+
+/// A staged passkey waiting for the user to confirm that it replaces a live
+/// one. Both summaries name the same item; neither carries a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasskeyReplacement {
+    /// The live passkey that stays in use until the user confirms.
+    pub existing: PasskeySummary,
+    /// The staged passkey, held in the trash meanwhile.
+    pub staged: PasskeySummary,
 }
 
 /// What became of one staged passkey.
 enum PasskeyOutcome {
     AlreadyThere,
-    Replaced,
+    NeedsConfirmation(Box<PasskeyReplacement>),
     AttachedTo(String),
     Created(String),
     Invalid,
+}
+
+/// A passkey in the trash, identified without its secrets.
+struct TrashedPasskey {
+    item_id: String,
+    field_id: String,
+    credential_id: Vec<u8>,
+    rp_id: String,
+    user_handle: Vec<u8>,
 }
 
 /// What an unattributed create record turned out to be, once the vault could be
@@ -102,6 +128,11 @@ impl Wallet {
     /// `record_id`, so a crash between writing an item and deleting the journal
     /// cannot double-import on the next attempt.
     ///
+    /// Applies only records that prove they were written by the provider: a
+    /// valid tag under `keys.auth_key`, or for legacy records a provider wrap
+    /// under one of `keys.legacy_wrap_keys`. The rest are counted in
+    /// [`DrainSummary::unauthenticated`] and left alone.
+    ///
     /// `folder_id` is the previously recorded `AutoFill` folder. Pass `None` on
     /// the first drain, or when the recorded folder no longer exists; a fresh
     /// one is then created and returned.
@@ -130,15 +161,56 @@ impl Wallet {
     pub fn drain_autofill_journal(
         &mut self,
         journal_bytes: &[u8],
-        journal_secret: &[u8; 32],
+        keys: &DrainKeys<'_>,
         folder_id: Option<&str>,
     ) -> Result<DrainSummary> {
         self.ensure_unlocked()?;
 
-        let records = journal::dedupe(journal::open_with_journal_key(journal_bytes, journal_secret));
+        let read = journal::open_for_drain(journal_bytes, keys);
+        let records = journal::dedupe(read.records);
         // All or nothing: a failure part-way leaves the vault as it was, and the
         // journal, which is only deleted after a successful drain, is retried.
-        self.in_transaction(|w| w.drain_records(records, folder_id))
+        let mut summary = self.in_transaction(|w| w.drain_records(records, folder_id))?;
+        summary.unauthenticated = read.unauthenticated;
+        Ok(summary)
+    }
+
+    /// Accept a replacement reported in [`DrainSummary::pending_replacements`]:
+    /// the existing passkey moves to the trash and the staged one, already on
+    /// the same item, comes out of it. Both stay recoverable.
+    ///
+    /// Refuses unless `existing_field_id` is a live passkey on `item_id`,
+    /// `staged_field_id` is a trashed passkey on the same item, and both are
+    /// for the same rpId and user handle. To decline, do nothing: the staged
+    /// passkey simply stays in the trash.
+    pub fn confirm_passkey_replacement(
+        &mut self,
+        item_id: &str,
+        existing_field_id: &str,
+        staged_field_id: &str,
+    ) -> Result<()> {
+        self.ensure_unlocked()?;
+        let refuse = |why: &str| WalletError::InvalidOperation(format!("cannot replace the passkey: {why}"));
+
+        let existing = self
+            .live_passkeys()?
+            .into_iter()
+            .find(|(item, field, _)| item == item_id && field == existing_field_id)
+            .map(|(_, _, record)| record)
+            .ok_or_else(|| refuse("the passkey to replace is not a live passkey on this item"))?;
+        let staged = self
+            .trashed_passkeys()?
+            .into_iter()
+            .find(|t| t.item_id == item_id && t.field_id == staged_field_id)
+            .ok_or_else(|| refuse("the staged passkey is not in the trash on this item"))?;
+        if !staged.rp_id.eq_ignore_ascii_case(&existing.rp_id) || staged.user_handle != existing.user_handle {
+            return Err(refuse("the two passkeys are for different accounts"));
+        }
+
+        self.in_transaction(|w| {
+            w.delete_field(item_id, existing_field_id)?;
+            w.undelete_field(item_id, staged_field_id)
+        })
     }
 
     fn drain_records(&mut self, records: Vec<PendingRecord>, folder_id: Option<&str>) -> Result<DrainSummary> {
@@ -158,13 +230,14 @@ impl Wallet {
             unchanged: 0,
             skipped: 0,
             passkeys_added: 0,
-            passkeys_replaced: 0,
+            pending_replacements: Vec::new(),
+            unauthenticated: 0,
         };
 
         for record in records {
             if record.op == PendingOp::CreatePasskey {
                 match self.apply_staged_passkey(&record, &known, &folder)? {
-                    PasskeyOutcome::Replaced => summary.passkeys_replaced = summary.passkeys_replaced.saturating_add(1),
+                    PasskeyOutcome::NeedsConfirmation(pending) => summary.pending_replacements.push(*pending),
                     PasskeyOutcome::AttachedTo(item_id) => {
                         summary.passkeys_added = summary.passkeys_added.saturating_add(1);
                         summary.updated.push(item_id);
@@ -220,10 +293,14 @@ impl Wallet {
 
     /// Put a staged passkey into the vault. First match wins:
     ///
-    /// 1. the vault already holds this credential id: already drained, nothing to do;
+    /// 1. the vault already holds this credential id: already drained, nothing
+    ///    to do (when that copy is a staged replacement still waiting in the
+    ///    trash, it is reported again, so a crash before the user was asked
+    ///    does not lose the question);
     /// 2. a live passkey for the same rpId **and** user handle: WebAuthn treats
-    ///    the new one as a replacement, so it takes that field's place and the
-    ///    old one goes to the trash (recoverable, never destroyed);
+    ///    the new one as a replacement, but a journal record alone is not
+    ///    enough to drop a working passkey. The staged one is stored on the
+    ///    same item, straight into the trash, and reported for confirmation;
     /// 3. a live login whose `LINK` is the rpId's host or registrable domain
     ///    **and** whose identity equals the user name (ignoring ASCII case): the
     ///    passkey is added to that item;
@@ -242,12 +319,32 @@ impl Wallet {
         if existing.iter().any(|(_, _, r)| r.credential_id == passkey.credential_id) {
             return Ok(PasskeyOutcome::AlreadyThere);
         }
-        if let Some((_, field_id, _)) = existing
-            .iter()
-            .find(|(_, _, r)| r.rp_id == passkey.rp_id && r.user_handle == passkey.user_handle)
+        // A live passkey for the same account, on `item` when one is named.
+        let same_account = |item: Option<&str>| {
+            existing.iter().find(|(i, _, r)| {
+                item.is_none_or(|item| i == item) && r.rp_id == passkey.rp_id && r.user_handle == passkey.user_handle
+            })
+        };
+        if let Some(trashed) = self
+            .trashed_passkeys()?
+            .into_iter()
+            .find(|t| t.credential_id == passkey.credential_id)
         {
-            self.update_field_unchecked(field_id, &value, None)?;
-            return Ok(PasskeyOutcome::Replaced);
+            return Ok(match same_account(Some(&trashed.item_id)) {
+                Some((item_id, field_id, current)) => PasskeyOutcome::NeedsConfirmation(Box::new(PasskeyReplacement {
+                    existing: current.summary(item_id, field_id),
+                    staged: passkey.summary(item_id, &trashed.field_id),
+                })),
+                None => PasskeyOutcome::AlreadyThere,
+            });
+        }
+        if let Some((item_id, field_id, current)) = same_account(None) {
+            let staged_field = self.add_field_unchecked(item_id, FIELD_PASSKEY, &value, None)?;
+            self.delete_field(item_id, &staged_field)?;
+            return Ok(PasskeyOutcome::NeedsConfirmation(Box::new(PasskeyReplacement {
+                existing: current.summary(item_id, field_id),
+                staged: passkey.summary(item_id, &staged_field),
+            })));
         }
 
         let user = passkey.user_name.trim();
@@ -328,6 +425,38 @@ impl Wallet {
             hosts,
             registrable,
         }
+    }
+
+    /// Identity of every readable passkey in the trash, from its public value.
+    fn trashed_passkeys(&mut self) -> Result<Vec<TrashedPasskey>> {
+        let mut out = Vec::new();
+        for field in self.get_deleted_fields()? {
+            if field.field_type != FIELD_PASSKEY {
+                continue;
+            }
+            let Ok(public) = serde_json::from_str::<serde_json::Value>(&field.value) else { continue };
+            let decode = |k: &str| {
+                public
+                    .get(k)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|v| crate::passkey::b64::decode(v, k).ok())
+            };
+            let (Some(credential_id), Some(user_handle), Some(rp_id)) = (
+                decode("credentialId"),
+                decode("userHandle"),
+                public.get("rpId").and_then(serde_json::Value::as_str),
+            ) else {
+                continue;
+            };
+            out.push(TrashedPasskey {
+                rp_id: rp_id.to_string(),
+                item_id: field.item_id,
+                field_id: field.field_id,
+                credential_id,
+                user_handle,
+            });
+        }
+        Ok(out)
     }
 
     /// Every readable passkey on a live item, as the index carries it.
@@ -450,6 +579,10 @@ mod tests {
     use crate::autofill::keys::generate_keys;
     use tempfile::TempDir;
 
+    fn dk(keys: &crate::autofill::AutofillKeys) -> DrainKeys<'_> {
+        DrainKeys { journal_secret: &keys.journal_secret, auth_key: &keys.journal_auth_key, legacy_wrap_keys: &[] }
+    }
+
     fn wallet() -> (Wallet, TempDir) {
         let dir = TempDir::new().unwrap();
         let wallet = Wallet::create(dir.path(), "test-password", "en").unwrap();
@@ -516,12 +649,12 @@ mod tests {
         let mut journal = Vec::new();
         for r in [record("r1", "bkv"), record("r2", "a@bkv.me")] {
             journal.extend_from_slice(
-                &journal::seal_record(&r, &keys.journal_public, &keys.index_key).unwrap(),
+                &journal::seal_record(&r, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap(),
             );
         }
 
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
         assert_eq!(summary.created.len(), 2);
         assert_eq!(summary.skipped, 0);
@@ -552,14 +685,13 @@ mod tests {
                 &journal::seal_record(
                     &record(&format!("r{i}"), value),
                     &keys.journal_public,
-                    &keys.index_key,
-                )
+                    &keys.index_key, &keys.journal_auth_key)
                 .unwrap(),
             );
         }
 
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         for (item_id, (_, expected)) in summary.created.iter().zip(cases.iter()) {
@@ -597,18 +729,18 @@ mod tests {
         let (mut w, _dir) = wallet();
         let keys = generate_keys().unwrap();
         let journal =
-            journal::seal_record(&record("r1", "bkv"), &keys.journal_public, &keys.index_key)
+            journal::seal_record(&record("r1", "bkv"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key)
                 .unwrap();
 
         // First drain succeeds, then the process dies before the journal is
         // deleted, so the same bytes are drained again.
         let first = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
         let mut doubled = journal.clone();
         doubled.extend_from_slice(&journal);
         let second = w
-            .drain_autofill_journal(&doubled, &keys.journal_secret, Some(&first.folder_id))
+            .drain_autofill_journal(&doubled, &dk(&keys), Some(&first.folder_id))
             .unwrap();
 
         assert_eq!(first.created.len(), 1);
@@ -628,19 +760,19 @@ mod tests {
         let (mut w, _dir) = wallet();
         let keys = generate_keys().unwrap();
         let journal =
-            journal::seal_record(&record("r1", "bkv"), &keys.journal_public, &keys.index_key)
+            journal::seal_record(&record("r1", "bkv"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key)
                 .unwrap();
 
         let first = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
         w.update_item_name(&first.folder_id, "My logins").unwrap();
 
         let journal2 =
-            journal::seal_record(&record("r2", "bkv"), &keys.journal_public, &keys.index_key)
+            journal::seal_record(&record("r2", "bkv"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key)
                 .unwrap();
         let second = w
-            .drain_autofill_journal(&journal2, &keys.journal_secret, Some(&first.folder_id))
+            .drain_autofill_journal(&journal2, &dk(&keys), Some(&first.folder_id))
             .unwrap();
 
         assert_eq!(second.folder_id, first.folder_id);
@@ -651,19 +783,19 @@ mod tests {
         let (mut w, _dir) = wallet();
         let keys = generate_keys().unwrap();
         let journal =
-            journal::seal_record(&record("r1", "bkv"), &keys.journal_public, &keys.index_key)
+            journal::seal_record(&record("r1", "bkv"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key)
                 .unwrap();
 
         let first = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
         w.delete_item(&first.folder_id).unwrap();
 
         let journal2 =
-            journal::seal_record(&record("r2", "bkv"), &keys.journal_public, &keys.index_key)
+            journal::seal_record(&record("r2", "bkv"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key)
                 .unwrap();
         let second = w
-            .drain_autofill_journal(&journal2, &keys.journal_secret, Some(&first.folder_id))
+            .drain_autofill_journal(&journal2, &dk(&keys), Some(&first.folder_id))
             .unwrap();
 
         assert_ne!(second.folder_id, first.folder_id);
@@ -690,10 +822,10 @@ mod tests {
         update.item_id = Some(item.clone());
         update.password = "new-password".into();
         let journal =
-            journal::seal_record(&update, &keys.journal_public, &keys.index_key).unwrap();
+            journal::seal_record(&update, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
 
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
         assert_eq!(summary.updated, vec![item.clone()]);
         assert!(summary.created.is_empty());
@@ -720,10 +852,10 @@ mod tests {
         update.op = PendingOp::UpdatePassword;
         update.item_id = Some("does-not-exist".into());
         let journal =
-            journal::seal_record(&update, &keys.journal_public, &keys.index_key).unwrap();
+            journal::seal_record(&update, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
 
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
         assert!(summary.updated.is_empty());
         assert_eq!(summary.created.len(), 1, "the password is not thrown away");
@@ -764,9 +896,9 @@ mod tests {
             passkey: None,
         };
         let journal =
-            journal::seal_record(&staged, &keys.journal_public, &keys.index_key).unwrap();
+            journal::seal_record(&staged, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
         let summary = target
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         // Re-export from the target and compare the shape.
@@ -785,12 +917,185 @@ mod tests {
         assert_eq!(reimported.registrable, exported.registrable);
     }
 
+    // ---- integrity of drained records ---------------------------------------
+
+    #[test]
+    fn an_update_without_a_valid_tag_is_refused_and_reported() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let unrelated = generate_keys().unwrap();
+        let item = login(&mut w, "GitHub", "https://github.com/login", "bkv", "hunter2");
+
+        let mut update = capture("f1", "https://github.com/login", "bkv", "hunter3");
+        update.op = PendingOp::UpdatePassword;
+        update.item_id = Some(item.clone());
+        // Sealed to the right app key, but tagged under another auth key.
+        let journal = journal::seal_record(&update, &keys.journal_public, &unrelated.index_key, &unrelated.journal_auth_key)
+            .unwrap();
+        let summary = w.drain_autofill_journal(&journal, &dk(&keys), None).unwrap();
+
+        assert_eq!(summary.unauthenticated, 1);
+        assert!(summary.updated.is_empty() && summary.created.is_empty());
+        assert_eq!(password_of(&mut w, &item, FIELD_PASSWORD).as_deref(), Some("hunter2"));
+        assert_eq!(password_of(&mut w, &item, FIELD_OLD_PASSWORD), None);
+    }
+
+    #[test]
+    fn a_legacy_record_is_applied_only_through_the_recovery_keys() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let legacy = journal::seal_legacy_record(&record("old", "bkv"), &keys.journal_public, &keys.index_key).unwrap();
+
+        let refused = w.drain_autofill_journal(&legacy, &dk(&keys), None).unwrap();
+        assert_eq!((refused.unauthenticated, refused.created.len()), (1, 0));
+
+        let recovery = [*keys.index_key];
+        let with_recovery = DrainKeys { legacy_wrap_keys: &recovery, ..dk(&keys) };
+        let applied = w.drain_autofill_journal(&legacy, &with_recovery, None).unwrap();
+        assert_eq!((applied.unauthenticated, applied.created.len()), (0, 1));
+    }
+
+    // ---- passkey replacement needs confirmation -----------------------------
+
+    fn staged_passkey(keys: &crate::autofill::AutofillKeys, id: &str, handle: &[u8]) -> (Vec<u8>, PasskeyRecord) {
+        let reg = crate::passkey::sign::register(&crate::passkey::sign::RegisterInput {
+            rp_id: "example.com",
+            user_name: "bkv",
+            user_display_name: "bkv",
+            user_handle: handle,
+            exclude_credentials: &[],
+            held_credential_ids: &[],
+            user_verified: true,
+            now: 1,
+        })
+        .unwrap();
+        let mut r = record(id, "bkv");
+        r.op = PendingOp::CreatePasskey;
+        r.password = String::new();
+        r.passkey = Some(reg.record.to_field_value().unwrap().to_string());
+        let sealed = journal::seal_record(&r, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
+        (sealed, reg.record)
+    }
+
+    /// Two passkeys for the same account, the second waiting in the trash.
+    struct Pending {
+        replacement: PasskeyReplacement,
+        first: PasskeyRecord,
+        second: PasskeyRecord,
+        keys: crate::autofill::AutofillKeys,
+        second_journal: Vec<u8>,
+    }
+
+    fn pending_replacement(w: &mut Wallet) -> Pending {
+        let keys = generate_keys().unwrap();
+        let (j1, first) = staged_passkey(&keys, "p1", b"handle");
+        let (j2, second) = staged_passkey(&keys, "p2", b"handle");
+        w.drain_autofill_journal(&j1, &dk(&keys), None).unwrap();
+        let summary = w.drain_autofill_journal(&j2, &dk(&keys), None).unwrap();
+        assert_eq!(summary.pending_replacements.len(), 1);
+        assert_eq!(summary.passkeys_added, 0);
+        Pending { replacement: summary.pending_replacements[0].clone(), first, second, keys, second_journal: j2 }
+    }
+
+    #[test]
+    fn a_replacing_passkey_is_held_in_the_trash_until_confirmed() {
+        let (mut w, _dir) = wallet();
+        let Pending { replacement: pending, first, second, .. } = pending_replacement(&mut w);
+
+        assert_eq!(pending.existing.credential_id, first.credential_id);
+        assert_eq!(pending.staged.credential_id, second.credential_id);
+        assert_eq!(pending.existing.item_id, pending.staged.item_id);
+        let live: Vec<_> = w.list_passkeys().unwrap().into_iter().map(|p| p.credential_id).collect();
+        assert_eq!(live, vec![first.credential_id.clone()], "nothing replaced yet");
+
+        w.confirm_passkey_replacement(&pending.existing.item_id, &pending.existing.field_id, &pending.staged.field_id)
+            .unwrap();
+        let live: Vec<_> = w.list_passkeys().unwrap().into_iter().map(|p| p.credential_id).collect();
+        assert_eq!(live, vec![second.credential_id.clone()]);
+        assert!(
+            w.get_deleted_fields().unwrap().iter().any(|f| f.field_id == pending.existing.field_id),
+            "the replaced passkey stays recoverable"
+        );
+    }
+
+    #[test]
+    fn confirming_a_replacement_refuses_anything_but_the_reported_pair() {
+        let (mut w, _dir) = wallet();
+        let pending = pending_replacement(&mut w).replacement;
+        let (item, existing, staged) =
+            (pending.existing.item_id.clone(), pending.existing.field_id.clone(), pending.staged.field_id.clone());
+
+        // Swapped roles, unknown ids, another item.
+        assert!(w.confirm_passkey_replacement(&item, &staged, &existing).is_err());
+        assert!(w.confirm_passkey_replacement(&item, "nope", &staged).is_err());
+        assert!(w.confirm_passkey_replacement(&item, &existing, "nope").is_err());
+        assert!(w.confirm_passkey_replacement("other-item", &existing, &staged).is_err());
+
+        // A trashed passkey for another account on the same item.
+        let keys = generate_keys().unwrap();
+        let (j, other) = staged_passkey(&keys, "p3", b"another-handle");
+        w.drain_autofill_journal(&j, &dk(&keys), None).unwrap();
+        let (other_item, other_field) = w
+            .list_passkeys()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.credential_id == other.credential_id)
+            .map(|p| (p.item_id, p.field_id))
+            .unwrap();
+        let moved = w.passkey_stored_value(&other_item, &other_field).unwrap().unwrap();
+        let foreign = w.add_field_unchecked(&item, FIELD_PASSKEY, &moved, None).unwrap();
+        w.delete_field(&item, &foreign).unwrap();
+        let err = w.confirm_passkey_replacement(&item, &existing, &foreign).unwrap_err();
+        assert!(err.to_string().contains("different accounts"), "{err}");
+
+        // Nothing changed through any of that, and the real pair still works.
+        w.confirm_passkey_replacement(&item, &existing, &staged).unwrap();
+
+        w.lock();
+        assert!(matches!(w.confirm_passkey_replacement(&item, &existing, &staged), Err(WalletError::Locked)));
+    }
+
+    #[test]
+    fn re_draining_a_pending_replacement_asks_again_without_a_second_copy() {
+        let (mut w, _dir) = wallet();
+        let p = pending_replacement(&mut w);
+        let again = w.drain_autofill_journal(&p.second_journal, &dk(&p.keys), None).unwrap();
+        assert_eq!(again.pending_replacements, vec![p.replacement.clone()]);
+        assert_eq!(w.trashed_passkeys().unwrap().len(), 1);
+        assert_eq!(w.list_passkeys().unwrap()[0].credential_id, p.first.credential_id);
+    }
+
+    #[test]
+    fn a_staged_passkey_already_in_the_trash_without_a_live_rival_is_already_there() {
+        let (mut w, _dir) = wallet();
+        let p = pending_replacement(&mut w);
+        // The user deletes the live passkey instead of confirming.
+        w.delete_field(&p.replacement.existing.item_id, &p.replacement.existing.field_id).unwrap();
+
+        let again = w.drain_autofill_journal(&p.second_journal, &dk(&p.keys), None).unwrap();
+        assert!(again.pending_replacements.is_empty());
+        assert_eq!((again.unchanged, again.passkeys_added), (1, 0));
+        assert!(w.list_passkeys().unwrap().is_empty(), "nothing was restored behind the user's back");
+        assert!(w.trashed_passkeys().unwrap().iter().any(|t| t.credential_id == p.second.credential_id));
+    }
+
+    #[test]
+    fn unreadable_passkeys_in_the_trash_are_ignored() {
+        let (mut w, _dir) = wallet();
+        let item = w.add_item("Broken", "", false, Some(crate::ROOT_ID)).unwrap();
+        let field = w.add_field_unchecked(&item, FIELD_PASSKEY, "{\"v\":1}", None).unwrap();
+        w.delete_field(&item, &field).unwrap();
+        let other = w.add_field(&item, "NOTE", "plain", None).unwrap();
+        w.delete_field(&item, &other).unwrap();
+        assert!(w.trashed_passkeys().unwrap().is_empty());
+    }
+
     #[test]
     fn a_garbage_journal_drains_to_nothing_without_creating_a_folder_full_of_junk() {
         let (mut w, _dir) = wallet();
         let keys = generate_keys().unwrap();
         let summary = w
-            .drain_autofill_journal(b"not a journal", &keys.journal_secret, None)
+            .drain_autofill_journal(b"not a journal", &dk(&keys), None)
             .unwrap();
         assert!(summary.created.is_empty());
         assert!(summary.updated.is_empty());
@@ -833,7 +1138,7 @@ mod tests {
         let mut journal = Vec::new();
         for r in records {
             journal.extend_from_slice(
-                &journal::seal_record(r, &keys.journal_public, &keys.index_key).unwrap(),
+                &journal::seal_record(r, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap(),
             );
         }
         journal
@@ -859,7 +1164,7 @@ mod tests {
             &keys,
         );
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.unchanged, 1);
@@ -878,7 +1183,7 @@ mod tests {
             &keys,
         );
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.updated, vec![item.clone()]);
@@ -902,7 +1207,7 @@ mod tests {
             &keys,
         );
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.created.len(), 1);
@@ -920,7 +1225,7 @@ mod tests {
             &keys,
         );
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.created.len(), 1);
@@ -938,7 +1243,7 @@ mod tests {
             &keys,
         );
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.updated, vec![item]);
@@ -955,7 +1260,7 @@ mod tests {
             &keys,
         );
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.updated, vec![item]);
@@ -973,7 +1278,7 @@ mod tests {
             &keys,
         );
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.created.len(), 1);
@@ -988,7 +1293,7 @@ mod tests {
 
         let journal = seal_all(&[capture("r1", "https://github.com/login", "", "hunter3")], &keys);
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.created.len(), 1);
@@ -1008,7 +1313,7 @@ mod tests {
             &keys,
         );
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.created.len(), 1);
@@ -1028,7 +1333,7 @@ mod tests {
             &keys,
         );
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.created.len(), 1);
@@ -1056,7 +1361,7 @@ mod tests {
 
         let journal = seal_all(&[record], &keys);
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.updated, vec![named]);
@@ -1070,7 +1375,7 @@ mod tests {
 
         let journal = seal_all(&[capture("r1", "https://example.com/signup", "bkv", "")], &keys);
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.skipped, 1);
@@ -1091,7 +1396,7 @@ mod tests {
             &keys,
         );
         let summary = w
-            .drain_autofill_journal(&journal, &keys.journal_secret, None)
+            .drain_autofill_journal(&journal, &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.created.len(), 1);
@@ -1105,10 +1410,10 @@ mod tests {
         let keys = generate_keys().unwrap();
 
         let first = w
-            .drain_autofill_journal(&seal_all(&[record("r1", "bkv")], &keys), &keys.journal_secret, None)
+            .drain_autofill_journal(&seal_all(&[record("r1", "bkv")], &keys), &dk(&keys), None)
             .unwrap();
         let second = w
-            .drain_autofill_journal(&seal_all(&[record("r2", "other")], &keys), &keys.journal_secret, None)
+            .drain_autofill_journal(&seal_all(&[record("r2", "other")], &keys), &dk(&keys), None)
             .unwrap();
 
         assert_eq!(second.folder_id, first.folder_id);
@@ -1132,7 +1437,7 @@ mod tests {
         update.op = PendingOp::UpdatePassword;
         update.item_id = Some(folder.clone());
         let summary = w
-            .drain_autofill_journal(&seal_all(&[update], &keys), &keys.journal_secret, None)
+            .drain_autofill_journal(&seal_all(&[update], &keys), &dk(&keys), None)
             .unwrap();
 
         assert!(summary.updated.is_empty());
@@ -1153,7 +1458,7 @@ mod tests {
         let mut update = capture("r1", "https://github.com/login", "bkv", "hunter3");
         update.op = PendingOp::UpdatePassword;
         update.item_id = Some(item.clone());
-        w.drain_autofill_journal(&seal_all(&[update], &keys), &keys.journal_secret, None)
+        w.drain_autofill_journal(&seal_all(&[update], &keys), &dk(&keys), None)
             .unwrap();
 
         let oldp: Vec<String> = w
@@ -1176,7 +1481,7 @@ mod tests {
         let mut blank_totp = capture("r2", "https://other.example.org/signup", "bkv", "hunter2");
         blank_totp.totp_secret = Some("  ".into());
         let summary = w
-            .drain_autofill_journal(&seal_all(&[with_totp, blank_totp], &keys), &keys.journal_secret, None)
+            .drain_autofill_journal(&seal_all(&[with_totp, blank_totp], &keys), &dk(&keys), None)
             .unwrap();
 
         assert_eq!(summary.created.len(), 2);

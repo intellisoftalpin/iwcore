@@ -20,16 +20,45 @@
 //! attacker who has compromised the provider already holds the index key and
 //! therefore the whole index, so a handful of staged records is marginal.
 //!
+//! # Integrity
+//!
+//! The app wrap provides confidentiality; it does not identify the writer,
+//! because the key it is sealed to is public. Every format-2 record therefore
+//! also carries an HMAC-SHA256 tag under the journal auth key (see
+//! [`super::keys`]), a symmetric key held only by the app and its provider, so
+//! the drain applies exactly the records the provider wrote. The tag covers every payload byte before it, version
+//! included, so no part of a record can be altered or exchanged.
+//!
+//! The drain ([`open_for_drain`]) verifies the tag before it unwraps anything
+//! and refuses a record whose tag does not verify. Such records are counted in
+//! [`DrainRead::unauthenticated`] and never applied.
+//!
+//! Format-1 records, written before records carried a tag, are refused by the
+//! drain as well, unless the caller passes the key they were wrapped under in
+//! [`DrainKeys::legacy_wrap_keys`]: a format-1 record whose provider wrap opens
+//! under one of those symmetric keys was written by a holder of that key, which
+//! is the same guarantee the tag gives. Passing none refuses them all.
+//!
+//! The provider's read-back path ([`open_with_index_key`]) needs no tag: the
+//! provider wrap is an AEAD under a symmetric key, so a record that opens there
+//! was written by a holder of that key. It reads both formats.
+//!
 //! # Framing
 //!
 //! ```text
 //! record := u32 LE payload_len || payload
-//! payload := u8 version
+//! payload := u8 version                        (2; 1 for legacy records)
 //!         || u8  eph_len  || eph_public
 //!         || u16 LE len   || wrap_to_app      (K sealed to the app's key)
 //!         || u16 LE len   || wrap_to_index    (K sealed under the index key)
 //!         || u32 LE len   || body             (the record JSON, sealed under K)
+//!         || [32] tag                         (format 2 only; HMAC-SHA256 under
+//!                                              the journal auth key over
+//!                                              MAC_CONTEXT || every byte above)
 //! ```
+//!
+//! Every length is applied with checked arithmetic and bounds-checked slices,
+//! so a hostile length ends the walk on every pointer width, 32-bit included.
 //!
 //! Records are **independently** sealed and independently framed, and the file
 //! is only ever appended to. A torn final write costs at most the last record;
@@ -37,15 +66,24 @@
 //! malformed record and return everything they parsed before it, rather than
 //! failing the whole file.
 
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::error::{Result, WalletError};
 
 use super::crypto::{self, KEY_LEN};
 
-/// Current journal record format version.
-pub const FORMAT_VERSION: u8 = 1;
+/// Current journal record format version: records carry an HMAC tag.
+pub const FORMAT_VERSION: u8 = 2;
+/// The format before records carried a tag. Read back by the provider; drained
+/// only through [`DrainKeys::legacy_wrap_keys`].
+pub const LEGACY_FORMAT_VERSION: u8 = 1;
+/// Length of the HMAC-SHA256 tag closing a format-2 record.
+pub const TAG_LEN: usize = 32;
+/// Prefix of the message the tag is computed over, for domain separation.
+pub const MAC_CONTEXT: &[u8] = b"iwcore/autofill/journal/v2/mac";
 
 /// Maximum records the provider may stage before it must refuse to save more.
 pub const MAX_RECORDS: usize = 50;
@@ -142,12 +180,29 @@ impl PendingRecord {
     }
 }
 
-/// Seal one record into its framed on-disk form. The provider appends the
-/// returned bytes verbatim.
+/// Seal one record into its framed on-disk form, in the current format. The
+/// provider appends the returned bytes verbatim.
+///
+/// `index_key` fills the provider's read-back wrap (on Android, the staging
+/// key); `auth_key` is the journal auth key the drain verifies the tag with.
 pub fn seal_record(
     record: &PendingRecord,
     journal_public: &[u8],
     index_key: &[u8; KEY_LEN],
+    auth_key: &[u8; KEY_LEN],
+) -> Result<Vec<u8>> {
+    let mut payload = seal_payload(record, journal_public, index_key, FORMAT_VERSION)?;
+    let tag = record_tag(auth_key, &payload);
+    payload.extend_from_slice(&tag);
+    frame(&payload)
+}
+
+/// The unframed payload of one record, without a tag, in format `version`.
+fn seal_payload(
+    record: &PendingRecord,
+    journal_public: &[u8],
+    index_key: &[u8; KEY_LEN],
+    version: u8,
 ) -> Result<Vec<u8>> {
     let json = Zeroizing::new(
         serde_json::to_vec(record)
@@ -160,15 +215,15 @@ pub fn seal_record(
     // header that contains that key. It is bound to the version instead; any
     // tampering with the ephemeral key makes the derivation fail regardless.
     let (eph_public, wrap_to_app) =
-        crypto::ecies_seal(journal_public, record_key.as_slice(), &[FORMAT_VERSION], ECIES_INFO)?;
+        crypto::ecies_seal(journal_public, record_key.as_slice(), &[version], ECIES_INFO)?;
 
     // Everything else is bound to version + ephemeral key.
-    let header = header_bytes(&eph_public);
+    let header = header_bytes(version, &eph_public);
     let wrap_to_index = crypto::seal(index_key, record_key.as_slice(), &header)?;
     let body = crypto::seal(&record_key, &json, &header)?;
 
     let mut payload = Vec::new();
-    payload.push(FORMAT_VERSION);
+    payload.push(version);
     payload.push(u8::try_from(eph_public.len()).map_err(|_| too_long("ephemeral key"))?);
     payload.extend_from_slice(&eph_public);
     payload.extend_from_slice(&u16::try_from(wrap_to_app.len()).map_err(|_| too_long("app wrap"))?.to_le_bytes());
@@ -177,26 +232,118 @@ pub fn seal_record(
     payload.extend_from_slice(&wrap_to_index);
     payload.extend_from_slice(&u32::try_from(body.len()).map_err(|_| too_long("body"))?.to_le_bytes());
     payload.extend_from_slice(&body);
+    Ok(payload)
+}
 
+/// A record in the legacy format, with no tag, for tests of the recovery path.
+#[cfg(test)]
+pub(crate) fn seal_legacy_record(
+    record: &PendingRecord,
+    journal_public: &[u8],
+    index_key: &[u8; KEY_LEN],
+) -> Result<Vec<u8>> {
+    frame(&seal_payload(record, journal_public, index_key, LEGACY_FORMAT_VERSION)?)
+}
+
+/// Prefix `payload` with its u32 length.
+fn frame(payload: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(payload.len().saturating_add(4));
     out.extend_from_slice(&u32::try_from(payload.len()).map_err(|_| too_long("record"))?.to_le_bytes());
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(payload);
     Ok(out)
 }
 
-/// Open every record the app can read, using its private journal key. This is
-/// the drain path, and it works regardless of the state of the index key.
-pub fn open_with_journal_key(journal: &[u8], journal_secret: &[u8; 32]) -> Vec<PendingRecord> {
-    parse(journal, |parsed| {
-        let key = crypto::ecies_open(
-            journal_secret,
-            parsed.eph_public,
-            parsed.wrap_to_app,
-            &[FORMAT_VERSION],
-            ECIES_INFO,
-        )?;
-        into_key(key)
-    })
+fn record_mac(auth_key: &[u8; KEY_LEN], signed: &[u8]) -> Hmac<Sha256> {
+    // HMAC takes keys of any length, and a 32-byte key in particular.
+    let mut mac = match <Hmac<Sha256> as KeyInit>::new_from_slice(auth_key) {
+        Ok(mac) => mac,
+        Err(_) => unreachable!("HMAC takes any key length"),
+    };
+    mac.update(MAC_CONTEXT);
+    mac.update(signed);
+    mac
+}
+
+/// The tag over `signed`, the payload bytes before the tag.
+fn record_tag(auth_key: &[u8; KEY_LEN], signed: &[u8]) -> [u8; TAG_LEN] {
+    record_mac(auth_key, signed).finalize().into_bytes().into()
+}
+
+/// Constant-time check of a record's tag.
+fn tag_verifies(auth_key: &[u8; KEY_LEN], signed: &[u8], tag: &[u8]) -> bool {
+    record_mac(auth_key, signed).verify_slice(tag).is_ok()
+}
+
+/// Keys the app drains with. See the module documentation for what each one
+/// proves.
+pub struct DrainKeys<'a> {
+    /// The app-private P-256 secret that opens the app wrap.
+    pub journal_secret: &'a [u8; 32],
+    /// The journal auth key the provider tagged each record with.
+    pub auth_key: &'a [u8; KEY_LEN],
+    /// Recovery only: symmetric keys a format-1 record may be wrapped under
+    /// (the index key, or Android's staging key, that the provider used). A
+    /// format-1 record is applied only when its provider wrap opens under one
+    /// of these. Empty refuses every format-1 record.
+    pub legacy_wrap_keys: &'a [[u8; KEY_LEN]],
+}
+
+/// What the drain could read from a journal.
+#[derive(Debug, Default)]
+pub struct DrainRead {
+    /// Records that proved who wrote them and opened, in file order.
+    pub records: Vec<PendingRecord>,
+    /// Well-framed records that were refused because they carry no valid tag
+    /// (or, for format 1, no provider wrap under a supplied legacy key).
+    pub unauthenticated: usize,
+}
+
+/// Open every record the drain may apply. This is the drain path, and it works
+/// regardless of the state of the index key.
+///
+/// A format-2 record is applied only when its tag verifies under
+/// `keys.auth_key`; the tag is checked before anything is unwrapped. A format-1
+/// record is applied only when its provider wrap opens under one of
+/// `keys.legacy_wrap_keys`. Everything else that is well framed is counted in
+/// [`DrainRead::unauthenticated`].
+pub fn open_for_drain(journal: &[u8], keys: &DrainKeys<'_>) -> DrainRead {
+    let mut unauthenticated = 0usize;
+    let records = parse(journal, |parsed| {
+        let key = match parsed.tag {
+            Some(tag) => {
+                if !tag_verifies(keys.auth_key, parsed.signed, tag) {
+                    unauthenticated = unauthenticated.saturating_add(1);
+                    return Err(unauthenticated_record());
+                }
+                let key = crypto::ecies_open(
+                    keys.journal_secret,
+                    parsed.eph_public,
+                    parsed.wrap_to_app,
+                    &[parsed.version],
+                    ECIES_INFO,
+                )?;
+                into_key(key)?
+            }
+            None => {
+                let header = header_bytes(parsed.version, parsed.eph_public);
+                let opened = keys
+                    .legacy_wrap_keys
+                    .iter()
+                    .find_map(|k| crypto::open(k, parsed.wrap_to_index, &header).ok());
+                let Some(key) = opened else {
+                    unauthenticated = unauthenticated.saturating_add(1);
+                    return Err(unauthenticated_record());
+                };
+                into_key(key)?
+            }
+        };
+        Ok(key)
+    });
+    DrainRead { records, unauthenticated }
+}
+
+fn unauthenticated_record() -> WalletError {
+    WalletError::DecryptionError("journal record is not authenticated".into())
 }
 
 /// Open every record the provider can read, using the shared index key. This is
@@ -204,7 +351,7 @@ pub fn open_with_journal_key(journal: &[u8], journal_secret: &[u8; 32]) -> Vec<P
 /// list before the app has ever drained it.
 pub fn open_with_index_key(journal: &[u8], index_key: &[u8; KEY_LEN]) -> Vec<PendingRecord> {
     parse(journal, |parsed| {
-        let header = header_bytes(parsed.eph_public);
+        let header = header_bytes(parsed.version, parsed.eph_public);
         let key = crypto::open(index_key, parsed.wrap_to_index, &header)?;
         into_key(key)
     })
@@ -277,9 +424,9 @@ pub fn dedupe(records: Vec<PendingRecord>) -> Vec<PendingRecord> {
         .collect()
 }
 
-fn header_bytes(eph_public: &[u8]) -> Vec<u8> {
+fn header_bytes(version: u8, eph_public: &[u8]) -> Vec<u8> {
     let mut header = Vec::with_capacity(eph_public.len().saturating_add(1));
-    header.push(FORMAT_VERSION);
+    header.push(version);
     header.extend_from_slice(eph_public);
     header
 }
@@ -296,6 +443,11 @@ fn too_long(what: &str) -> WalletError {
 }
 
 struct ParsedRecord<'a> {
+    version: u8,
+    /// The payload bytes the tag covers: everything before it.
+    signed: &'a [u8],
+    /// The tag, for format 2; `None` for a format-1 record.
+    tag: Option<&'a [u8]>,
     eph_public: &'a [u8],
     wrap_to_app: &'a [u8],
     wrap_to_index: &'a [u8],
@@ -308,9 +460,9 @@ struct ParsedRecord<'a> {
 /// parsed so far. A record that is well-framed but fails to open (wrong key,
 /// tampering) is skipped while parsing continues, so one bad record cannot hide
 /// the ones after it.
-fn parse<F>(journal: &[u8], unwrap_key: F) -> Vec<PendingRecord>
+fn parse<F>(journal: &[u8], mut unwrap_key: F) -> Vec<PendingRecord>
 where
-    F: Fn(&ParsedRecord<'_>) -> Result<Zeroizing<[u8; KEY_LEN]>>,
+    F: FnMut(&ParsedRecord<'_>) -> Result<Zeroizing<[u8; KEY_LEN]>>,
 {
     let mut out = Vec::new();
 
@@ -321,7 +473,7 @@ where
         let Ok(key) = unwrap_key(&parsed) else {
             continue; // not ours to read, or tampered; later records may be fine
         };
-        let header = header_bytes(parsed.eph_public);
+        let header = header_bytes(parsed.version, parsed.eph_public);
         let Ok(json) = crypto::open(&key, parsed.body, &header).map(Zeroizing::new) else {
             continue;
         };
@@ -335,7 +487,8 @@ where
 
 fn split_payload(payload: &[u8]) -> Option<ParsedRecord<'_>> {
     let mut reader = Reader(payload);
-    if reader.byte()? != FORMAT_VERSION {
+    let version = reader.byte()?;
+    if version != FORMAT_VERSION && version != LEGACY_FORMAT_VERSION {
         return None;
     }
 
@@ -351,7 +504,24 @@ fn split_payload(payload: &[u8]) -> Option<ParsedRecord<'_>> {
     let body_len = reader.u32()?;
     let body = reader.take(body_len)?;
 
+    // Format 2 ends with exactly one tag; format 1 ends at the body (anything
+    // after it was never read, and still is not).
+    let signed_len = payload.len().checked_sub(reader.0.len())?;
+    let signed = payload.get(..signed_len)?;
+    let tag = if version == FORMAT_VERSION {
+        let tag = reader.take(TAG_LEN)?;
+        if !reader.0.is_empty() {
+            return None;
+        }
+        Some(tag)
+    } else {
+        None
+    };
+
     Some(ParsedRecord {
+        version,
+        signed,
+        tag,
         eph_public,
         wrap_to_app,
         wrap_to_index,
@@ -395,6 +565,11 @@ mod tests {
     use super::super::keys::generate_keys;
     use super::*;
 
+    /// The drain path with no legacy keys: what the app applies.
+    fn open_app(journal: &[u8], secret: &[u8; 32], auth: &[u8; KEY_LEN]) -> Vec<PendingRecord> {
+        open_for_drain(journal, &DrainKeys { journal_secret: secret, auth_key: auth, legacy_wrap_keys: &[] }).records
+    }
+
     fn record(id: &str) -> PendingRecord {
         PendingRecord {
             record_id: id.to_string(),
@@ -415,9 +590,9 @@ mod tests {
     fn both_wraps_open_to_identical_plaintext() {
         let keys = generate_keys().unwrap();
         let original = record("r1");
-        let sealed = seal_record(&original, &keys.journal_public, &keys.index_key).unwrap();
+        let sealed = seal_record(&original, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
 
-        let via_app = open_with_journal_key(&sealed, &keys.journal_secret);
+        let via_app = open_app(&sealed, &keys.journal_secret, &keys.journal_auth_key);
         let via_index = open_with_index_key(&sealed, &keys.index_key);
 
         assert_eq!(via_app, vec![original.clone()]);
@@ -431,22 +606,24 @@ mod tests {
     fn app_can_still_drain_when_the_index_wrap_is_unusable() {
         let keys = generate_keys().unwrap();
         let rotated = generate_keys().unwrap();
-        let sealed = seal_record(&record("r1"), &keys.journal_public, &keys.index_key).unwrap();
+        let sealed = seal_record(&record("r1"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
 
         // The provider has lost read-back...
         assert!(open_with_index_key(&sealed, &rotated.index_key).is_empty());
         // ...but nothing is lost, because the app never needed that key.
-        assert_eq!(open_with_journal_key(&sealed, &keys.journal_secret).len(), 1);
+        assert_eq!(open_app(&sealed, &keys.journal_secret, &keys.journal_auth_key).len(), 1);
     }
 
+    /// A damaged provider wrap costs read-back, and the drain refuses the
+    /// record too: the tag covers the wrap, so the record is no longer the one
+    /// the provider wrote. (A rotated index key, by contrast, costs the drain
+    /// nothing; see the test above.)
     #[test]
-    fn corrupting_only_the_index_wrap_leaves_the_app_path_intact() {
+    fn corrupting_only_the_index_wrap_is_detected_on_both_paths() {
         let keys = generate_keys().unwrap();
-        let mut sealed = seal_record(&record("r1"), &keys.journal_public, &keys.index_key).unwrap();
+        let mut sealed = seal_record(&record("r1"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
 
-        // Locate the index wrap exactly, rather than guessing an offset: the
-        // body is sealed under the shared record key, so corrupting it would
-        // break both paths and prove nothing.
+        // Locate the index wrap exactly, rather than guessing an offset.
         let (eph_len, wrap_app_len) = {
             let parsed = split_payload(&sealed[4..]).unwrap();
             (parsed.eph_public.len(), parsed.wrap_to_app.len())
@@ -455,28 +632,30 @@ mod tests {
         sealed[target] ^= 0xff;
 
         assert!(open_with_index_key(&sealed, &keys.index_key).is_empty());
-        assert_eq!(open_with_journal_key(&sealed, &keys.journal_secret).len(), 1);
+        let read = open_for_drain(&sealed, &drain_keys(&keys, &[]));
+        assert!(read.records.is_empty());
+        assert_eq!(read.unauthenticated, 1);
     }
 
     #[test]
     fn the_public_key_alone_cannot_open_a_record() {
         let keys = generate_keys().unwrap();
-        let sealed = seal_record(&record("r1"), &keys.journal_public, &keys.index_key).unwrap();
+        let sealed = seal_record(&record("r1"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
 
         // Treating the public key bytes as if they were a secret scalar must
         // not yield anything.
         let mut fake_secret = [0u8; 32];
         fake_secret.copy_from_slice(&keys.journal_public[1..33]);
-        assert!(open_with_journal_key(&sealed, &fake_secret).is_empty());
+        assert!(open_app(&sealed, &fake_secret, &keys.journal_auth_key).is_empty());
     }
 
     #[test]
     fn keys_from_another_enable_cycle_open_nothing() {
         let keys = generate_keys().unwrap();
         let other = generate_keys().unwrap();
-        let sealed = seal_record(&record("r1"), &keys.journal_public, &keys.index_key).unwrap();
+        let sealed = seal_record(&record("r1"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
 
-        assert!(open_with_journal_key(&sealed, &other.journal_secret).is_empty());
+        assert!(open_app(&sealed, &other.journal_secret, &other.journal_auth_key).is_empty());
         assert!(open_with_index_key(&sealed, &other.index_key).is_empty());
     }
 
@@ -484,19 +663,19 @@ mod tests {
     fn records_are_independent_under_truncation_at_every_offset() {
         let keys = generate_keys().unwrap();
         let mut journal = Vec::new();
-        let first = seal_record(&record("r1"), &keys.journal_public, &keys.index_key).unwrap();
-        let second = seal_record(&record("r2"), &keys.journal_public, &keys.index_key).unwrap();
+        let first = seal_record(&record("r1"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
+        let second = seal_record(&record("r2"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
         journal.extend_from_slice(&first);
         journal.extend_from_slice(&second);
 
         // Cut anywhere inside the second record: the first must always survive.
         for cut in first.len()..journal.len() {
-            let opened = open_with_journal_key(&journal[..cut], &keys.journal_secret);
+            let opened = open_app(&journal[..cut], &keys.journal_secret, &keys.journal_auth_key);
             assert_eq!(opened.len(), 1, "truncated at {cut}");
             assert_eq!(opened[0].record_id, "r1");
         }
         // Intact, both are readable.
-        assert_eq!(open_with_journal_key(&journal, &keys.journal_secret).len(), 2);
+        assert_eq!(open_app(&journal, &keys.journal_secret, &keys.journal_auth_key).len(), 2);
     }
 
     #[test]
@@ -506,13 +685,13 @@ mod tests {
         let mut journal = Vec::new();
         // Sealed to a different app key: well-framed, but not ours to open.
         journal.extend_from_slice(
-            &seal_record(&record("foreign"), &other.journal_public, &keys.index_key).unwrap(),
+            &seal_record(&record("foreign"), &other.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap(),
         );
         journal.extend_from_slice(
-            &seal_record(&record("ours"), &keys.journal_public, &keys.index_key).unwrap(),
+            &seal_record(&record("ours"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap(),
         );
 
-        let opened = open_with_journal_key(&journal, &keys.journal_secret);
+        let opened = open_app(&journal, &keys.journal_secret, &keys.journal_auth_key);
         assert_eq!(opened.len(), 1);
         assert_eq!(opened[0].record_id, "ours");
     }
@@ -527,7 +706,7 @@ mod tests {
             vec![0u8; 128],
             b"not a journal at all".to_vec(),
         ] {
-            assert!(open_with_journal_key(&junk, &keys.journal_secret).is_empty());
+            assert!(open_app(&junk, &keys.journal_secret, &keys.journal_auth_key).is_empty());
             assert!(open_with_index_key(&junk, &keys.index_key).is_empty());
         }
     }
@@ -535,9 +714,9 @@ mod tests {
     #[test]
     fn an_unknown_format_version_is_refused() {
         let keys = generate_keys().unwrap();
-        let mut sealed = seal_record(&record("r1"), &keys.journal_public, &keys.index_key).unwrap();
+        let mut sealed = seal_record(&record("r1"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
         sealed[4] = 99; // version byte, straight after the u32 frame length
-        assert!(open_with_journal_key(&sealed, &keys.journal_secret).is_empty());
+        assert!(open_app(&sealed, &keys.journal_secret, &keys.journal_auth_key).is_empty());
     }
 
     #[test]
@@ -545,10 +724,121 @@ mod tests {
         let keys = generate_keys().unwrap();
         let mut ancient = record("old");
         ancient.created_at = 0; // 1970
-        let sealed = seal_record(&ancient, &keys.journal_public, &keys.index_key).unwrap();
+        let sealed = seal_record(&ancient, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
 
-        assert_eq!(open_with_journal_key(&sealed, &keys.journal_secret).len(), 1);
+        assert_eq!(open_app(&sealed, &keys.journal_secret, &keys.journal_auth_key).len(), 1);
         assert_eq!(open_with_index_key(&sealed, &keys.index_key).len(), 1);
+    }
+
+    // ---- integrity ----------------------------------------------------------
+
+    fn drain_keys<'a>(keys: &'a crate::autofill::AutofillKeys, legacy: &'a [[u8; KEY_LEN]]) -> DrainKeys<'a> {
+        DrainKeys { journal_secret: &keys.journal_secret, auth_key: &keys.journal_auth_key, legacy_wrap_keys: legacy }
+    }
+
+    /// A record tagged under any key but the journal auth key is not applied.
+    #[test]
+    fn a_record_without_the_auth_key_is_refused_and_counted() {
+        let keys = generate_keys().unwrap();
+        let unrelated = generate_keys().unwrap();
+        let untagged = seal_record(&record("other"), &keys.journal_public, &unrelated.index_key, &unrelated.journal_auth_key)
+            .unwrap();
+        let genuine = seal_record(&record("genuine"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
+        let mut journal = untagged.clone();
+        journal.extend_from_slice(&genuine);
+
+        let read = open_for_drain(&journal, &drain_keys(&keys, &[]));
+        assert_eq!(read.unauthenticated, 1);
+        let ids: Vec<_> = read.records.iter().map(|r| r.record_id.as_str()).collect();
+        assert_eq!(ids, vec!["genuine"], "the refused record does not hide the next one");
+    }
+
+    #[test]
+    fn every_byte_of_a_record_is_covered_by_the_tag() {
+        let keys = generate_keys().unwrap();
+        let sealed = seal_record(&record("r1"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
+        // Skip the outer length: changing it breaks framing, not the tag.
+        for byte in 5..sealed.len() {
+            let mut tampered = sealed.clone();
+            tampered[byte] ^= 0x01;
+            let read = open_for_drain(&tampered, &drain_keys(&keys, &[]));
+            assert!(read.records.is_empty(), "byte {byte}");
+            // Inner lengths may now be malformed (not counted); otherwise
+            // the tag must be what refused it.
+            if split_payload(&tampered[4..]).is_some() {
+                assert_eq!(read.unauthenticated, 1, "byte {byte}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_tagged_record_must_end_exactly_at_its_tag() {
+        let keys = generate_keys().unwrap();
+        let sealed = seal_record(&record("r1"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
+        let payload = &sealed[4..];
+        assert!(split_payload(payload).is_some());
+        let mut longer = payload.to_vec();
+        longer.push(0);
+        assert!(split_payload(&longer).is_none(), "trailing byte after the tag");
+        assert!(split_payload(&payload[..payload.len() - 1]).is_none(), "tag one byte short");
+    }
+
+    #[test]
+    fn a_tag_does_not_open_a_record_meant_for_another_app_key() {
+        let keys = generate_keys().unwrap();
+        let other = generate_keys().unwrap();
+        let sealed = seal_record(&record("r1"), &other.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
+        let read = open_for_drain(&sealed, &drain_keys(&keys, &[]));
+        assert!(read.records.is_empty());
+        assert_eq!(read.unauthenticated, 0, "authentic, just not ours to open");
+    }
+
+    #[test]
+    fn legacy_records_drain_only_through_a_supplied_wrap_key() {
+        let keys = generate_keys().unwrap();
+        let other = generate_keys().unwrap();
+        let legacy = seal_legacy_record(&record("old"), &keys.journal_public, &keys.index_key).unwrap();
+        assert_eq!(legacy[4], LEGACY_FORMAT_VERSION);
+
+        let refused = open_for_drain(&legacy, &drain_keys(&keys, &[]));
+        assert!(refused.records.is_empty());
+        assert_eq!(refused.unauthenticated, 1);
+
+        let wrong = [*other.index_key];
+        let refused = open_for_drain(&legacy, &drain_keys(&keys, &wrong));
+        assert!(refused.records.is_empty());
+        assert_eq!(refused.unauthenticated, 1);
+
+        let right = [*other.index_key, *keys.index_key];
+        let read = open_for_drain(&legacy, &drain_keys(&keys, &right));
+        assert_eq!(read.records, vec![record("old")]);
+        assert_eq!(read.unauthenticated, 0);
+    }
+
+    #[test]
+    fn read_back_opens_both_formats() {
+        let keys = generate_keys().unwrap();
+        let mut journal = seal_legacy_record(&record("old"), &keys.journal_public, &keys.index_key).unwrap();
+        journal.extend_from_slice(
+            &seal_record(&record("new"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap(),
+        );
+        let ids: Vec<_> = open_with_index_key(&journal, &keys.index_key).into_iter().map(|r| r.record_id).collect();
+        assert_eq!(ids, vec!["old", "new"]);
+        assert_eq!(count_records(&journal), 2);
+    }
+
+    #[test]
+    fn the_tag_is_hmac_sha256_over_the_context_and_the_payload() {
+        // Pinned so other implementations (the Swift extension) can match it.
+        let key = [0x42u8; KEY_LEN];
+        let tag = record_tag(&key, b"payload");
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key).unwrap();
+        mac.update(b"iwcore/autofill/journal/v2/mac");
+        mac.update(b"payload");
+        assert_eq!(tag.as_slice(), mac.finalize().into_bytes().as_slice());
+        assert!(tag_verifies(&key, b"payload", &tag));
+        assert!(!tag_verifies(&key, b"payload", &tag[..TAG_LEN - 1]));
+        assert!(!tag_verifies(&[0x43; KEY_LEN], b"payload", &tag));
     }
 
     #[test]
@@ -623,7 +913,7 @@ mod tests {
     #[test]
     fn hostile_frame_lengths_end_the_walk() {
         let keys = generate_keys().unwrap();
-        let valid = seal_record(&record("r1"), &keys.journal_public, &keys.index_key).unwrap();
+        let valid = seal_record(&record("r1"), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
 
         let mut cases: Vec<Vec<u8>> = vec![
             vec![0xfc, 0xff, 0xff, 0xff],
@@ -645,7 +935,7 @@ mod tests {
             let starts_valid = journal.starts_with(&valid);
             let expected = usize::from(starts_valid);
             assert_eq!(count_records(journal), expected, "{journal:02x?}");
-            assert_eq!(open_with_journal_key(journal, &keys.journal_secret).len(), expected);
+            assert_eq!(open_app(journal, &keys.journal_secret, &keys.journal_auth_key).len(), expected);
             assert_eq!(open_with_index_key(journal, &keys.index_key).len(), expected);
         }
     }
@@ -675,10 +965,15 @@ mod tests {
             framed.extend_from_slice(&payload);
             assert_eq!(count_records(&framed), 1, "framing itself is fine");
             let keys = generate_keys().unwrap();
-            assert!(open_with_journal_key(&framed, &keys.journal_secret).is_empty());
+            assert!(open_app(&framed, &keys.journal_secret, &keys.journal_auth_key).is_empty());
         }
-        // The smallest structurally complete payload: every length zero.
-        assert!(split_payload(&[FORMAT_VERSION, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_some());
+        // The smallest structurally complete payloads: every length zero, and
+        // for the current format a tag.
+        let mut tagged = vec![FORMAT_VERSION, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        tagged.extend_from_slice(&[0u8; TAG_LEN]);
+        assert!(split_payload(&tagged).is_some());
+        assert!(split_payload(&[LEGACY_FORMAT_VERSION, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_some());
+        assert!(split_payload(&tagged[..10]).is_none(), "format 2 without its tag");
     }
 
     #[test]
@@ -698,8 +993,7 @@ mod tests {
             let sealed = seal_record(
                 &record(&format!("r{i}")),
                 &keys.journal_public,
-                &keys.index_key,
-            )
+                &keys.index_key, &keys.journal_auth_key)
             .unwrap();
             journal.extend_from_slice(&sealed);
             assert_eq!(count_records(&journal), i + 1);

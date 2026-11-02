@@ -56,9 +56,9 @@ pub mod wallet;
 pub use domain::{MatchTier, normalize_host, registrable_domain};
 pub use identity::{IdentityKind, classify};
 pub use index::{IndexEntry, IndexHeader, IndexOptions};
-pub use journal::{PendingOp, PendingRecord};
+pub use journal::{DrainKeys, PendingOp, PendingRecord};
 pub use keys::{AutofillKeys, generate_keys};
-pub use wallet::DrainSummary;
+pub use wallet::{DrainSummary, PasskeyReplacement};
 
 /// Field type holding a login password.
 pub const FIELD_PASSWORD: &str = "PASS";

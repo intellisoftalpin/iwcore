@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use iwcore::autofill::{index, IndexOptions};
+use iwcore::autofill::{index, DrainKeys, IndexOptions};
 use iwcore::backup::{get_backup_db_version, BackupManager};
 use iwcore::{IWField, IWItem, IWLabel, Wallet};
 use serde_json::Value;
@@ -209,15 +209,26 @@ fn v1_journal_from_0_4_0_drains_into_the_restored_vault() {
     let dir = fixture_dir("0.4.0");
     let (_t, mut wallet, m) = restore("0.4.0");
     let secret = hex32(m["autofill"]["journal_secret"].as_str().unwrap());
+    let index_key = hex32(m["autofill"]["index_key"].as_str().unwrap());
     let journal = fs::read(dir.join("autofill-journal-v1.bin")).unwrap();
 
-    let summary = wallet.drain_autofill_journal(&journal, &secret, None).unwrap();
+    // Format-1 records carry no tag, so without a legacy key they are refused.
+    let strict = DrainKeys { journal_secret: &secret, auth_key: &[0u8; 32], legacy_wrap_keys: &[] };
+    let refused = wallet.drain_autofill_journal(&journal, &strict, None).unwrap();
+    assert!(refused.created.is_empty(), "an untagged record must not be applied");
+    assert_eq!(refused.unauthenticated, 1);
+
+    // The recovery path: the provider wrap opens under the index key.
+    let legacy = [index_key];
+    let keys = DrainKeys { journal_secret: &secret, auth_key: &[0u8; 32], legacy_wrap_keys: &legacy };
+    let summary = wallet.drain_autofill_journal(&journal, &keys, Some(&refused.folder_id)).unwrap();
     assert_eq!(summary.created.len(), 1, "the staged login must be imported");
+    assert_eq!(summary.unauthenticated, 0);
     let fields = wallet.get_fields_by_item(&summary.created[0]).unwrap();
     assert!(fields.iter().any(|f| f.field_type == "PASS" && f.value == "staged-pass-1"));
 
     // Draining the same journal again changes nothing.
-    let again = wallet.drain_autofill_journal(&journal, &secret, Some(&summary.folder_id)).unwrap();
+    let again = wallet.drain_autofill_journal(&journal, &keys, Some(&summary.folder_id)).unwrap();
     assert!(again.created.is_empty(), "second drain must not duplicate");
 }
 
@@ -342,8 +353,9 @@ fn a_restored_old_backup_gains_passkeys_and_backs_them_up() {
             password: String::new(), totp_secret: None, created_at: 0,
             passkey: Some(reg.record.to_field_value().unwrap().to_string()),
         };
-        let j = journal::seal_record(&record, &keys.journal_public, &keys.index_key).unwrap();
-        let s = wallet.drain_autofill_journal(&j, &keys.journal_secret, None).unwrap();
+        let j = journal::seal_record(&record, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
+        let dk = DrainKeys { journal_secret: &keys.journal_secret, auth_key: &keys.journal_auth_key, legacy_wrap_keys: &[] };
+        let s = wallet.drain_autofill_journal(&j, &dk, None).unwrap();
         assert_eq!(s.passkeys_added, 1, "{v}");
         assert!(wallet.get_labels().unwrap().iter().any(|l| l.field_type == "PKEY"), "{v}: label added");
 

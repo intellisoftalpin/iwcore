@@ -88,8 +88,9 @@ fn pending_records_are_redacted() {
     assert_hidden("PendingRecord", format!("{record:?}"));
 
     let keys = generate_keys().unwrap();
-    let sealed = journal::seal_record(&record, &keys.journal_public, &keys.index_key).unwrap();
-    let opened = journal::open_with_journal_key(&sealed, &keys.journal_secret);
+    let sealed = journal::seal_record(&record, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
+    let dk = journal::DrainKeys { journal_secret: &keys.journal_secret, auth_key: &keys.journal_auth_key, legacy_wrap_keys: &[] };
+    let opened = journal::open_for_drain(&sealed, &dk).records;
     assert_eq!(opened.len(), 1);
     assert_hidden("PendingRecord opened", format!("{opened:#?}"));
 }

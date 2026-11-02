@@ -2,7 +2,7 @@
 //! registers a passkey, stages it in the journal, signs with it before the app
 //! ever opens, and the app drains it into the vault and rebuilds the index.
 
-use iwcore::autofill::{generate_keys, index, journal, AutofillKeys, IndexOptions, PendingOp, PendingRecord};
+use iwcore::autofill::{generate_keys, index, journal, AutofillKeys, DrainKeys, IndexOptions, PendingOp, PendingRecord};
 use iwcore::backup::BackupManager;
 use iwcore::passkey::sign::{self, RegisterInput};
 use iwcore::passkey::{PasskeyRecord, FIELD_PASSKEY};
@@ -46,7 +46,7 @@ fn stage(keys: &AutofillKeys, rp: &str, user: &str, handle: &[u8]) -> (Vec<u8>, 
         created_at: 1_793_433_600,
         passkey: Some(reg.record.to_field_value().unwrap().to_string()),
     };
-    let bytes = journal::seal_record(&record, &keys.journal_public, &keys.index_key).unwrap();
+    let bytes = journal::seal_record(&record, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
     (bytes, reg.record)
 }
 
@@ -55,7 +55,8 @@ fn hex(b: &[u8]) -> String {
 }
 
 fn drain(w: &mut Wallet, keys: &AutofillKeys, journal: &[u8]) -> iwcore::autofill::DrainSummary {
-    w.drain_autofill_journal(journal, &keys.journal_secret, None).unwrap()
+    let dk = DrainKeys { journal_secret: &keys.journal_secret, auth_key: &keys.journal_auth_key, legacy_wrap_keys: &[] };
+    w.drain_autofill_journal(journal, &dk, None).unwrap()
 }
 
 fn index_passkeys(w: &mut Wallet, keys: &AutofillKeys) -> Vec<index::PasskeyIndexEntry> {
@@ -83,7 +84,7 @@ fn no_matching_login_creates_an_item_in_autofill() {
     let keys = generate_keys().unwrap();
     let (j, staged) = stage(&keys, "example.com", "bkv@example.com", b"h1");
     let s = drain(&mut w, &keys, &j);
-    assert_eq!((s.passkeys_added, s.passkeys_replaced, s.created.len()), (1, 0, 1));
+    assert_eq!((s.passkeys_added, s.pending_replacements.len(), s.created.len()), (1, 0, 1));
 
     let item = w.get_item(&s.created[0]).unwrap().unwrap();
     assert_eq!(item.name, "example.com");
@@ -127,22 +128,41 @@ fn a_login_for_another_account_does_not_receive_it() {
 }
 
 #[test]
-fn re_registration_replaces_and_keeps_the_old_one_in_the_trash() {
+fn re_registration_waits_for_confirmation_then_keeps_the_old_one_in_the_trash() {
     let (_t, mut w) = wallet();
     let keys = generate_keys().unwrap();
     let (j1, first) = stage(&keys, "example.com", "bkv", b"same-handle");
     drain(&mut w, &keys, &j1);
     let (j2, second) = stage(&keys, "example.com", "bkv", b"same-handle");
     let s = drain(&mut w, &keys, &j2);
-    assert_eq!((s.passkeys_replaced, s.passkeys_added), (1, 0));
+    assert_eq!((s.pending_replacements.len(), s.passkeys_added), (1, 0));
 
+    // Nothing is replaced yet: the old passkey still signs, the new one waits
+    // in the trash on the same item.
+    let pending = &s.pending_replacements[0];
+    assert_eq!(pending.existing.credential_id, first.credential_id);
+    assert_eq!(pending.staged.credential_id, second.credential_id);
+    assert_eq!(pending.existing.item_id, pending.staged.item_id);
+    let live: Vec<_> = w.list_passkeys().unwrap().into_iter().map(|p| p.credential_id).collect();
+    assert_eq!(live, vec![first.credential_id.clone()]);
+
+    // Draining the same journal again asks again, without a second copy.
+    let again = drain(&mut w, &keys, &j2);
+    assert_eq!(again.pending_replacements, s.pending_replacements);
+    let trashed = |w: &mut Wallet| -> Vec<_> {
+        w.get_deleted_fields().unwrap().into_iter().filter(|f| f.field_type == FIELD_PASSKEY).collect()
+    };
+    assert_eq!(trashed(&mut w).len(), 1);
+
+    // Confirmed: the new one is live, the old one recoverable from the trash.
+    w.confirm_passkey_replacement(&pending.existing.item_id, &pending.existing.field_id, &pending.staged.field_id)
+        .unwrap();
     let list = w.list_passkeys().unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].credential_id, second.credential_id);
-    // The replaced key is recoverable from the trash.
-    let trashed: Vec<_> = w.get_deleted_fields().unwrap().into_iter().filter(|f| f.field_type == FIELD_PASSKEY).collect();
-    assert_eq!(trashed.len(), 1);
-    w.undelete_field(&trashed[0].item_id, &trashed[0].field_id).unwrap();
+    let old = trashed(&mut w);
+    assert_eq!(old.len(), 1);
+    w.undelete_field(&old[0].item_id, &old[0].field_id).unwrap();
     let ids: Vec<_> = w.list_passkeys().unwrap().into_iter().map(|p| p.credential_id).collect();
     assert!(ids.contains(&first.credential_id));
 }
@@ -167,7 +187,7 @@ fn draining_twice_changes_nothing() {
     let (j, _) = stage(&keys, "example.com", "bkv", b"h1");
     drain(&mut w, &keys, &j);
     let s = drain(&mut w, &keys, &j);
-    assert_eq!((s.passkeys_added, s.passkeys_replaced, s.unchanged), (0, 0, 1));
+    assert_eq!((s.passkeys_added, s.pending_replacements.len(), s.unchanged), (0, 0, 1));
     assert_eq!(w.list_passkeys().unwrap().len(), 1);
 }
 
@@ -188,13 +208,13 @@ fn an_invalid_staged_passkey_is_skipped_and_the_rest_drains() {
         created_at: 0,
         passkey: Some("{\"v\":1,\"rpId\":\"x.example\"}".into()),
     };
-    let mut j = journal::seal_record(&bad, &keys.journal_public, &keys.index_key).unwrap();
+    let mut j = journal::seal_record(&bad, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
     let (good, _) = stage(&keys, "example.com", "bkv", b"h1");
     j.extend_from_slice(&good);
     // And a plain login in the same journal.
     let login = PendingRecord { record_id: "login".into(), op: PendingOp::Create, passkey: None,
         password: "pw".into(), url: "https://other.example".into(), identity_value: "me".into(), ..bad.clone() };
-    j.extend_from_slice(&journal::seal_record(&login, &keys.journal_public, &keys.index_key).unwrap());
+    j.extend_from_slice(&journal::seal_record(&login, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap());
 
     let s = drain(&mut w, &keys, &j);
     assert_eq!((s.skipped, s.passkeys_added, s.created.len()), (1, 1, 2));
