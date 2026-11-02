@@ -14,6 +14,7 @@ use aes::Aes256;
 use cbc::{Encryptor, Decryptor};
 use cbc::cipher::{BlockModeEncrypt, BlockModeDecrypt, KeyIvInit};
 use block_padding::Pkcs7;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::key::{prepare_key, KEY_LENGTH};
 use super::md5::md5_hex;
@@ -175,6 +176,8 @@ fn raw_password_key(password: &str) -> [u8; KEY_LENGTH] {
 /// For `re_encryption_count == 0` all three C# modes collapse into one key,
 /// so the chain holds a single candidate and behaves exactly like the plain
 /// [`decrypt`] — zero change for the healthy majority of vaults.
+///
+/// Every candidate key is wiped when the chain is dropped.
 pub struct LegacyKeyChain {
     /// (mode, normal key, iOS-workaround key)
     candidates: Vec<(LegacyKeyMode, [u8; KEY_LENGTH], [u8; KEY_LENGTH])>,
@@ -183,6 +186,26 @@ pub struct LegacyKeyChain {
     /// Whether the preferred candidate succeeded via its iOS variant.
     prefer_ios: bool,
 }
+
+impl Zeroize for LegacyKeyChain {
+    fn zeroize(&mut self) {
+        for (_, key, ios_key) in self.candidates.iter_mut() {
+            key.zeroize();
+            ios_key.zeroize();
+        }
+        self.candidates.clear();
+        self.preferred = 0;
+        self.prefer_ios = false;
+    }
+}
+
+impl Drop for LegacyKeyChain {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for LegacyKeyChain {}
 
 impl LegacyKeyChain {
     /// The historical default iteration count of the C# app (`// 200` in its
@@ -273,8 +296,9 @@ fn decrypt_with_key(ciphertext: &[u8], key: &[u8; KEY_LENGTH]) -> Result<String,
         return Err("Empty ciphertext".to_string());
     }
 
-    // Create a mutable copy for in-place decryption
-    let mut buffer = ciphertext.to_vec();
+    // Create a mutable copy for in-place decryption; it ends up holding the
+    // plaintext, so it is wiped on drop.
+    let mut buffer = Zeroizing::new(ciphertext.to_vec());
 
     // Create decryptor and decrypt
     let decryptor = Aes256CbcDec::new(key.into(), &ZERO_IV.into());
@@ -283,8 +307,8 @@ fn decrypt_with_key(ciphertext: &[u8], key: &[u8; KEY_LENGTH]) -> Result<String,
         .decrypt_padded::<Pkcs7>(&mut buffer)
         .map_err(|e| format!("Decryption failed: {:?}", e))?;
 
-    // Convert to UTF-8 string
-    let full_text = String::from_utf8(decrypted.to_vec())
+    // Validate UTF-8 in place (no further copy of the plaintext).
+    let full_text = std::str::from_utf8(decrypted)
         .map_err(|e| format!("Invalid UTF-8: {}", e))?;
 
     // Verify MD5 checksum. The checksum is 32 ASCII hex characters; a
@@ -628,6 +652,22 @@ mod tests {
         // Even with all three candidates active, a wrong password never
         // passes the MD5 checksum.
         assert!(LegacyKeyChain::new("wrong_password", 200).decrypt(&encrypted).is_err());
+    }
+
+    #[test]
+    fn key_chain_zeroize_wipes_every_candidate() {
+        let mut chain = LegacyKeyChain::new("TestPassword123!", 33);
+        assert_eq!(chain.candidates.len(), 4);
+        chain.zeroize();
+        assert!(chain.candidates.is_empty());
+        assert_eq!(chain.preferred, 0);
+        assert!(!chain.prefer_ios);
+        // A wiped chain decrypts nothing, and does not panic.
+        let blob = encrypt("x", "TestPassword123!", 0, None).unwrap();
+        assert!(chain.decrypt(&blob).is_err());
+        assert_eq!(chain.preferred_mode(), LegacyKeyMode::NoChain);
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<LegacyKeyChain>();
     }
 
     #[test]

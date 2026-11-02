@@ -42,6 +42,16 @@ fn iwfield_debug_is_redacted() {
 }
 
 #[test]
+fn iwitem_debug_redacts_the_title() {
+    let (_t, mut w, item) = wallet();
+    let it = w.get_item(&item).unwrap().unwrap();
+    for text in [format!("{it:?}"), format!("{it:#?}")] {
+        assert!(!text.contains("Example"), "IWItem leaks its title in Debug: {text}");
+        assert!(text.contains("[redacted]"));
+    }
+}
+
+#[test]
 fn search_results_are_redacted() {
     let (_t, mut w, _) = wallet();
     let results = w.search("SecretPass").unwrap();

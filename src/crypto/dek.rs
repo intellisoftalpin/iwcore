@@ -10,6 +10,8 @@
 //!   verifier) - no separate verifier, no MD5.
 
 
+use zeroize::Zeroizing;
+
 use super::aead::{self, KEY_LEN};
 
 /// DEK length (32 bytes = 256 bits).
@@ -28,11 +30,17 @@ pub fn wrap_dek(kek: &[u8; KEY_LEN], dek: &[u8; DEK_LEN]) -> Result<Vec<u8>, Str
 }
 
 /// Unwrap the DEK. Returns an error if the KEK is wrong (the password is
-/// incorrect) or the wrapped blob is malformed/tampered.
-pub fn unwrap_dek(kek: &[u8; KEY_LEN], wrapped: &[u8]) -> Result<[u8; DEK_LEN], String> {
-    let pt = aead::open(kek, wrapped)?;
-    <[u8; DEK_LEN]>::try_from(pt.as_slice())
-        .map_err(|_| "unwrapped DEK has wrong length".to_string())
+/// incorrect) or the wrapped blob is malformed/tampered. The DEK, and the
+/// decrypted buffer it is copied from, are wiped on drop.
+pub fn unwrap_dek(kek: &[u8; KEY_LEN], wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>, String> {
+    let pt = Zeroizing::new(aead::open(kek, wrapped)?);
+    let bytes: &[u8; DEK_LEN] = pt
+        .as_slice()
+        .try_into()
+        .map_err(|_| "unwrapped DEK has wrong length".to_string())?;
+    let mut dek = Zeroizing::new([0u8; DEK_LEN]);
+    dek.copy_from_slice(bytes);
+    Ok(dek)
 }
 
 #[cfg(test)]
@@ -44,7 +52,8 @@ mod tests {
         let kek = [3u8; KEY_LEN];
         let dek = generate_dek().unwrap();
         let wrapped = wrap_dek(&kek, &dek).unwrap();
-        assert_eq!(unwrap_dek(&kek, &wrapped).unwrap(), *dek);
+        let unwrapped: Zeroizing<[u8; DEK_LEN]> = unwrap_dek(&kek, &wrapped).unwrap();
+        assert_eq!(*unwrapped, *dek);
     }
 
     #[test]

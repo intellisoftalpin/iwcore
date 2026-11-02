@@ -249,7 +249,7 @@ impl Wallet {
             // v6 vault: derive KEK from the stored params and unwrap the DEK.
             match self.unwrap_with_password(&rec, password) {
                 Some(dek) => {
-                    self.unlocked = Some(Unlocked { dek: Zeroizing::new(dek) });
+                    self.unlocked = Some(Unlocked { dek });
                     self.clear_caches();
                     self.add_system_labels()?;
                     Ok(true)
@@ -342,7 +342,7 @@ impl Wallet {
     /// strict no-op. Repeatable any number of times.
     pub fn recover_quarantined(&mut self, password: &str) -> Result<RecoveryResult> {
         self.ensure_unlocked()?;
-        let dek = *self.dek()?;
+        let dek = Zeroizing::new(*self.dek()?);
         let mut chain = crypto::legacy::LegacyKeyChain::new(password, self.encryption_count);
 
         let rows = {
@@ -424,7 +424,7 @@ impl Wallet {
 
     /// Derive the KEK from `password` using the record's stored params and try
     /// to unwrap the DEK. Returns the DEK on success, `None` on wrong password.
-    fn unwrap_with_password(&self, rec: &CryptoRecord, password: &str) -> Option<[u8; DEK_LEN]> {
+    fn unwrap_with_password(&self, rec: &CryptoRecord, password: &str) -> Option<Zeroizing<[u8; DEK_LEN]>> {
         let params = crypto::kdf::KdfParams {
             m_cost_kib: rec.m_cost_kib,
             t_cost: rec.t_cost,
@@ -572,7 +572,7 @@ impl Wallet {
     pub fn change_password(&mut self, new_password: &str) -> Result<bool> {
         self.ensure_unlocked()?;
 
-        let dek = *self.dek()?;
+        let dek = Zeroizing::new(*self.dek()?);
         let params = crypto::kdf::KdfParams::current();
         let salt = random_bytes(KDF_SALT_LEN)?;
         let kek = crypto::kdf::derive_kek(new_password.as_bytes(), &salt, params)
