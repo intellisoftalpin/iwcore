@@ -626,6 +626,28 @@ mod tests {
     }
 
     #[test]
+    fn test_key_chain_ios_variant_of_a_later_candidate() {
+        let password = "пароль12";
+        let ios_raw = ios_variant(raw_password_key(password));
+        let blob = encrypt_with_raw_key("ios raw record", &ios_raw);
+
+        let mut chain = LegacyKeyChain::new(password, 200);
+        assert_eq!(chain.decrypt(&blob).unwrap(), "ios raw record");
+        assert_eq!(chain.preferred_mode(), LegacyKeyMode::RawPassword);
+        assert!(chain.prefer_ios);
+        // Preference sticks: the next blob hits the iOS raw key first.
+        let blob_2 = encrypt_with_raw_key("second", &ios_raw);
+        assert_eq!(chain.decrypt(&blob_2).unwrap(), "second");
+    }
+
+    #[test]
+    fn test_legacy_key_mode_names() {
+        assert_eq!(LegacyKeyMode::NoChain.as_str(), "no_chain");
+        assert_eq!(LegacyKeyMode::Md5Chain.as_str(), "md5_chain");
+        assert_eq!(LegacyKeyMode::RawPassword.as_str(), "raw_password");
+    }
+
+    #[test]
     fn test_key_chain_no_chain_fallback() {
         // The realistic 5.x scenario: email column says 200, but the app's
         // encrypt callers hardcoded count 0, so the data was written with
