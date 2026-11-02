@@ -50,9 +50,11 @@ pub fn prepare_key(password: &str, hash: Option<&str>, re_encryption_count: u32)
 
 /// Derive key from password with optional MD5 iterations
 fn derive_key_from_password(password: &str, re_encryption_count: u32) -> String {
-    // Step 1: Pad password by doubling until >= 32 chars
+    // Step 1: Pad password by doubling until >= 32 chars. An empty password
+    // cannot be padded: it stays empty (an all-zero key) instead of looping
+    // forever.
     let mut padded = password.to_string();
-    while padded.chars().count() < KEY_LENGTH {
+    while !password.is_empty() && padded.chars().count() < KEY_LENGTH {
         padded.push_str(password);
     }
 
@@ -149,4 +151,20 @@ mod tests {
         assert_eq!(&key[..], expected_hash.as_bytes());
     }
 
+    #[test]
+    fn test_key_empty_password_terminates() {
+        // An empty password must not hang the padding loop.
+        assert_eq!(prepare_key("", None, 0), [0u8; KEY_LENGTH]);
+        assert_eq!(prepare_key("", Some(""), 200), md5_iterated_empty(200));
+    }
+
+    fn md5_iterated_empty(count: u32) -> [u8; KEY_LENGTH] {
+        let mut s = String::new();
+        for _ in 0..count {
+            s = super::md5_hex(&s);
+        }
+        let mut key = [0u8; KEY_LENGTH];
+        key.copy_from_slice(s.as_bytes());
+        key
+    }
 }

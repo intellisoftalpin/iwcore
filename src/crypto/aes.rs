@@ -578,6 +578,19 @@ mod tests {
     }
 
     #[test]
+    fn test_key_chain_empty_password_returns() {
+        // An empty password builds every candidate and fails cleanly on
+        // foreign or empty input instead of hanging.
+        for count in [0u32, 7, 200] {
+            let mut chain = LegacyKeyChain::new("", count);
+            assert!(chain.decrypt(&[]).is_err());
+            assert!(chain.decrypt(&[0u8; 32]).is_err());
+        }
+        let blob = encrypt("empty password data", "", 0, None).unwrap();
+        assert_eq!(LegacyKeyChain::new("", 0).decrypt(&blob).unwrap(), "empty password data");
+    }
+
+    #[test]
     fn test_key_chain_default_count_fallback() {
         // Vault whose email column reads 0/NULL but whose data was written
         // with the historical default MD5 chain (200): the extra candidate
