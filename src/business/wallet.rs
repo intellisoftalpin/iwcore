@@ -1877,6 +1877,73 @@ pub(crate) mod tests {
         assert_eq!(restored.field_type, "NOTE", "NULL metadata falls back to NOTE");
     }
 
+    /// Insert raw quarantine rows into a closed, migrated vault.
+    fn insert_quarantine_rows(db_path: &std::path::Path, rows: &[(&str, &str, Option<&str>, Option<Vec<u8>>)]) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        queries::ensure_quarantine_table(&conn).unwrap();
+        for (kind, item_id, field_id, blob) in rows {
+            conn.execute(
+                "INSERT INTO nswallet_quarantine (record_type, item_id, field_id, blob, quarantined_at)
+                 VALUES (?, ?, ?, ?, '2026-07-01 00:00:00')",
+                rusqlite::params![kind, item_id, field_id, blob],
+            ).unwrap();
+        }
+    }
+
+    /// Rows that cannot be placed stay quarantined: no blob, an item id that
+    /// is already live, a field whose slot is taken, a field without parent.
+    #[test]
+    fn test_recovery_keeps_rows_it_cannot_place() {
+        let password = "TestPassword123";
+        let (_temp, path) = create_legacy_vault_with_data(0);
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password).unwrap());
+        drop(wallet);
+
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        let (item_id, field_id): (String, String) = rusqlite::Connection::open(&db_path).unwrap()
+            .query_row("SELECT item_id, field_id FROM nswallet_fields LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        let blob = || Some(crypto::legacy::encrypt("quarantined value", password, 0, None).unwrap());
+        insert_quarantine_rows(&db_path, &[
+            ("item", "NOBLOB01", None, None),
+            ("item", "EMPTYB01", None, Some(Vec::new())),
+            ("item", &item_id, None, blob()),
+            ("field", &item_id, Some(&field_id), blob()),
+            ("field", "NOPARENT", Some("ORPHAN01"), blob()),
+        ]);
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password).unwrap());
+        let rec = wallet.recover_quarantined(password).unwrap();
+        assert_eq!(rec.recovered_items + rec.recovered_fields, 0);
+        assert_eq!(rec.remaining, 4);
+        assert_eq!(rec.waiting_for_parent, 1);
+        assert_eq!(wallet.quarantine_count().unwrap(), 5);
+    }
+
+    /// A write failure during recovery rolls the whole pass back.
+    #[test]
+    fn test_recovery_failure_rolls_back() {
+        let password = "TestPassword123";
+        let (_temp, path) = create_legacy_vault_with_data(0);
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password).unwrap());
+        drop(wallet);
+
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        let blob = crypto::legacy::encrypt("quarantined item", password, 0, None).unwrap();
+        insert_quarantine_rows(&db_path, &[("item", "NEWITEM1", None, Some(blob))]);
+        rusqlite::Connection::open(&db_path).unwrap().execute_batch(
+            "CREATE TRIGGER block_items BEFORE INSERT ON nswallet_items BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        ).unwrap();
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(wallet.unlock(password).unwrap());
+        assert!(wallet.recover_quarantined(password).is_err());
+        assert_eq!(wallet.quarantine_count().unwrap(), 1);
+    }
+
     /// The Nirav regression: a fully migrated, crypto-healthy v6 vault with a
     /// NULL icon on one row. One NULL cosmetic column used to fail the whole
     /// item listing (blank main screen, broken About).
