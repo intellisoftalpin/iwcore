@@ -16,6 +16,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# actions: write lets a failing job cancel the rest of the run.
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   semver:
     name: API compatibility (cargo semver-checks)
@@ -37,6 +42,14 @@ jobs:
           cargo semver-checks check-release --release-type minor 2>&1 | tee semver.txt || true
           { echo '### Breaking changes against the last release'; echo '```'; cat semver.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
+      # The first failing job stops the whole run instead of waiting hours for
+      # the other fuzz targets and mutation shards. Keep this step last.
+      - name: Stop the whole run
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel ${{ github.run_id }} -R ${{ github.repository }}
+
   docs-and-package:
     name: Docs and packaging
     runs-on: ubuntu-latest
@@ -53,12 +66,20 @@ jobs:
       - name: Publish dry run (nothing is published)
         run: cargo publish --dry-run
 
+      # The first failing job stops the whole run instead of waiting hours for
+      # the other fuzz targets and mutation shards. Keep this step last.
+      - name: Stop the whole run
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel ${{ github.run_id }} -R ${{ github.repository }}
+
   fuzz:
     name: Fuzz ${{ matrix.target }} (30 min)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         target: [cxf_preview, passkey_request, passkey_record, assetlinks, journal, restore_inspect, autofill_index, legacy_decrypt, origin_check, cxf_import_apply]
         # libFuzzer caps inputs at 4 KiB by default; CXF payloads get room to
@@ -94,12 +115,20 @@ jobs:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts/
 
+      # The first failing job stops the whole run instead of waiting hours for
+      # the other fuzz targets and mutation shards. Keep this step last.
+      - name: Stop the whole run
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel ${{ github.run_id }} -R ${{ github.repository }}
+
   mutants:
     name: Mutation testing (shard ${{ matrix.shard }}/8)
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
@@ -137,3 +166,10 @@ jobs:
         with:
           name: mutants-shard-${{ matrix.shard }}
           path: mutants.out/
+      # The first failing job stops the whole run instead of waiting hours for
+      # the other fuzz targets and mutation shards. Keep this step last.
+      - name: Stop the whole run
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel ${{ github.run_id }} -R ${{ github.repository }}
