@@ -91,16 +91,16 @@ pub fn normalize_host(raw: &str) -> Option<String> {
 
     // Scheme. `://` is the common form; a bare `scheme:` prefix is how the
     // schemes we reject (mailto:, javascript:, ...) actually appear.
-    let after_scheme = match trimmed.find("://") {
-        Some(idx) => {
-            if is_rejected_scheme(&trimmed[..idx]) {
+    let after_scheme = match trimmed.split_once("://") {
+        Some((scheme, rest)) => {
+            if is_rejected_scheme(scheme) {
                 return None;
             }
-            &trimmed[idx + 3..]
+            rest
         }
         None => {
-            if let Some(idx) = trimmed.find(':')
-                && is_rejected_scheme(&trimmed[..idx])
+            if let Some((scheme, _)) = trimmed.split_once(':')
+                && is_rejected_scheme(scheme)
             {
                 return None;
             }
@@ -113,17 +113,15 @@ pub fn normalize_host(raw: &str) -> Option<String> {
 
     // Authority ends at the first path, query or fragment delimiter.
     let authority = after_scheme
-        .find(['/', '?', '#'])
-        .map_or(after_scheme, |idx| &after_scheme[..idx]);
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
     if authority.is_empty() {
         return None;
     }
 
     // Userinfo: everything up to and including the last `@`.
-    let host_port = match authority.rfind('@') {
-        Some(idx) => &authority[idx + 1..],
-        None => authority,
-    };
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
 
     let host = strip_port(host_port)?;
     if host.is_empty() {
@@ -162,25 +160,17 @@ pub fn registrable_domain(host: &str) -> Option<String> {
 
     // Longest matching public suffix wins, so `s3.amazonaws.com`-style
     // three-label suffixes beat any two-label prefix of themselves.
-    let mut best_suffix_labels = 0usize;
-    for start in 0..labels.len() {
-        let candidate = labels[start..].join(".");
-        if is_public_suffix(&candidate) {
-            best_suffix_labels = labels.len() - start;
-            break;
-        }
-    }
+    let best_suffix_labels = (0..labels.len())
+        .find(|&start| labels.get(start..).is_some_and(|tail| is_public_suffix(&tail.join("."))))
+        .map_or(0, |start| labels.len().saturating_sub(start));
 
     let take = if best_suffix_labels > 0 {
-        best_suffix_labels + 1
+        best_suffix_labels.checked_add(1)?
     } else {
         2
     };
-    if labels.len() < take {
-        return None;
-    }
-
-    let candidate = labels[labels.len() - take..].join(".");
+    let first = labels.len().checked_sub(take)?;
+    let candidate = labels.get(first..)?.join(".");
     // Belt and braces for suffixes missing from the curated list.
     if is_public_suffix(&candidate) {
         return None;
@@ -218,9 +208,9 @@ pub fn match_tier(stored_host: &str, query_host: &str) -> Option<MatchTier> {
 }
 
 fn is_subdomain_of(child: &str, parent: &str) -> bool {
-    child.len() > parent.len()
-        && child.ends_with(parent)
-        && child.as_bytes()[child.len() - parent.len() - 1] == b'.'
+    child
+        .strip_suffix(parent)
+        .is_some_and(|head| head.ends_with('.'))
 }
 
 fn is_rejected_scheme(scheme: &str) -> bool {
@@ -232,12 +222,10 @@ fn is_rejected_scheme(scheme: &str) -> bool {
 /// when the authority is structurally broken (an unclosed bracket).
 fn strip_port(host_port: &str) -> Option<&str> {
     if let Some(rest) = host_port.strip_prefix('[') {
-        let close = rest.find(']')?;
-        return Some(&rest[..close]);
+        return rest.split_once(']').map(|(host, _)| host);
     }
-    match host_port.rfind(':') {
-        Some(idx) => {
-            let (host, port) = (&host_port[..idx], &host_port[idx + 1..]);
+    match host_port.rsplit_once(':') {
+        Some((host, port)) => {
             // Only a genuinely numeric tail is a port. A bare unbracketed IPv6
             // literal has several colons and no numeric-only tail, and is left
             // intact rather than truncated.
@@ -313,8 +301,16 @@ const DAMP: u32 = 700;
 const INITIAL_BIAS: u32 = 72;
 const INITIAL_N: u32 = 128;
 
+/// Largest `delta` `adapt` leaves unscaled, per RFC 3492 section 6.1.
+const ADAPT_LIMIT: u32 = ((BASE - TMIN) * TMAX) / 2;
+/// Digit alphabet, value 0 to 35.
+const DIGITS: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Every step is checked arithmetic: an overflow (which RFC 3492 itself
+/// treats as a failure) or any impossible state yields `None`, never a panic or
+/// a wrapped value.
 fn punycode_encode(label: &str) -> Option<String> {
-    let input: Vec<u32> = label.chars().map(|c| c as u32).collect();
+    let input: Vec<u32> = label.chars().map(u32::from).collect();
     let mut output = String::new();
 
     for &c in &input {
@@ -322,7 +318,9 @@ fn punycode_encode(label: &str) -> Option<String> {
             output.push(char::from_u32(c)?);
         }
     }
-    let basic_count = output.chars().count() as u32;
+    // Basic code points are ASCII, so bytes and chars agree.
+    let basic_count = u32::try_from(output.len()).ok()?;
+    let total = u32::try_from(input.len()).ok()?;
     let mut handled = basic_count;
     if basic_count > 0 {
         output.push('-');
@@ -332,9 +330,9 @@ fn punycode_encode(label: &str) -> Option<String> {
     let mut delta: u32 = 0;
     let mut bias = INITIAL_BIAS;
 
-    while (handled as usize) < input.len() {
+    while handled < total {
         let m = *input.iter().filter(|&&c| c >= n).min()?;
-        delta = delta.checked_add((m - n).checked_mul(handled + 1)?)?;
+        delta = delta.checked_add(m.checked_sub(n)?.checked_mul(handled.checked_add(1)?)?)?;
         n = m;
 
         for &c in &input {
@@ -345,50 +343,45 @@ fn punycode_encode(label: &str) -> Option<String> {
                 let mut q = delta;
                 let mut k = BASE;
                 loop {
-                    let t = if k <= bias {
-                        TMIN
-                    } else if k >= bias + TMAX {
-                        TMAX
-                    } else {
-                        k - bias
-                    };
+                    // TMIN when k <= bias, TMAX when k >= bias + TMAX, else k - bias.
+                    let t = k.saturating_sub(bias).clamp(TMIN, TMAX);
                     if q < t {
                         break;
                     }
-                    output.push(digit_to_char(t + (q - t) % (BASE - t))?);
-                    q = (q - t) / (BASE - t);
-                    k += BASE;
+                    let span = BASE.checked_sub(t)?;
+                    let rest = q.checked_sub(t)?;
+                    output.push(digit_to_char(t.checked_add(rest.checked_rem(span)?)?)?);
+                    q = rest.checked_div(span)?;
+                    k = k.checked_add(BASE)?;
                 }
                 output.push(digit_to_char(q)?);
-                bias = adapt(delta, handled + 1, handled == basic_count);
+                let next = handled.checked_add(1)?;
+                bias = adapt(delta, next, handled == basic_count)?;
                 delta = 0;
-                handled += 1;
+                handled = next;
             }
         }
-        delta += 1;
-        n += 1;
+        delta = delta.checked_add(1)?;
+        n = n.checked_add(1)?;
     }
 
     Some(output)
 }
 
-fn adapt(mut delta: u32, numpoints: u32, first_time: bool) -> u32 {
-    delta = if first_time { delta / DAMP } else { delta / 2 };
-    delta += delta / numpoints;
-    let mut k = 0;
-    while delta > ((BASE - TMIN) * TMAX) / 2 {
-        delta /= BASE - TMIN;
-        k += BASE;
+fn adapt(delta: u32, numpoints: u32, first_time: bool) -> Option<u32> {
+    let mut delta = delta.checked_div(if first_time { DAMP } else { 2 })?;
+    delta = delta.checked_add(delta.checked_div(numpoints)?)?;
+    let mut k: u32 = 0;
+    while delta > ADAPT_LIMIT {
+        delta = delta.checked_div(BASE - TMIN)?;
+        k = k.checked_add(BASE)?;
     }
-    k + (((BASE - TMIN + 1) * delta) / (delta + SKEW))
+    let scaled = (BASE - TMIN + 1).checked_mul(delta)?.checked_div(delta.checked_add(SKEW)?)?;
+    k.checked_add(scaled)
 }
 
 fn digit_to_char(d: u32) -> Option<char> {
-    match d {
-        0..=25 => char::from_u32('a' as u32 + d),
-        26..=35 => char::from_u32('0' as u32 + d - 26),
-        _ => None,
-    }
+    DIGITS.get(usize::try_from(d).ok()?).map(|&b| char::from(b))
 }
 
 #[cfg(test)]
@@ -487,6 +480,28 @@ mod tests {
         assert_eq!(punycode_encode("münchen").as_deref(), Some("mnchen-3ya"));
         assert_eq!(punycode_encode("рф").as_deref(), Some("p1ai"));
         assert_eq!(punycode_encode("пример").as_deref(), Some("e1afmkfd"));
+    }
+
+    /// RFC 3492 treats an overflowing `delta` as a failure. The encoder must
+    /// report it as `None`, not wrap (release) or panic (debug).
+    #[test]
+    fn punycode_overflow_is_a_failure_not_a_wrap() {
+        let huge = format!("{}\u{10FFFF}", "a".repeat(5000));
+        assert_eq!(punycode_encode(&huge), None);
+        assert_eq!(normalize_host(&format!("https://{huge}.com/")), None);
+        // Long, but within range: still encodes.
+        let fine = format!("{}é", "a".repeat(50));
+        assert!(punycode_encode(&fine).is_some());
+    }
+
+    #[test]
+    fn digits_map_to_the_rfc_alphabet_and_nothing_past_it() {
+        assert_eq!(digit_to_char(0), Some('a'));
+        assert_eq!(digit_to_char(25), Some('z'));
+        assert_eq!(digit_to_char(26), Some('0'));
+        assert_eq!(digit_to_char(35), Some('9'));
+        assert_eq!(digit_to_char(36), None);
+        assert_eq!(digit_to_char(u32::MAX), None);
     }
 
     #[test]

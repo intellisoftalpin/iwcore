@@ -53,7 +53,7 @@ pub fn seal(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>
         .encrypt(&nonce, Payload { msg: plaintext, aad })
         .map_err(|_| WalletError::EncryptionError("autofill seal failed".into()))?;
 
-    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+    let mut out = Vec::with_capacity(NONCE_LEN.saturating_add(ct.len()));
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
     Ok(out)
@@ -62,23 +62,17 @@ pub fn seal(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>
 /// Open a blob produced by [`seal`]. Fails on a wrong key, a wrong `aad`, a
 /// truncated blob, or any tampering.
 pub fn open(key: &[u8; KEY_LEN], blob: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-    if blob.len() < NONCE_LEN + TAG_LEN {
-        return Err(WalletError::DecryptionError("autofill blob too short".into()));
+    let too_short = || WalletError::DecryptionError("autofill blob too short".into());
+    let (nonce_bytes, msg) = blob.split_first_chunk::<NONCE_LEN>().ok_or_else(too_short)?;
+    if msg.len() < TAG_LEN {
+        return Err(too_short());
     }
     let cipher = ChaCha20Poly1305::new_from_slice(key)
         .map_err(|_| WalletError::DecryptionError("autofill key is not 32 bytes".into()))?;
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    nonce_bytes.copy_from_slice(&blob[..NONCE_LEN]);
-    let nonce = Nonce::from(nonce_bytes);
+    let nonce = Nonce::from(*nonce_bytes);
 
     cipher
-        .decrypt(
-            &nonce,
-            Payload {
-                msg: &blob[NONCE_LEN..],
-                aad,
-            },
-        )
+        .decrypt(&nonce, Payload { msg, aad })
         .map_err(|_| WalletError::DecryptionError("autofill blob failed authentication".into()))
 }
 

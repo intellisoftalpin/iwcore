@@ -149,8 +149,10 @@ pub fn seal_record(
     journal_public: &[u8],
     index_key: &[u8; KEY_LEN],
 ) -> Result<Vec<u8>> {
-    let json = serde_json::to_vec(record)
-        .map_err(|e| WalletError::EncryptionError(format!("journal encode failed: {e}")))?;
+    let json = Zeroizing::new(
+        serde_json::to_vec(record)
+            .map_err(|e| WalletError::EncryptionError(format!("journal encode failed: {e}")))?,
+    );
 
     let record_key = crypto::random_key()?;
 
@@ -176,7 +178,7 @@ pub fn seal_record(
     payload.extend_from_slice(&u32::try_from(body.len()).map_err(|_| too_long("body"))?.to_le_bytes());
     payload.extend_from_slice(&body);
 
-    let mut out = Vec::with_capacity(4 + payload.len());
+    let mut out = Vec::with_capacity(payload.len().saturating_add(4));
     out.extend_from_slice(&u32::try_from(payload.len()).map_err(|_| too_long("record"))?.to_le_bytes());
     out.extend_from_slice(&payload);
     Ok(out)
@@ -219,25 +221,40 @@ pub fn open_with_index_key(journal: &[u8], index_key: &[u8; KEY_LEN]) -> Vec<Pen
 /// Stops at the first truncated frame, matching what the readers do, so a torn
 /// final write is not counted.
 pub fn count_records(journal: &[u8]) -> usize {
-    let mut count = 0usize;
-    let mut cursor = 0usize;
+    Frames::new(journal).count()
+}
 
-    while cursor + 4 <= journal.len() {
-        let len = u32::from_le_bytes([
-            journal[cursor],
-            journal[cursor + 1],
-            journal[cursor + 2],
-            journal[cursor + 3],
-        ]) as usize;
-        cursor += 4;
-        if len == 0 || cursor + len > journal.len() {
-            break;
-        }
-        cursor += len;
-        count += 1;
+/// Iterator over the framed payloads of a journal.
+///
+/// Every offset is computed with checked arithmetic and every slice is taken
+/// with `get`, so a hostile length prefix ends the walk instead of wrapping
+/// around on a 32-bit target. A zero length, a length running past the end of
+/// the data, or a length that does not fit the address space all end it.
+struct Frames<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Frames<'a> {
+    fn new(journal: &'a [u8]) -> Self {
+        Self { rest: journal }
     }
+}
 
-    count
+impl<'a> Iterator for Frames<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        // Taken up front, so every early return leaves the walk finished.
+        let rest = std::mem::take(&mut self.rest);
+        let (prefix, after) = rest.split_first_chunk::<4>()?;
+        let len = usize::try_from(u32::from_le_bytes(*prefix)).ok()?;
+        if len == 0 {
+            return None;
+        }
+        let (payload, rest) = after.split_at_checked(len)?;
+        self.rest = rest;
+        Some(payload)
+    }
 }
 
 /// Whether the provider may stage another record.
@@ -261,21 +278,17 @@ pub fn dedupe(records: Vec<PendingRecord>) -> Vec<PendingRecord> {
 }
 
 fn header_bytes(eph_public: &[u8]) -> Vec<u8> {
-    let mut header = Vec::with_capacity(1 + eph_public.len());
+    let mut header = Vec::with_capacity(eph_public.len().saturating_add(1));
     header.push(FORMAT_VERSION);
     header.extend_from_slice(eph_public);
     header
 }
 
 fn into_key(bytes: Vec<u8>) -> Result<Zeroizing<[u8; KEY_LEN]>> {
-    if bytes.len() != KEY_LEN {
-        return Err(WalletError::DecryptionError(
-            "journal record key has the wrong length".into(),
-        ));
-    }
-    let mut key = [0u8; KEY_LEN];
-    key.copy_from_slice(&bytes);
-    Ok(Zeroizing::new(key))
+    let bytes = Zeroizing::new(bytes);
+    <[u8; KEY_LEN]>::try_from(bytes.as_slice())
+        .map(Zeroizing::new)
+        .map_err(|_| WalletError::DecryptionError("journal record key has the wrong length".into()))
 }
 
 fn too_long(what: &str) -> WalletError {
@@ -300,22 +313,8 @@ where
     F: Fn(&ParsedRecord<'_>) -> Result<Zeroizing<[u8; KEY_LEN]>>,
 {
     let mut out = Vec::new();
-    let mut cursor = 0usize;
 
-    while cursor + 4 <= journal.len() {
-        let len = u32::from_le_bytes([
-            journal[cursor],
-            journal[cursor + 1],
-            journal[cursor + 2],
-            journal[cursor + 3],
-        ]) as usize;
-        cursor += 4;
-        if len == 0 || cursor + len > journal.len() {
-            break; // truncated tail
-        }
-        let payload = &journal[cursor..cursor + len];
-        cursor += len;
-
+    for payload in Frames::new(journal) {
         let Some(parsed) = split_payload(payload) else {
             break; // structurally broken, cannot trust anything past here
         };
@@ -323,7 +322,7 @@ where
             continue; // not ours to read, or tampered; later records may be fine
         };
         let header = header_bytes(parsed.eph_public);
-        let Ok(json) = crypto::open(&key, parsed.body, &header) else {
+        let Ok(json) = crypto::open(&key, parsed.body, &header).map(Zeroizing::new) else {
             continue;
         };
         if let Ok(record) = serde_json::from_slice::<PendingRecord>(&json) {
@@ -335,31 +334,22 @@ where
 }
 
 fn split_payload(payload: &[u8]) -> Option<ParsedRecord<'_>> {
-    let mut at = 0usize;
-    let version = *payload.first()?;
-    at += 1;
-    if version != FORMAT_VERSION {
+    let mut reader = Reader(payload);
+    if reader.byte()? != FORMAT_VERSION {
         return None;
     }
 
-    let eph_len = *payload.get(at)? as usize;
-    at += 1;
-    let eph_public = payload.get(at..at + eph_len)?;
-    at += eph_len;
+    let eph_len = usize::from(reader.byte()?);
+    let eph_public = reader.take(eph_len)?;
 
-    let wrap_app_len = read_u16(payload, at)?;
-    at += 2;
-    let wrap_to_app = payload.get(at..at + wrap_app_len)?;
-    at += wrap_app_len;
+    let wrap_app_len = reader.u16()?;
+    let wrap_to_app = reader.take(wrap_app_len)?;
 
-    let wrap_idx_len = read_u16(payload, at)?;
-    at += 2;
-    let wrap_to_index = payload.get(at..at + wrap_idx_len)?;
-    at += wrap_idx_len;
+    let wrap_idx_len = reader.u16()?;
+    let wrap_to_index = reader.take(wrap_idx_len)?;
 
-    let body_len = read_u32(payload, at)?;
-    at += 4;
-    let body = payload.get(at..at + body_len)?;
+    let body_len = reader.u32()?;
+    let body = reader.take(body_len)?;
 
     Some(ParsedRecord {
         eph_public,
@@ -369,14 +359,34 @@ fn split_payload(payload: &[u8]) -> Option<ParsedRecord<'_>> {
     })
 }
 
-fn read_u16(buf: &[u8], at: usize) -> Option<usize> {
-    let bytes = buf.get(at..at + 2)?;
-    Some(u16::from_le_bytes([bytes[0], bytes[1]]) as usize)
-}
+/// Forward-only reader over a record payload. Every read is bounds-checked and
+/// returns `None` past the end, never panics.
+struct Reader<'a>(&'a [u8]);
 
-fn read_u32(buf: &[u8], at: usize) -> Option<usize> {
-    let bytes = buf.get(at..at + 4)?;
-    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
+impl<'a> Reader<'a> {
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let (head, tail) = self.0.split_at_checked(len)?;
+        self.0 = tail;
+        Some(head)
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        let (&b, tail) = self.0.split_first()?;
+        self.0 = tail;
+        Some(b)
+    }
+
+    fn u16(&mut self) -> Option<usize> {
+        let (bytes, tail) = self.0.split_first_chunk::<2>()?;
+        self.0 = tail;
+        Some(usize::from(u16::from_le_bytes(*bytes)))
+    }
+
+    fn u32(&mut self) -> Option<usize> {
+        let (bytes, tail) = self.0.split_first_chunk::<4>()?;
+        self.0 = tail;
+        usize::try_from(u32::from_le_bytes(*bytes)).ok()
+    }
 }
 
 #[cfg(test)]
@@ -586,13 +596,96 @@ mod tests {
     }
 
     #[test]
-    fn read_u16_reads_the_two_bytes_at_the_offset() {
+    fn reader_reads_each_width_at_the_offset_and_stops_one_byte_short() {
         for at in 0..6 {
             let mut buf = vec![0xaa; at];
             buf.extend_from_slice(&0x1234u16.to_le_bytes());
-            assert_eq!(read_u16(&buf, at), Some(0x1234), "offset {at}");
-            assert_eq!(read_u16(&buf[..buf.len() - 1], at), None, "offset {at}, one byte short");
+            let mut r = Reader(&buf);
+            assert!(r.take(at).is_some());
+            assert_eq!(r.u16(), Some(0x1234), "offset {at}");
+            assert_eq!(r.byte(), None, "nothing left");
+
+            let short = &buf[..buf.len() - 1];
+            let mut r = Reader(short);
+            r.take(at).unwrap();
+            assert_eq!(r.u16(), None, "offset {at}, one byte short");
         }
+        let mut r = Reader(&[1, 0, 0]);
+        assert_eq!(r.u32(), None, "three bytes are not a u32");
+        let mut r = Reader(&[1, 0, 0, 0]);
+        assert_eq!(r.u32(), Some(1));
+        assert_eq!(Reader(&[1, 2]).take(3), None);
+    }
+
+    /// Length prefixes that would wrap a 32-bit `usize` when added to the
+    /// cursor. The readers must stop, never loop and never panic, whatever the
+    /// pointer width.
+    #[test]
+    fn hostile_frame_lengths_end_the_walk() {
+        let keys = generate_keys().unwrap();
+        let valid = seal_record(&record("r1"), &keys.journal_public, &keys.index_key).unwrap();
+
+        let mut cases: Vec<Vec<u8>> = vec![
+            vec![0xfc, 0xff, 0xff, 0xff],
+            vec![0xff, 0xff, 0xff, 0xff],
+            vec![0xfc, 0xff, 0xff, 0xff, 0, 0, 0, 0],
+            vec![0x00, 0x00, 0x00, 0x00, 0x01],
+            vec![0x05, 0x00, 0x00, 0x00, 0x01, 0x02],
+            vec![0x01, 0x00, 0x00],
+        ];
+        // A valid record followed by each hostile tail: the record survives,
+        // the tail is ignored.
+        for tail in cases.clone() {
+            let mut j = valid.clone();
+            j.extend_from_slice(&tail);
+            cases.push(j);
+        }
+
+        for journal in &cases {
+            let starts_valid = journal.starts_with(&valid);
+            let expected = usize::from(starts_valid);
+            assert_eq!(count_records(journal), expected, "{journal:02x?}");
+            assert_eq!(open_with_journal_key(journal, &keys.journal_secret).len(), expected);
+            assert_eq!(open_with_index_key(journal, &keys.index_key).len(), expected);
+        }
+    }
+
+    /// Inner lengths that point past the payload, up to the maximum each
+    /// width can hold, are refused as malformed.
+    #[test]
+    fn hostile_inner_lengths_are_refused() {
+        let payloads: Vec<Vec<u8>> = vec![
+            // eph_len past the end
+            vec![FORMAT_VERSION, 0xff],
+            // wrap_to_app length past the end
+            vec![FORMAT_VERSION, 0, 0xff, 0xff],
+            // wrap_to_index length past the end
+            vec![FORMAT_VERSION, 0, 0, 0, 0xff, 0xff],
+            // body length at the u32 maximum
+            vec![FORMAT_VERSION, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff],
+            // body length field cut short
+            vec![FORMAT_VERSION, 0, 0, 0, 0, 0, 0xff],
+            // version only
+            vec![FORMAT_VERSION],
+        ];
+
+        for payload in payloads {
+            assert!(split_payload(&payload).is_none(), "{payload:02x?}");
+            let mut framed = u32::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
+            framed.extend_from_slice(&payload);
+            assert_eq!(count_records(&framed), 1, "framing itself is fine");
+            let keys = generate_keys().unwrap();
+            assert!(open_with_journal_key(&framed, &keys.journal_secret).is_empty());
+        }
+        // The smallest structurally complete payload: every length zero.
+        assert!(split_payload(&[FORMAT_VERSION, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_some());
+    }
+
+    #[test]
+    fn a_record_key_of_the_wrong_length_is_refused() {
+        assert!(into_key(vec![0u8; KEY_LEN - 1]).is_err());
+        assert!(into_key(vec![0u8; KEY_LEN + 1]).is_err());
+        assert_eq!(*into_key(vec![7u8; KEY_LEN]).unwrap(), [7u8; KEY_LEN]);
     }
 
     #[test]

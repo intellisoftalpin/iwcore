@@ -25,6 +25,25 @@
 //! belongs in on the way in, and the same priority governs which one is chosen
 //! on the way out, so an entry that round-trips out through the index and back
 //! through the journal keeps its shape. There is a test asserting exactly that.
+//!
+//! # Untrusted input
+//!
+//! The index and the journal are files in storage another process can write,
+//! so every parser here treats them as hostile: lengths are checked with
+//! checked arithmetic and slices are taken with `get`, never by indexing. The
+//! lints below hold the whole module to that, on 32-bit targets too, where a
+//! `usize` sum of two file-supplied lengths can wrap.
+
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic
+    )
+)]
 
 pub mod crypto;
 pub mod domain;

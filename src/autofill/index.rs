@@ -29,6 +29,7 @@
 //! the minimum needed to fill a login form and not one field more.
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::database::models::{IWField, IWItem};
 use crate::error::{Result, WalletError};
@@ -46,6 +47,9 @@ pub const FORMAT_VERSION: u8 = 2;
 pub const OLDEST_READABLE_VERSION: u8 = 1;
 /// The body is padded up to a multiple of this before sealing.
 pub const PAD_BLOCK: usize = 4096;
+/// Header bytes before the database id: magic, version, generation,
+/// timestamp, id length.
+const HEADER_FIXED_LEN: usize = 4 + 1 + 8 + 8 + 1;
 
 /// One fillable login. `Debug` redacts the password and TOTP secret.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,16 +166,19 @@ pub fn build_with_passkeys(
 
     let actual_len = u32::try_from(json.len())
         .map_err(|_| WalletError::EncryptionError("index is too large to frame".into()))?;
-    let mut padded = Vec::with_capacity(4 + json.len());
+    let mut padded = Zeroizing::new(Vec::with_capacity(json.len().saturating_add(4)));
     padded.extend_from_slice(&actual_len.to_le_bytes());
     padded.extend_from_slice(&json);
-    let target = padded.len().div_ceil(PAD_BLOCK) * PAD_BLOCK;
+    let target = padded
+        .len()
+        .checked_next_multiple_of(PAD_BLOCK)
+        .ok_or_else(|| WalletError::EncryptionError("index is too large to pad".into()))?;
     padded.resize(target, 0);
 
     let header_bytes = encode_header(header)?;
     let sealed = crypto::seal(index_key, &padded, &header_bytes)?;
 
-    let mut out = Vec::with_capacity(header_bytes.len() + sealed.len());
+    let mut out = Vec::with_capacity(header_bytes.len().saturating_add(sealed.len()));
     out.extend_from_slice(&header_bytes);
     out.extend_from_slice(&sealed);
     Ok(out)
@@ -186,16 +193,17 @@ pub fn open(bytes: &[u8], index_key: &[u8; KEY_LEN]) -> Result<(IndexHeader, Vec
 /// Open a sealed index of either format and return logins and passkeys.
 pub fn open_all(bytes: &[u8], index_key: &[u8; KEY_LEN]) -> Result<(IndexHeader, IndexContents)> {
     let (header, header_len) = decode_header(bytes)?;
-    let sealed = &bytes[header_len..];
+    let (header_bytes, sealed) = bytes
+        .split_at_checked(header_len)
+        .ok_or_else(|| WalletError::DecryptionError("index header is malformed".into()))?;
 
-    let padded = crypto::open(index_key, sealed, &bytes[..header_len])?;
-    if padded.len() < 4 {
-        return Err(WalletError::DecryptionError("index body is truncated".into()));
-    }
-    let actual_len =
-        u32::from_le_bytes([padded[0], padded[1], padded[2], padded[3]]) as usize;
-    let json = padded
-        .get(4..4 + actual_len)
+    let padded = Zeroizing::new(crypto::open(index_key, sealed, header_bytes)?);
+    let (prefix, rest) = padded
+        .split_first_chunk::<4>()
+        .ok_or_else(|| WalletError::DecryptionError("index body is truncated".into()))?;
+    let json = usize::try_from(u32::from_le_bytes(*prefix))
+        .ok()
+        .and_then(|actual_len| rest.get(..actual_len))
         .ok_or_else(|| WalletError::DecryptionError("index body length is out of range".into()))?;
 
     let decode_err = |e: serde_json::Error| WalletError::DecryptionError(format!("index decode failed: {e}"));
@@ -220,7 +228,7 @@ fn encode_header(header: &IndexHeader) -> Result<Vec<u8>> {
     let id_len = u8::try_from(id.len())
         .map_err(|_| WalletError::EncryptionError("database id is too long".into()))?;
 
-    let mut out = Vec::with_capacity(4 + 1 + 8 + 8 + 1 + id.len());
+    let mut out = Vec::with_capacity(id.len().saturating_add(HEADER_FIXED_LEN));
     out.extend_from_slice(MAGIC);
     out.push(header.format_version);
     out.extend_from_slice(&header.generation.to_le_bytes());
@@ -233,29 +241,34 @@ fn encode_header(header: &IndexHeader) -> Result<Vec<u8>> {
 fn decode_header(bytes: &[u8]) -> Result<(IndexHeader, usize)> {
     let malformed = || WalletError::DecryptionError("index header is malformed".into());
 
-    if bytes.len() < 4 + 1 + 8 + 8 + 1 || &bytes[..4] != MAGIC {
+    let (fixed, rest) = bytes
+        .split_first_chunk::<HEADER_FIXED_LEN>()
+        .ok_or_else(malformed)?;
+    let (magic, fixed) = fixed.split_first_chunk::<4>().ok_or_else(malformed)?;
+    if magic != MAGIC {
         return Err(malformed());
     }
-    let format_version = bytes[4];
+    let (&format_version, fixed) = fixed.split_first().ok_or_else(malformed)?;
     if !(OLDEST_READABLE_VERSION..=FORMAT_VERSION).contains(&format_version) {
         return Err(WalletError::InvalidVersion(format!(
             "unsupported autofill index format {format_version}"
         )));
     }
-    let generation = u64::from_le_bytes(bytes[5..13].try_into().map_err(|_| malformed())?);
-    let built_at = i64::from_le_bytes(bytes[13..21].try_into().map_err(|_| malformed())?);
-    let id_len = bytes[21] as usize;
-    let id = bytes.get(22..22 + id_len).ok_or_else(malformed)?;
+    let (generation, fixed) = fixed.split_first_chunk::<8>().ok_or_else(malformed)?;
+    let (built_at, fixed) = fixed.split_first_chunk::<8>().ok_or_else(malformed)?;
+    let (&id_len, _) = fixed.split_first().ok_or_else(malformed)?;
+    let id_len = usize::from(id_len);
+    let id = rest.get(..id_len).ok_or_else(malformed)?;
     let database_id = String::from_utf8(id.to_vec()).map_err(|_| malformed())?;
 
     Ok((
         IndexHeader {
             format_version,
-            generation,
-            built_at,
+            generation: u64::from_le_bytes(*generation),
+            built_at: i64::from_le_bytes(*built_at),
             database_id,
         },
-        22 + id_len,
+        HEADER_FIXED_LEN.saturating_add(id_len),
     ))
 }
 

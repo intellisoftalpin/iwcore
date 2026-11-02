@@ -164,17 +164,17 @@ impl Wallet {
         for record in records {
             if record.op == PendingOp::CreatePasskey {
                 match self.apply_staged_passkey(&record, &known, &folder)? {
-                    PasskeyOutcome::Replaced => summary.passkeys_replaced += 1,
+                    PasskeyOutcome::Replaced => summary.passkeys_replaced = summary.passkeys_replaced.saturating_add(1),
                     PasskeyOutcome::AttachedTo(item_id) => {
-                        summary.passkeys_added += 1;
+                        summary.passkeys_added = summary.passkeys_added.saturating_add(1);
                         summary.updated.push(item_id);
                     }
                     PasskeyOutcome::Created(item_id) => {
-                        summary.passkeys_added += 1;
+                        summary.passkeys_added = summary.passkeys_added.saturating_add(1);
                         summary.created.push(item_id);
                     }
-                    PasskeyOutcome::AlreadyThere => summary.unchanged += 1,
-                    PasskeyOutcome::Invalid => summary.skipped += 1,
+                    PasskeyOutcome::AlreadyThere => summary.unchanged = summary.unchanged.saturating_add(1),
+                    PasskeyOutcome::Invalid => summary.skipped = summary.skipped.saturating_add(1),
                 }
                 continue;
             }
@@ -186,7 +186,7 @@ impl Wallet {
                 PendingOp::CreatePasskey => unreachable!("handled above"),
                 PendingOp::Create => match Self::reconcile(&known, &record) {
                     Some(Match::Same) => {
-                        summary.unchanged += 1;
+                        summary.unchanged = summary.unchanged.saturating_add(1);
                         continue;
                     }
                     Some(Match::PasswordChanged(item_id)) => Some(item_id),
@@ -211,7 +211,7 @@ impl Wallet {
                     known.push(Self::entry_for(&item_id, &record));
                     summary.created.push(item_id);
                 }
-                Err(_) => summary.skipped += 1,
+                Err(_) => summary.skipped = summary.skipped.saturating_add(1),
             }
         }
 
