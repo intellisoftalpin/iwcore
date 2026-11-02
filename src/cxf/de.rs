@@ -718,10 +718,8 @@ impl<'de> Shape<'de> for Fields<'de> {
         while let Some(Loose(f)) = seq.next_element::<Loose<Ef>>()? {
             n = n.saturating_add(1);
             if n > CUSTOM_FIELDS_MAX {
-                out.over = true;
-                out.list = Vec::new();
                 drain_seq(seq)?;
-                break;
+                return Ok(Some(Self { list: Vec::new(), over: true }));
             }
             out.list.extend(f);
         }
@@ -945,5 +943,95 @@ mod tests {
     fn escaped_names_still_match() {
         let c = cred(r#"{"t\u0079pe": "note"}"#);
         assert_eq!(c.str("type"), Some("note"));
+    }
+
+    fn read(json: &str) -> RawHeader<'_> {
+        header(json, &mut Ctx::default()).unwrap().unwrap()
+    }
+
+    #[test]
+    fn numbers_and_strings_of_every_kind_are_skipped_where_not_wanted() {
+        let h = read(
+            r#"{"version": {"major": 1}, "timestamp": 7, "accounts": [-1, 2.5, false, {"items": -1, "collections": 2.5, "id": "a"},
+                {"items": [-1, 2.5, "x", {"scope": -1}, {"scope": 2.5, "creationAt": -5, "credentials": -1}, {"credentials": 2.5, "tags": -1}],
+                 "collections": [-1, 2.5, {"items": -1, "subCollections": 2.5}, {"items": 2.5, "subCollections": -1}]}]}"#,
+        );
+        assert_eq!(h.timestamp, Some(7));
+        assert_eq!(h.version.and_then(|v| v.major), Some(1));
+        let accounts = h.accounts.unwrap();
+        assert_eq!(accounts.len(), 2, "only objects are accounts");
+        assert_eq!(accounts[0].id.as_deref(), Some("a"));
+        assert!(accounts[0].items.is_empty() && accounts[0].collections.is_empty());
+        let items = &accounts[1].items;
+        assert_eq!(items.len(), 3, "only objects are items");
+        assert!(items[0].scope.is_none() && items[1].scope.is_none());
+        assert_eq!(items[1].creation_at, Some(-5));
+        assert!(items[1].credentials.is_empty() && items[2].credentials.is_empty() && items[2].tags.is_empty());
+        let cols = &accounts[1].collections;
+        assert_eq!(cols.len(), 2, "only objects are collections");
+        assert!(cols.iter().all(|c| c.links.is_empty() && c.sub.is_empty()));
+        for root in ["-1", "2.5", "\"x\"", "[1]", "null", "true"] {
+            assert!(header(root, &mut Ctx::default()).unwrap().is_none(), "{root}");
+        }
+        for accounts in ["-1", "2.5", "{}"] {
+            let json = format!(r#"{{"version": {{"major": 1}}, "accounts": {accounts}}}"#);
+            assert!(read(&json).accounts.is_none(), "{accounts}");
+        }
+    }
+
+    #[test]
+    fn unknown_members_are_skipped_at_every_level() {
+        let h = read(
+            r#"{"version": {"major": 1, "x": [1]}, "accounts": [{"id": "a", "x": {"y": 1}, "items": [{"id": "i", "x": 1,
+                "scope": {"x": [1], "urls": ["u"], "androidApps": [{"x": {"y": 2}, "bundleId": "b", "certificate": "c"}]}}],
+                "collections": [{"title": "C", "x": 1, "items": [{"x": 1, "item": "i", "account": "a", "extra": [2]}]}]}]}"#,
+        );
+        let acc = &h.accounts.unwrap()[0];
+        assert_eq!(acc.id.as_deref(), Some("a"));
+        let scope = acc.items[0].scope.as_ref().unwrap();
+        assert_eq!(scope.urls, ["u"]);
+        assert_eq!(scope.android_apps, ["b"]);
+        let link = &acc.collections[0].links[0];
+        assert_eq!((link.item.as_deref(), link.account.as_deref()), (Some("i"), Some("a")));
+    }
+
+    /// A deserializer that hands over a kind JSON has not (bytes) is refused,
+    /// and the error names what each reader expected.
+    #[test]
+    fn readers_name_what_they_expect() {
+        use serde::de::value::{BytesDeserializer, Error};
+        fn refused<'de, S: DeserializeSeed<'de>>(seed: S) -> String {
+            seed.deserialize(BytesDeserializer::<Error>::new(b"x")).err().unwrap().to_string()
+        }
+        let mut ctx = Ctx::default();
+        let cases = [
+            (refused(RootSeed(&mut ctx)), "a CXF document"),
+            (refused(AccountsSeed(&mut ctx)), "CXF accounts"),
+            (refused(AccountSeed(&mut ctx)), "a CXF account"),
+            (refused(ItemsSeed(&mut ctx)), "CXF items"),
+            (refused(ItemSeed(&mut ctx)), "a CXF item"),
+            (refused(ScopeSeed(&mut ctx)), "a CXF scope"),
+            (refused(CredentialsSeed(&mut ctx)), "CXF credentials"),
+            (refused(ListSeed::<Cow<str>>::new(&mut ctx)), "a JSON array"),
+            (refused(CollectionsSeed { ctx: &mut ctx, depth: 1 }), "CXF collections"),
+            (refused(CollectionSeed { ctx: &mut ctx, depth: 1 }), "a CXF collection"),
+            (refused(PhantomData::<Loose<u64>>), "any JSON value"),
+        ];
+        for (err, expected) in cases {
+            assert!(err.contains(expected), "{err} / {expected}");
+        }
+        assert!(ctx.limit.is_none(), "a refused kind is not a limit");
+    }
+
+    #[test]
+    fn owned_strings_are_read() {
+        use serde::de::value::{Error, StringDeserializer};
+        let v = Loose::<Cow<str>>::deserialize(StringDeserializer::<Error>::new("owned".to_string())).unwrap();
+        assert!(matches!(v.0, Some(Cow::Owned(ref s)) if s == "owned"));
+        let v = Loose::<u64>::deserialize(StringDeserializer::<Error>::new("5".to_string())).unwrap();
+        assert!(v.0.is_none(), "a string is not a number");
+        assert_eq!(<u64 as Shape>::from_u64(5), Some(5));
+        assert_eq!(<i64 as Shape>::from_i64(-5), Some(-5));
+        assert_eq!(<u64 as Shape>::from_str(Cow::Borrowed("5")), None);
     }
 }

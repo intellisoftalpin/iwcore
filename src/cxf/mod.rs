@@ -185,28 +185,36 @@ fn invalid(msg: &str) -> WalletError {
     WalletError::InvalidInput(msg.to_string())
 }
 
+/// Counts the bytes written.
+struct Count(usize);
+
+impl std::io::Write for Count {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Serialise to JSON in a zeroizing buffer of exactly the right size.
 ///
 /// The length is measured first, so the buffer is allocated once and never
 /// grows: a growing buffer would leave copies of the secrets it holds in the
 /// memory it gives back.
 pub(crate) fn to_json<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<Zeroizing<String>> {
-    struct Count(usize);
-    impl std::io::Write for Count {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(buf.len());
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
     let mut count = Count(0);
     serde_json::to_writer(&mut count, value)?;
     let mut buf = Zeroizing::new(Vec::with_capacity(count.0));
     serde_json::to_writer(&mut *buf, value)?;
-    // serde_json writes UTF-8 only, so this cannot fail; if it did, the bytes
-    // are wiped all the same.
+    utf8(buf)
+}
+
+/// The buffer as text without copying it. serde_json writes UTF-8 only, so
+/// this does not fail on its output; if it did, the bytes are wiped all the
+/// same.
+fn utf8(mut buf: Zeroizing<Vec<u8>>) -> serde_json::Result<Zeroizing<String>> {
     match String::from_utf8(std::mem::take(&mut *buf)) {
         Ok(s) => Ok(Zeroizing::new(s)),
         Err(e) => {
@@ -407,5 +415,23 @@ mod tests {
         assert_eq!(*to_json(&v).unwrap(), serde_json::to_string(&v).unwrap());
         let s = to_json(&json!("x".repeat(10_000))).unwrap();
         assert_eq!(s.len(), 10_002);
+    }
+
+    #[test]
+    fn the_counter_and_the_utf8_check() {
+        use std::io::Write;
+        let mut c = Count(usize::MAX - 1);
+        assert_eq!(c.write(b"abc").unwrap(), 3);
+        assert_eq!(c.0, usize::MAX);
+        c.flush().unwrap();
+        assert!(utf8(Zeroizing::new(vec![0xff, 0xfe])).unwrap_err().to_string().contains("not UTF-8"));
+        assert_eq!(utf8(Zeroizing::new(b"ok".to_vec())).unwrap().as_str(), "ok");
+    }
+
+    /// Links name the account in any member order; unknown members are skipped.
+    #[test]
+    fn links_are_read_whatever_the_member_order() {
+        let d = doc(json!([{"id": "a", "collections": [{"title": "C", "items": [{"account": "a", "x": 1, "item": "i1"}, {"account": "b", "item": "i2"}]}]}]));
+        assert_eq!(parse(&d).unwrap().accounts[0].collections[0].items, ["i1"]);
     }
 }
