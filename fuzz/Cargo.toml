@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.13"
 iwcore = { path = ".." }
 tempfile = "3.27"
+zip = { version = "9.2.0", default-features = false, features = ["deflate"] }
 
 # Not part of the iwcore workspace; run with `cargo +nightly fuzz run <target>`.
 [workspace]
@@ -47,6 +48,13 @@ bench = false
 [[bin]]
 name = "journal"
 path = "fuzz_targets/journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "restore_inspect"
+path = "fuzz_targets/restore_inspect.rs"
 test = false
 doc = false
 bench = false
