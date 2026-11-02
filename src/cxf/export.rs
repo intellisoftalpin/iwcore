@@ -396,10 +396,7 @@ fn item_view<'a>(item: &'a IWItem, fields: &[&'a IWField], records: &'a HashMap<
         });
     }
 
-    for (i, f) in fields.iter().enumerate() {
-        if used.contains(&i) {
-            continue;
-        }
+    for (_, f) in fields.iter().enumerate().filter(|(i, _)| !used.contains(i)) {
         match f.field_type.as_str() {
             "LINK" => urls.push(&f.value),
             FIELD_PASSKEY => match records.get(&(f.item_id.as_str(), f.field_id.as_str())) {
@@ -622,5 +619,24 @@ mod tests {
                 .iter().map(|c| c["title"].as_str().unwrap()).collect();
             assert_eq!(titles, ["Top"], "parent {parent:?}");
         }
+    }
+
+    /// A passkey field whose record cannot be read is exported as a concealed
+    /// custom field rather than lost.
+    #[test]
+    fn an_unreadable_passkey_is_kept_as_text() {
+        let (mut w, _t) = create_test_wallet();
+        let item = w.add_item("Site", "document", false, None).unwrap();
+        w.add_field_unchecked(&item, FIELD_PASSKEY, "not a passkey record", None).unwrap();
+        let doc = w.export_cxf(&ExportOptions::default()).unwrap();
+        let v: Value = serde_json::from_str(&doc).unwrap();
+        let creds = v["accounts"][0]["items"][0]["credentials"].as_array().unwrap();
+        assert!(!creds.iter().any(|c| c["type"] == "passkey"));
+        let custom = creds.iter().find(|c| c["type"] == "custom-fields").unwrap();
+        assert_eq!(custom["fields"][0]["label"], "Passkey (unreadable)");
+        assert_eq!(custom["fields"][0]["fieldType"], "concealed-string");
+        // The value is the field's public form, never the stored text.
+        let value = custom["fields"][0]["value"].as_str().unwrap();
+        assert!(value.contains("\"unreadable\":true") && !value.contains("not a passkey record"), "{value}");
     }
 }

@@ -1037,4 +1037,50 @@ mod tests {
         assert!(r.preview.skipped.is_empty());
         assert_eq!(w.list_passkeys().unwrap().len(), 3);
     }
+
+    fn skip_reasons(p: &Plan) -> Vec<(String, String)> {
+        p.skipped.clone().into_vec().into_iter().map(|s| (s.credential_type, s.reason)).collect()
+    }
+
+    #[test]
+    fn a_totp_secret_that_is_not_base32_is_skipped() {
+        for secret in [r#""not base32!""#, "5", "{}"] {
+            let d = doc(&format!(r#"{{"title": "T", "credentials": [{{"type": "totp", "secret": {secret}, "algorithm": "sha256"}}]}}"#));
+            let p = plan(&parse(&d).unwrap()).unwrap();
+            assert_eq!(p.counts.totp, 0, "{secret}");
+            assert_eq!(skip_reasons(&p), [("totp".to_string(), "the secret is not Base32".to_string())], "{secret}");
+        }
+        let d = doc(r#"{"title": "T", "credentials": [{"type": "totp", "secret": "JBSWY3DPEHPK3PXP", "algorithm": "md5"}]}"#);
+        let p = plan(&parse(&d).unwrap()).unwrap();
+        assert_eq!(skip_reasons(&p), [("totp".to_string(), "unknown hash algorithm".to_string())]);
+    }
+
+    #[test]
+    fn an_ssh_key_keeps_its_dates_and_source() {
+        let d = doc(
+            r#"{"title": "K", "credentials": [{"type": "ssh-key", "privateKey": "AAEC", "keyType": "ssh-ed25519", "keyComment": "me@box",
+                "creationDate": {"value": "2024-01-31"}, "expiryDate": {"value": "2030-12-31"}, "keyGenerationSource": {"value": "ssh-keygen"}}]}"#,
+        );
+        let p = plan(&parse(&d).unwrap()).unwrap();
+        assert_eq!(p.counts.other, 1);
+        let f = &p.items[0].fields;
+        let custom = |n: &str| f.iter().find(|f| matches!(&f.kind, Kind::Custom { name, .. } if name == n)).map(|f| f.value.as_str());
+        assert!(custom("SSH private key").is_some_and(|v| v.contains("PRIVATE KEY")));
+        assert_eq!(custom("Key type"), Some("ssh-ed25519"));
+        assert_eq!(custom("Key comment"), Some("me@box"));
+        assert_eq!(custom("Created"), Some("20240131"));
+        assert_eq!(custom("Key source"), Some("ssh-keygen"));
+        assert!(f.iter().any(|f| f.kind == Kind::System("EXPD") && *f.value == "20301231"));
+    }
+
+    #[test]
+    fn an_ssh_key_without_a_usable_private_key_is_skipped() {
+        for key in ["", r#", "privateKey": "not base64url!""#, r#", "privateKey": 5"#] {
+            let d = doc(&format!(r#"{{"title": "K", "credentials": [{{"type": "ssh-key", "keyType": "ssh-rsa"{key}}}]}}"#));
+            let p = plan(&parse(&d).unwrap()).unwrap();
+            assert_eq!(p.counts.other, 0, "{key}");
+            assert!(p.items.is_empty() || p.items[0].fields.is_empty(), "{key}");
+            assert_eq!(skip_reasons(&p), [("ssh-key".to_string(), "the private key is missing or not base64url".to_string())], "{key}");
+        }
+    }
 }
