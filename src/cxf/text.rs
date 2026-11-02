@@ -26,7 +26,7 @@ pub(crate) fn clean(text: &str, max: usize, multiline: bool) -> String {
         if !keep {
             continue;
         }
-        if out.len() + c.len_utf8() > max {
+        if out.len().saturating_add(c.len_utf8()) > max {
             break;
         }
         out.push(c);
@@ -234,26 +234,30 @@ fn unpct(s: &str) -> String {
     let mut i = 0;
     while let Some(&b) = bytes.get(i) {
         if b == b'%'
-            && let Some(v) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())
+            && let Some(v) = s.get(i.saturating_add(1)..i.saturating_add(3)).and_then(|h| u8::from_str_radix(h, 16).ok())
         {
             out.push(v);
-            i += 3;
+            i = i.saturating_add(3);
             continue;
         }
         out.push(if b == b'+' { b' ' } else { b });
-        i += 1;
+        i = i.saturating_add(1);
     }
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Last day of a `YYYY-MM` month as the vault's `YYYYMMDD` date.
+/// Last day of a `YYYY-MM` month as the vault's `YYYYMMDD` date; `None` for
+/// anything else, including a month outside 1–12 or a year chrono cannot hold.
 pub(crate) fn year_month_to_last_day(ym: &str) -> Option<String> {
     let (y, m) = ym.trim().split_once('-')?;
     let (y, m): (i32, u32) = (y.parse().ok()?, m.parse().ok()?);
+    if !(1..=12).contains(&m) {
+        return None;
+    }
     let first_next = if m == 12 {
-        chrono::NaiveDate::from_ymd_opt(y + 1, 1, 1)?
+        chrono::NaiveDate::from_ymd_opt(y.checked_add(1)?, 1, 1)?
     } else {
-        chrono::NaiveDate::from_ymd_opt(y, m + 1, 1)?
+        chrono::NaiveDate::from_ymd_opt(y, m.checked_add(1)?, 1)?
     };
     Some(first_next.pred_opt()?.format("%Y%m%d").to_string())
 }
@@ -376,12 +380,31 @@ mod tests {
         assert_eq!(year_month_to_last_day("2028-02").as_deref(), Some("20280229"));
         assert_eq!(year_month_to_last_day("2030-12").as_deref(), Some("20301231"));
         assert!(year_month_to_last_day("2030-13").is_none());
+        assert!(year_month_to_last_day("2030-0").is_none());
         assert!(year_month_to_last_day("garbage").is_none());
         assert_eq!(iso_date_to_vault("1990-05-17"), "19900517");
         assert_eq!(iso_date_to_vault("May 17"), "May 17");
         assert_eq!(vault_date_to_iso("19900517").as_deref(), Some("1990-05-17"));
         assert_eq!(vault_date_to_iso("1990-05-17").as_deref(), Some("1990-05-17"));
         assert!(vault_date_to_iso("soon").is_none());
+    }
+
+    /// Extreme years and months give `None`, never an overflow (tests run with
+    /// overflow checks on).
+    #[test]
+    fn year_month_extremes_are_refused_without_overflow() {
+        for ym in ["2147483647-12", "2147483647-11", "-2147483648-01", "2024-4294967295", "2024-4294967294", "2024-00", "262143-12", "262144-01"] {
+            assert!(year_month_to_last_day(ym).is_none(), "{ym}");
+        }
+        assert_eq!(year_month_to_last_day("9999-12").as_deref(), Some("99991231"));
+        assert_eq!(year_month_to_last_day(" 2024-1 ").as_deref(), Some("20240131"));
+    }
+
+    #[test]
+    fn clean_at_the_byte_limit() {
+        assert_eq!(clean("abc", 3, false), "abc");
+        assert_eq!(clean("abc", 2, false), "ab");
+        assert_eq!(clean("abc", usize::MAX, false), "abc");
     }
 
     #[test]

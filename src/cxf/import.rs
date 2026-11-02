@@ -192,7 +192,7 @@ fn plan(header: &Header<'_>) -> Result<Plan> {
         let mut name = format!("Imported from {} {}", header.exporter_display_name, date);
         if several {
             let who = [&account.username, &account.email].into_iter().find(|s| !s.is_empty());
-            name.push_str(&format!(" ({})", who.cloned().unwrap_or_else(|| format!("account {}", n + 1))));
+            name.push_str(&format!(" ({})", who.cloned().unwrap_or_else(|| format!("account {}", n.saturating_add(1)))));
         }
         let top = p.folders.len();
         p.folders.push(PlannedFolder { name, parent: None });
@@ -253,6 +253,17 @@ fn custom(name: &str, value_type: &'static str, value: String) -> PlannedField {
     }
 }
 
+/// Count one more credential of a kind.
+fn bump(count: &mut usize) {
+    *count = count.saturating_add(1);
+}
+
+/// Sort weight of the field at `index` within its item: 0, 100, 200, …,
+/// held at `i32::MAX` past the range.
+fn field_weight(index: usize) -> i32 {
+    i32::try_from(index).unwrap_or(i32::MAX).saturating_mul(100)
+}
+
 fn skip(item: &Item<'_>, ty: &str, reason: &str, out: &mut SkipList) {
     out.push(&item.title, ty, reason);
 }
@@ -288,7 +299,7 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
         let ty = cred.str("type").unwrap_or("");
         match ty {
             "basic-auth" => {
-                counts.logins += 1;
+                bump(&mut counts.logins);
                 if let Some(user) = ef(cred, "username") {
                     f.push(system(identity::classify(&user).field_type(), user));
                 }
@@ -298,7 +309,7 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
             }
             "passkey" => match passkey_field(cred, item) {
                 Ok(pf) => {
-                    counts.passkeys += 1;
+                    bump(&mut counts.passkeys);
                     f.push(pf);
                 }
                 Err(reason) => skip(item, ty, &reason, skipped),
@@ -308,7 +319,7 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
                 let secret = cred.str("secret").and_then(text::base32_secret);
                 match (secret, ["SHA1", "SHA256", "SHA512"].contains(&algorithm.as_str())) {
                     (Some(secret), true) => {
-                        counts.totp += 1;
+                        bump(&mut counts.totp);
                         let t = Totp {
                             secret,
                             algorithm,
@@ -325,12 +336,12 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
             }
             "note" => {
                 if let Some(content) = cred.ef("content").and_then(|c| c.value.as_deref()) {
-                    counts.notes += 1;
+                    bump(&mut counts.notes);
                     f.push(system("NOTE", text::clean(content, text::NOTE_MAX, true)));
                 }
             }
             "credit-card" => {
-                counts.cards += 1;
+                bump(&mut counts.cards);
                 for (member, code) in [("number", "CARD"), ("fullName", "NAME"), ("verificationNumber", "CVVC"), ("pin", "PINC")] {
                     if let Some(v) = ef(cred, member) {
                         f.push(system(code, v));
@@ -349,7 +360,7 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
                 }
             }
             "wifi" => {
-                counts.wifi += 1;
+                bump(&mut counts.wifi);
                 let sec = match ef(cred, "networkSecurityType").as_deref() {
                     Some("unsecured") => "nopass",
                     Some("wep") => "WEP",
@@ -362,7 +373,7 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
                 ));
             }
             "address" => {
-                counts.other += 1;
+                bump(&mut counts.other);
                 let city_line = [ef(cred, "postalCode"), ef(cred, "city")].into_iter().flatten().collect::<Vec<_>>().join(" ");
                 let lines: Vec<String> = [ef(cred, "streetAddress"), Some(city_line), ef(cred, "territory"), ef(cred, "country")]
                     .into_iter()
@@ -377,7 +388,7 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
                 }
             }
             "person-name" => {
-                counts.other += 1;
+                bump(&mut counts.other);
                 let parts: Vec<String> = ["title", "given", "given2", "surnamePrefix", "surname", "surname2", "generation", "credentials"]
                     .iter()
                     .filter_map(|m| ef(cred, m))
@@ -390,7 +401,7 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
                 }
             }
             "api-key" => {
-                counts.other += 1;
+                bump(&mut counts.other);
                 if let Some(k) = ef(cred, "key") {
                     f.push(custom("API key", "pass", k));
                 }
@@ -414,7 +425,7 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
                 let key = cred.str("privateKey").and_then(|k| crate::passkey::b64::decode(k, "privateKey").ok().map(Zeroizing::new));
                 match key {
                     Some(der) => {
-                        counts.other += 1;
+                        bump(&mut counts.other);
                         f.push(custom("SSH private key", "pass", text::pem_private_key(&der)));
                         if let Some(t) = cred.str("keyType") {
                             f.push(custom("Key type", "text", text::name(t)));
@@ -440,7 +451,7 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
                     skip(item, ty, "more than 256 fields", skipped);
                     continue;
                 }
-                counts.other += 1;
+                bump(&mut counts.other);
                 let number = match ty {
                     "drivers-license" => "licenseNumber",
                     "passport" => "passportNumber",
@@ -464,7 +475,7 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
                     skip(item, ty, "more than 256 custom fields", skipped);
                     continue;
                 }
-                counts.other += 1;
+                bump(&mut counts.other);
                 let group = cred.str("label").map(text::name).filter(|s| !s.is_empty());
                 for field in fields.0 {
                     let Some(v) = field.value.as_deref() else { continue };
@@ -487,7 +498,7 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
             }
             "generated-password" => match cred.str("password") {
                 Some(p) if !p.is_empty() => {
-                    counts.logins += 1;
+                    bump(&mut counts.logins);
                     f.push(custom("Generated password", "pass", text::clean(p, text::VALUE_MAX, false)));
                 }
                 _ => skip(item, ty, "no password", skipped),
@@ -821,7 +832,7 @@ impl Wallet {
                         }
                     }
                 };
-                self.add_field_unchecked(&item_id, &field_type, &f.value, Some(weight as i32 * 100))?;
+                self.add_field_unchecked(&item_id, &field_type, &f.value, Some(field_weight(weight)))?;
             }
             item_ids.push(item_id);
         }
@@ -920,6 +931,32 @@ mod tests {
         let reason = passkey_field(&cred, &item).err().unwrap();
         assert!(reason.starts_with("passkey is not usable"), "{reason}");
         assert!(!reason.contains("AAAAAAAA"));
+    }
+
+    #[test]
+    fn counters_and_weights_saturate() {
+        let mut n = usize::MAX - 1;
+        bump(&mut n);
+        assert_eq!(n, usize::MAX);
+        bump(&mut n);
+        assert_eq!(n, usize::MAX);
+        assert_eq!(field_weight(0), 0);
+        assert_eq!(field_weight(3), 300);
+        assert_eq!(field_weight(21_474_836), 2_147_483_600);
+        assert_eq!(field_weight(21_474_837), i32::MAX);
+        assert_eq!(field_weight(usize::MAX), i32::MAX);
+    }
+
+    /// A card expiry no calendar can hold is kept as text, never an overflow.
+    #[test]
+    fn extreme_card_expiry_dates_are_kept_as_text() {
+        for exp in ["2147483647-12", "2024-4294967295", "-2147483648-01"] {
+            let d = doc(&format!(r#"{{"title": "Card", "credentials": [{{"type": "credit-card", "number": {{"value": "4111"}}, "expiryDate": {{"value": "{exp}"}}}}]}}"#));
+            let p = plan(&parse(&d).unwrap()).unwrap();
+            let f = &p.items[0].fields;
+            assert!(f.iter().any(|f| matches!(&f.kind, Kind::Custom { name, .. } if name == "Expiry date") && *f.value == exp), "{exp}");
+            assert!(!f.iter().any(|f| f.kind == Kind::System("EXPD")), "{exp}");
+        }
     }
 
     // --- passkeys met twice ---------------------------------------------------

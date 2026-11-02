@@ -27,7 +27,10 @@
 //! and a preview lists at most [`SKIPPED_LISTED_MAX`] skipped credentials one
 //! by one.
 
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects)
+)]
 
 pub(crate) mod de;
 pub mod export;

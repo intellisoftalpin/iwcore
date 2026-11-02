@@ -276,7 +276,7 @@ fn collection_json<'a>(
         let mut subs: Vec<Value> = Vec::new();
         for f in kids.iter().filter(|i| i.folder) {
             if !guard.contains(f.item_id.as_str()) {
-                subs.push(collection_json(f, children, guard, depth + 1));
+                subs.push(collection_json(f, children, guard, depth.saturating_add(1)));
             }
         }
         if !subs.is_empty() {
