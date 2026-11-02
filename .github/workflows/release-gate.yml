@@ -60,7 +60,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [cxf_preview, passkey_request, passkey_record, assetlinks, journal]
+        target: [cxf_preview, passkey_request, passkey_record, assetlinks, journal, legacy_decrypt, origin_check]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
