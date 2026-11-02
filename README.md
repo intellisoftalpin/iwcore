@@ -230,6 +230,11 @@ backup_mgr.cleanup_auto_backups(3, 30)?;
 Backups carry the database version, so newer backups are correctly rejected by older
 versions, while newer versions can read and migrate older backups on restore.
 
+Upgrading a v5 vault to v6 leaves a snapshot of the old file
+(`nswallet.pre-v6.bak`) in the wallet folder. Once the upgraded vault is
+unlocked and a v6 backup exists, `wallet.retire_pre_v6_snapshot(backup_folder)?`
+deletes it (`wallet.has_pre_v6_snapshot()` tells whether it is still there).
+
 ## Passkeys
 
 A passkey is stored as a `PKEY` field on a login item. Its private key and PRF

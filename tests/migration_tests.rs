@@ -3,7 +3,8 @@
 //!
 //! These simulate the production upgrade end to end before any deployment:
 //! - golden snapshot equivalence (the user must see no difference);
-//! - migration markers (version 6, crypto record, AEAD blobs, kept pre-v6 backup);
+//! - migration markers (version 6, crypto record, AEAD blobs, pre-v6 backup
+//!   kept until retired once a v6 backup exists);
 //! - idempotency, wrong-password-no-mutation, crash/rollback;
 //! - undecryptable soft-deleted records are purged; undecryptable ACTIVE
 //!   records are quarantined (blob preserved) and the migration completes;
@@ -259,6 +260,78 @@ fn migration_keeps_pre_v6_backup_equal_to_original() {
     assert!(bak.exists(), "pre-v6 backup must be kept");
     let bak_snapshot = legacy_snapshot(&bak, TEST_PASSWORD);
     assert_eq!(before, bak_snapshot, "pre-v6 backup must equal the original readable data");
+}
+
+/// A backup folder holding one backup of `db`.
+fn backup_folder_with(db: &Path) -> TempDir {
+    let backups = TempDir::new().unwrap();
+    BackupManager::new(backups.path()).create_backup_from_path(db, true).unwrap();
+    backups
+}
+
+#[test]
+fn pre_v6_snapshot_is_kept_without_a_v6_backup() {
+    let (_t, folder) = fresh_real_vault();
+    let mut wallet = Wallet::open(&folder).unwrap();
+    assert!(wallet.unlock(TEST_PASSWORD).unwrap());
+    assert!(wallet.has_pre_v6_snapshot());
+
+    // No backup folder, an empty one, one with only the old v5 vault, and one
+    // with a file that only looks like a backup.
+    let empty = TempDir::new().unwrap();
+    let v5_only = backup_folder_with(&testdata("nswallet.dat"));
+    let fake = TempDir::new().unwrap();
+    fs::write(fake.path().join("iwb-20260101-120000-manual.zip"), b"not a zip").unwrap();
+    assert_eq!(BackupManager::new(fake.path()).list_backups().unwrap().len(), 1);
+    for backups in [&empty.path().join("missing"), empty.path(), v5_only.path(), fake.path()] {
+        assert!(!wallet.retire_pre_v6_snapshot(backups).unwrap(), "{}", backups.display());
+        assert!(wallet.has_pre_v6_snapshot());
+    }
+    assert!(folder.join(PRE_V6_BACKUP).exists());
+}
+
+#[test]
+fn pre_v6_snapshot_is_kept_while_locked() {
+    let (_t, folder) = fresh_real_vault();
+    let mut wallet = Wallet::open(&folder).unwrap();
+    assert!(wallet.unlock(TEST_PASSWORD).unwrap());
+    let backups = backup_folder_with(&folder.join("nswallet.dat"));
+    wallet.lock();
+
+    assert!(wallet.retire_pre_v6_snapshot(backups.path()).is_err());
+    assert!(wallet.has_pre_v6_snapshot());
+
+    let reopened = Wallet::open(&folder).unwrap();
+    assert!(reopened.retire_pre_v6_snapshot(backups.path()).is_err());
+    assert!(folder.join(PRE_V6_BACKUP).exists());
+}
+
+#[test]
+fn pre_v6_snapshot_is_deleted_once_a_v6_backup_exists() {
+    let (_t, folder) = fresh_real_vault();
+    let mut wallet = Wallet::open(&folder).unwrap();
+    assert!(wallet.unlock(TEST_PASSWORD).unwrap());
+    let before = api_snapshot(&mut wallet);
+
+    // An old v5 backup next to the v6 one does not get in the way.
+    let backups = backup_folder_with(&testdata("nswallet.dat"));
+    BackupManager::new(backups.path())
+        .create_backup(wallet.database().unwrap(), false)
+        .unwrap();
+
+    assert!(wallet.retire_pre_v6_snapshot(backups.path()).unwrap());
+    assert!(!wallet.has_pre_v6_snapshot());
+    assert!(!folder.join(PRE_V6_BACKUP).exists());
+
+    // Idempotent; the vault itself and the backups are untouched.
+    assert!(!wallet.retire_pre_v6_snapshot(backups.path()).unwrap());
+    assert_eq!(BackupManager::new(backups.path()).list_backups().unwrap().len(), 2);
+    assert_eq!(before, api_snapshot(&mut wallet));
+    drop(wallet);
+    let mut wallet = Wallet::open(&folder).unwrap();
+    assert!(wallet.unlock(TEST_PASSWORD).unwrap());
+    assert!(!wallet.has_pre_v6_snapshot());
+    assert_eq!(before, api_snapshot(&mut wallet));
 }
 
 // ── C. idempotency ──────────────────────────────────────────────────────────

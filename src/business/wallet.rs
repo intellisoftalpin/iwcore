@@ -15,8 +15,9 @@ use crate::utils::generate_database_id;
 use crate::{DATABASE_FILENAME, ROOT_ID, ROOT_PARENT_ID, DB_VERSION, ENCRYPTION_COUNT_DEFAULT};
 use zeroize::Zeroizing;
 
-/// Filename of the pre-migration snapshot kept (permanently) next to the
-/// database when a v5 vault is upgraded to v6. See `iwcore-hardening.md`.
+/// Filename of the pre-migration snapshot written next to the database when a
+/// v5 vault is upgraded to v6. Kept until [`Wallet::retire_pre_v6_snapshot`]
+/// removes it once a v6 backup exists. See `iwcore-hardening.md`.
 pub const PRE_V6_BACKUP_FILENAME: &str = "nswallet.pre-v6.bak";
 
 /// Scheme id stored in the crypto record (1 = XChaCha20-Poly1305 / Argon2id).
@@ -92,6 +93,22 @@ fn legacy_encryption_count(email: Option<&str>) -> u32 {
 
 /// KDF name stored in the crypto record of a v6 vault.
 const KDF_ARGON2ID: &str = "argon2id";
+
+/// First database version written with the v6 crypto scheme.
+const V6: u32 = 6;
+
+/// Whether `backup_folder` holds a backup that passes inspection and reports
+/// database version >= 6. Inspection extracts into a temporary folder under
+/// `temp_base`.
+fn has_v6_backup(backup_folder: &Path, temp_base: &Path) -> Result<bool> {
+    let backups = crate::backup::BackupManager::new(backup_folder).list_backups()?;
+    Ok(backups.iter().any(|b| {
+        crate::backup::inspect_backup_in(&b.path, temp_base)
+            .ok()
+            .and_then(|i| i.db_version.parse::<u32>().ok())
+            .is_some_and(|v| v >= V6)
+    }))
+}
 
 /// Derive the KEK from `password` using the record's stored params and try
 /// to unwrap the DEK. Returns the DEK on success, `None` on wrong password.
@@ -632,9 +649,52 @@ impl Wallet {
         Ok(())
     }
 
+    /// Whether the pre-v6 snapshot ([`PRE_V6_BACKUP_FILENAME`]) is still in
+    /// the wallet folder.
+    pub fn has_pre_v6_snapshot(&self) -> bool {
+        self.folder.join(PRE_V6_BACKUP_FILENAME).is_file()
+    }
+
+    /// Delete the pre-v6 snapshot once it is no longer needed. Returns whether
+    /// a snapshot was deleted.
+    ///
+    /// The snapshot still holds the vault in the old format, so it is removed
+    /// as soon as the converted vault is known to work and a current backup
+    /// can replace it. It is deleted only when all of these hold:
+    /// - the wallet is unlocked (else [`WalletError::Locked`]), which proves
+    ///   the converted vault opens with the password;
+    /// - the vault is v6 (it has a crypto record and version >= 6);
+    /// - the snapshot exists;
+    /// - `backup_folder` holds at least one backup that passes
+    ///   [`crate::backup::inspect_backup_in`] and reports database version >= 6.
+    ///
+    /// Backups are inspected through a temporary folder inside the wallet
+    /// folder. Backups that fail inspection are skipped, not reported.
+    /// Calling it again after the snapshot is gone returns `Ok(false)`.
+    pub fn retire_pre_v6_snapshot(&self, backup_folder: &Path) -> Result<bool> {
+        self.ensure_unlocked()?;
+        {
+            let conn = self.db.as_ref()
+                .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+                .connection()?;
+            let version: u32 = migrations::get_database_version(conn)?.parse().unwrap_or(0);
+            if version < V6 || queries::get_crypto_record(conn)?.is_none() {
+                return Ok(false);
+            }
+        }
+        if !self.has_pre_v6_snapshot() || !has_v6_backup(backup_folder, &self.folder)? {
+            return Ok(false);
+        }
+        std::fs::remove_file(self.folder.join(PRE_V6_BACKUP_FILENAME)).map_err(|e| {
+            WalletError::BackupError(format!("Failed to remove pre-v6 snapshot: {e}"))
+        })?;
+        Ok(true)
+    }
+
     /// Write a consistent pre-migration snapshot of the database to
-    /// `<folder>/nswallet.pre-v6.bak` using SQLite `VACUUM INTO`. Kept
-    /// permanently as a recovery anchor. Overwrites any stale snapshot (safe:
+    /// `<folder>/nswallet.pre-v6.bak` using SQLite `VACUUM INTO`. Kept as a
+    /// recovery anchor until [`Wallet::retire_pre_v6_snapshot`] removes it.
+    /// Overwrites any stale snapshot (safe:
     /// only called while the live DB is still an intact v5).
     fn create_pre_v6_backup(&self) -> Result<()> {
         let dst = self.folder.join(PRE_V6_BACKUP_FILENAME);
@@ -657,8 +717,8 @@ impl Wallet {
     /// from the verified derivation and falls back through the others for
     /// vaults with a mixed key history).
     ///
-    /// Sequence (see `iwcore-hardening.md`): checkpoint, write a kept pre-v6
-    /// snapshot, then in a single transaction generate fresh key material,
+    /// Sequence (see `iwcore-hardening.md`): checkpoint, write a pre-v6
+    /// snapshot (kept until retired), then in a single transaction generate fresh key material,
     /// re-encrypt every item name and field value (active, deleted, and root)
     /// from the legacy scheme to the DEK AEAD scheme, write the crypto record,
     /// and bump the version to 6.
@@ -963,6 +1023,40 @@ pub(crate) mod tests {
             assert!(!wallet.is_unlocked());
             assert!(started.elapsed() < std::time::Duration::from_secs(2), "{sql}");
         }
+    }
+
+    /// A v6 backup of the wallet at `folder`, written into a new backup folder.
+    fn v6_backup_folder(folder: &Path) -> TempDir {
+        let backups = TempDir::new().unwrap();
+        crate::backup::BackupManager::new(backups.path())
+            .create_backup_from_path(&folder.join(DATABASE_FILENAME), true)
+            .unwrap();
+        backups
+    }
+
+    #[test]
+    fn the_pre_v6_snapshot_stays_while_the_vault_is_not_v6() {
+        for sql in [
+            "UPDATE nswallet_properties SET version = '5'",
+            "UPDATE nswallet_properties SET version = 'x'",
+            "DELETE FROM nswallet_crypto",
+        ] {
+            let (wallet, temp) = create_test_wallet();
+            let backups = v6_backup_folder(temp.path());
+            std::fs::write(temp.path().join(PRE_V6_BACKUP_FILENAME), b"snapshot").unwrap();
+            assert!(wallet.has_pre_v6_snapshot());
+            wallet.db.as_ref().unwrap().connection().unwrap().execute_batch(sql).unwrap();
+            assert!(!wallet.retire_pre_v6_snapshot(backups.path()).unwrap(), "{sql}");
+            assert!(wallet.has_pre_v6_snapshot(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn retiring_without_a_snapshot_is_a_no_op() {
+        let (wallet, temp) = create_test_wallet();
+        let backups = v6_backup_folder(temp.path());
+        assert!(!wallet.has_pre_v6_snapshot());
+        assert!(!wallet.retire_pre_v6_snapshot(backups.path()).unwrap());
     }
 
     #[test]
