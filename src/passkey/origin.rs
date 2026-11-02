@@ -13,11 +13,22 @@
 //!   `get_login_creds` ([`assetlinks_allows`]). Fetching the file is the app's
 //!   job; parsing and deciding is done here.
 //!
+//! The same checks decide password AutoFill on Android:
+//!
+//! - a **native app** may be offered the logins saved for a site only if the
+//!   site's `assetlinks.json` (fetched from the registrable domain of the saved
+//!   URL, [`login_assetlinks_url`]) grants that app `get_login_creds`
+//!   ([`app_allowed_for_domain`]);
+//! - a **privileged browser**'s `webDomain` must belong to the same site as
+//!   the saved URL ([`web_domain_matches_url`]).
+//!
 //! Public suffixes come from the full Public Suffix List (`psl` crate), not the
 //! curated subset AutoFill ranking uses: accepting a public suffix such as
 //! `github.io` as an rpId would make one passkey usable by every site under it.
 
 use serde_json::Value;
+
+use crate::autofill::domain::normalize_host;
 
 use super::b64;
 use super::record::validate_rp_id;
@@ -118,6 +129,69 @@ pub fn assetlinks_allows(json: &[u8], package: &str, cert_sha256: &[u8; 32]) -> 
         return Err(WalletError::InvalidInput("assetlinks.json has too many statements".into()));
     }
     Ok(statements.iter().any(|s| statement_allows(s, package, cert_sha256)))
+}
+
+/// The registrable domain (eTLD+1, full Public Suffix List) of a saved login
+/// URL, a bare host or a browser's `webDomain`: `https://login.example.co.uk/x`
+/// gives `example.co.uk`. `None` for IP addresses, single-label hosts, public
+/// suffixes and anything that is not a host.
+pub fn registrable_domain(url_or_host: &str) -> Option<String> {
+    let host = normalize_host(url_or_host)?;
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let domain = psl::domain_str(&host)?;
+    validate_rp_id(domain).ok()?;
+    Some(domain.to_string())
+}
+
+/// Where to fetch the `assetlinks.json` that decides which apps may fill the
+/// logins saved for `saved_url`: `https://<registrable domain>/.well-known/assetlinks.json`.
+pub fn login_assetlinks_url(saved_url: &str) -> Option<String> {
+    registrable_domain(saved_url).map(|d| format!("https://{d}/.well-known/assetlinks.json"))
+}
+
+/// May the native app `package`, signed by `cert_sha256`, be offered the
+/// passwords saved for `domain`?
+///
+/// `domain` is the registrable domain of the saved login URL
+/// ([`registrable_domain`]) and `assetlinks_json` the file the app fetched from
+/// [`login_assetlinks_url`]. True only when that file grants exactly this
+/// package and certificate `delegate_permission/common.get_login_creds`, the
+/// same rule as for passkeys ([`assetlinks_allows`]). A `domain` that is not a
+/// registrable domain (a subdomain, a URL, a public suffix, an IP address) is
+/// an error, so a file from the wrong host is never consulted; so is a
+/// malformed or oversized file.
+pub fn app_allowed_for_domain(
+    assetlinks_json: &[u8],
+    package: &str,
+    cert_sha256: &[u8; 32],
+    domain: &str,
+) -> Result<bool> {
+    if registrable_domain(domain).as_deref() != Some(domain) {
+        return Err(refused("domain is not a registrable domain"));
+    }
+    assetlinks_allows(assetlinks_json, package, cert_sha256)
+}
+
+/// Does a `webDomain` reported by a privileged browser belong to the site a
+/// login was saved for?
+///
+/// True when both have the same registrable domain under the full Public
+/// Suffix List: `login.example.co.uk` matches a login saved for
+/// `https://example.co.uk/signin`, while `evil.co.uk` or `other.github.io`
+/// match nothing of `example.co.uk` / `bkv.github.io`. Hosts without a
+/// registrable domain (IP addresses, `localhost`, intranet names) must be
+/// equal. Port, path and scheme are ignored.
+pub fn web_domain_matches_url(web_domain: &str, saved_url: &str) -> bool {
+    match (registrable_domain(web_domain), registrable_domain(saved_url)) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => match (normalize_host(web_domain), normalize_host(saved_url)) {
+            (Some(web), Some(saved)) => web == saved,
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn statement_allows(statement: &Value, package: &str, cert_sha256: &[u8; 32]) -> bool {
@@ -284,6 +358,93 @@ mod tests {
         assert!(!allows(vec![statement(rel, "android_app", "com.example.app", &s.join(":"))]));
         assert!(!allows(vec![serde_json::json!({"relation": [rel]})]), "no target");
         assert!(!allows(vec![]));
+    }
+
+    #[test]
+    fn registrable_domains_use_the_full_list() {
+        let cases = [
+            ("https://login.example.co.uk/signin?x=1", Some("example.co.uk")),
+            ("example.com", Some("example.com")),
+            ("WWW.Example.COM:8443", Some("example.com")),
+            ("https://user@a.b.example.com/", Some("example.com")),
+            ("bkv.github.io", Some("bkv.github.io")),
+            ("x.y.vercel.app", Some("y.vercel.app")),
+            ("https://пример.рф/", Some("xn--e1afmkfd.xn--p1ai")),
+            ("github.io", None),
+            ("co.uk", None),
+            ("com", None),
+            ("localhost", None),
+            ("192.168.1.1", None),
+            ("http://[::1]:8080/", None),
+            ("javascript:alert(1)", None),
+            ("", None),
+            ("a_b.example.com", Some("example.com")),
+            ("x.under_score", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(registrable_domain(input).as_deref(), want, "{input}");
+        }
+        assert_eq!(
+            login_assetlinks_url("https://accounts.example.co.uk/login").as_deref(),
+            Some("https://example.co.uk/.well-known/assetlinks.json")
+        );
+        assert_eq!(login_assetlinks_url("https://github.io/"), None);
+    }
+
+    #[test]
+    fn password_autofill_needs_get_login_creds_for_the_registrable_domain() {
+        let rel = RELATION_GET_LOGIN_CREDS;
+        let file = serde_json::to_vec(&vec![statement(rel, "android_app", "com.example.app", &fp(true))]).unwrap();
+        let ok = |domain: &str| app_allowed_for_domain(&file, "com.example.app", &cert(), domain);
+        assert!(ok("example.com").unwrap());
+        assert!(!app_allowed_for_domain(&file, "com.example.other", &cert(), "example.com").unwrap());
+        let mut other_cert = cert();
+        other_cert[0] ^= 1;
+        assert!(!app_allowed_for_domain(&file, "com.example.app", &other_cert, "example.com").unwrap());
+        // handle_all_urls (app links) is not credential sharing.
+        let links = serde_json::to_vec(&vec![statement(
+            "delegate_permission/common.handle_all_urls", "android_app", "com.example.app", &fp(true),
+        )]).unwrap();
+        assert!(!app_allowed_for_domain(&links, "com.example.app", &cert(), "example.com").unwrap());
+        // Only a registrable domain names the file to consult.
+        for bad in ["login.example.com", "https://example.com", "co.uk", "github.io", "Example.com", "1.2.3.4", ""] {
+            assert!(ok(bad).is_err(), "{bad}");
+        }
+        assert!(app_allowed_for_domain(b"not json", "com.example.app", &cert(), "example.com").is_err());
+    }
+
+    #[test]
+    fn browser_web_domain_against_saved_url() {
+        let matches = [
+            ("example.com", "https://example.com/login"),
+            ("login.example.com", "https://example.com"),
+            ("example.com", "https://accounts.example.com/signin"),
+            ("www.example.co.uk", "example.co.uk"),
+            ("bkv.github.io", "https://bkv.github.io/app"),
+            ("192.168.1.1", "http://192.168.1.1:8080/admin"),
+            ("localhost", "http://localhost:3000"),
+            ("EXAMPLE.com", "https://example.COM"),
+        ];
+        for (web, saved) in matches {
+            assert!(web_domain_matches_url(web, saved), "{web} vs {saved}");
+        }
+        let different = [
+            ("evil.co.uk", "https://example.co.uk"),
+            ("other.github.io", "https://bkv.github.io"),
+            ("example.com.evil.net", "https://example.com"),
+            ("notexample.com", "https://example.com"),
+            ("192.168.1.2", "http://192.168.1.1"),
+            ("example.com", "http://192.168.1.1"),
+            ("localhost", "https://example.com"),
+            ("", "https://example.com"),
+            ("example.com", ""),
+            ("example.com", "javascript:alert(1)"),
+            ("", ""),
+            ("localhost", ""),
+        ];
+        for (web, saved) in different {
+            assert!(!web_domain_matches_url(web, saved), "{web} vs {saved}");
+        }
     }
 
     #[test]
