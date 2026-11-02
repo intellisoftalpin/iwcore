@@ -31,7 +31,9 @@ block-padding = "0.4.2"
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
+# raw_value: the AutoFill index carries passkey records as raw JSON text, so
+# they go straight from and into zeroized buffers (see autofill::index).
+serde_json = { version = "1.0.154", features = ["raw_value"] }
 
 # Utilities
 chrono = { version = "0.4.45", features = ["serde"] }

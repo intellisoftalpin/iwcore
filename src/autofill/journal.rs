@@ -72,6 +72,7 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::error::{Result, WalletError};
+use crate::passkey::PasskeyRecord;
 
 use super::crypto::{self, KEY_LEN};
 
@@ -103,8 +104,8 @@ pub enum PendingOp {
     /// A password change for an entry that already exists. The old value moves
     /// into an `OLDP` field and the new one is written to `PASS`.
     UpdatePassword,
-    /// A passkey created in the provider. The record is in
-    /// [`PendingRecord::passkey`]; the password field is empty.
+    /// A passkey created in the provider. The record is read with
+    /// [`PendingRecord::staged_passkey`]; the password field is empty.
     CreatePasskey,
 }
 
@@ -115,7 +116,12 @@ pub enum PendingOp {
 /// index's own expiry, because a record the user created moments ago has never
 /// had a chance to reach the vault.
 ///
-/// `Debug` redacts the password and TOTP secret.
+/// `Debug` redacts the password, the TOTP secret and the passkey.
+///
+/// The staged passkey (private key included) is not a public field: it is held
+/// in a zeroizing buffer, written with [`PendingRecord::new_passkey`] and read back
+/// only as a [`PasskeyRecord`], whose key never leaves the crate except as a
+/// signature.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRecord {
     /// Random identifier, so a crash between "written to vault" and "journal
@@ -147,8 +153,26 @@ pub struct PendingRecord {
     /// For [`PendingOp::CreatePasskey`]: the passkey as a `PKEY` field value
     /// (see `passkey::record`), private key included. Absent otherwise, so
     /// records written before passkeys existed read unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub passkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "secret_text")]
+    pub(crate) passkey: Option<Zeroizing<String>>,
+}
+
+/// Serde for the staged passkey: the same JSON string as always, held in a
+/// zeroizing buffer in memory.
+mod secret_text {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use zeroize::Zeroizing;
+
+    pub(super) fn serialize<S: Serializer>(value: &Option<Zeroizing<String>>, s: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(text) => s.serialize_some(text.as_str()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Zeroizing<String>>, D::Error> {
+        Ok(Option::<String>::deserialize(d)?.map(Zeroizing::new))
+    }
 }
 
 impl std::fmt::Debug for PendingRecord {
@@ -170,6 +194,60 @@ impl std::fmt::Debug for PendingRecord {
 }
 
 impl PendingRecord {
+    /// A staged login: [`PendingOp::Create`] with no item, hint, TOTP secret or
+    /// passkey. Set the public fields afterwards for anything else.
+    pub fn new_login(
+        record_id: impl Into<String>,
+        title: impl Into<String>,
+        url: impl Into<String>,
+        identity_value: impl Into<String>,
+        password: impl Into<String>,
+        created_at: i64,
+    ) -> Self {
+        Self {
+            record_id: record_id.into(),
+            op: PendingOp::Create,
+            item_id: None,
+            title: title.into(),
+            url: url.into(),
+            identity_value: identity_value.into(),
+            identity_hint: None,
+            password: password.into(),
+            totp_secret: None,
+            created_at,
+            passkey: None,
+        }
+    }
+
+    /// A staged passkey: [`PendingOp::CreatePasskey`] carrying `passkey`, for
+    /// the site at `https://<rpId>` and the passkey's user name.
+    pub fn new_passkey(
+        record_id: impl Into<String>,
+        title: impl Into<String>,
+        passkey: &PasskeyRecord,
+        created_at: i64,
+    ) -> Result<Self> {
+        let mut record = Self::new_login(
+            record_id,
+            title,
+            format!("https://{}", passkey.rp_id),
+            passkey.user_name.clone(),
+            String::new(),
+            created_at,
+        );
+        record.op = PendingOp::CreatePasskey;
+        record.passkey = Some(passkey.to_field_value()?);
+        Ok(record)
+    }
+
+    /// The staged passkey, parsed and validated. `None` when the record carries
+    /// none, or one that does not read as a passkey.
+    pub fn staged_passkey(&self) -> Option<PasskeyRecord> {
+        self.passkey
+            .as_deref()
+            .and_then(|stored| PasskeyRecord::from_field_value(stored).ok())
+    }
+
     /// The field type this record's identity value belongs in: the hint when it
     /// names a real identity type, the classifier otherwise.
     pub fn identity_kind(&self) -> super::identity::IdentityKind {
@@ -839,6 +917,31 @@ mod tests {
         assert!(tag_verifies(&key, b"payload", &tag));
         assert!(!tag_verifies(&key, b"payload", &tag[..TAG_LEN - 1]));
         assert!(!tag_verifies(&[0x43; KEY_LEN], b"payload", &tag));
+    }
+
+    #[test]
+    fn a_staged_passkey_is_redacted_and_keeps_its_wire_form() {
+        let passkey = crate::passkey::record::tests::sample(true);
+        let key_b64 = crate::passkey::b64::encode(passkey.pkcs8());
+        let r = PendingRecord::new_passkey("p1", "Example", &passkey, 5).unwrap();
+        assert_eq!(r.op, PendingOp::CreatePasskey);
+        assert_eq!(r.url, format!("https://{}", passkey.rp_id));
+        assert_eq!(r.identity_value, passkey.user_name);
+        assert!(r.password.is_empty());
+        assert!(!format!("{r:?}").contains(&key_b64), "Debug must not show the key");
+
+        // On disk the passkey is the stored PKEY value as a JSON string, as
+        // the Swift extension and earlier builds write it.
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["passkey"].as_str(), Some(passkey.to_field_value().unwrap().as_str()));
+        let back: PendingRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.staged_passkey().unwrap().credential_id, passkey.credential_id);
+
+        let login = PendingRecord::new_login("l1", "Example", "https://example.com", "bkv", "pw", 5);
+        assert_eq!(login.op, PendingOp::Create);
+        assert!(login.staged_passkey().is_none());
+        assert!(serde_json::to_value(&login).unwrap().get("passkey").is_none());
     }
 
     #[test]

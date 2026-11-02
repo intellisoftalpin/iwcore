@@ -337,7 +337,7 @@ fn old_backups_inspect_without_a_password() {
 /// the app can warn before an old backup replaces them.
 #[test]
 fn a_restored_old_backup_gains_passkeys_and_backs_them_up() {
-    use iwcore::autofill::{generate_keys, journal, PendingOp, PendingRecord};
+    use iwcore::autofill::{generate_keys, journal, PendingRecord};
     use iwcore::passkey::sign::{self, RegisterInput};
 
     for v in VERSIONS {
@@ -347,12 +347,7 @@ fn a_restored_old_backup_gains_passkeys_and_backs_them_up() {
             rp_id: "example.com", user_name: "bkv", user_display_name: "bkv", user_handle: b"h",
             exclude_credentials: &[], held_credential_ids: &[], user_verified: true, now: 0,
         }).unwrap();
-        let record = PendingRecord {
-            record_id: "r".into(), op: PendingOp::CreatePasskey, item_id: None, title: "example.com".into(),
-            url: "https://example.com".into(), identity_value: "bkv".into(), identity_hint: None,
-            password: String::new(), totp_secret: None, created_at: 0,
-            passkey: Some(reg.record.to_field_value().unwrap().to_string()),
-        };
+        let record = PendingRecord::new_passkey("r", "example.com", &reg.record, 0).unwrap();
         let j = journal::seal_record(&record, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
         let dk = DrainKeys { journal_secret: &keys.journal_secret, auth_key: &keys.journal_auth_key, legacy_wrap_keys: &[] };
         let s = wallet.drain_autofill_journal(&j, &dk, None).unwrap();

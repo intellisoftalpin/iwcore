@@ -10,7 +10,7 @@
 
 use crate::business::Wallet;
 use crate::error::{Result, WalletError};
-use crate::passkey::{PasskeyRecord, PasskeySummary, FIELD_PASSKEY};
+use crate::passkey::{PasskeySummary, FIELD_PASSKEY};
 
 use super::index::{self, IndexHeader, IndexOptions};
 use super::journal::{self, DrainKeys, PendingOp, PendingRecord};
@@ -311,8 +311,7 @@ impl Wallet {
         known: &[index::IndexEntry],
         folder: &str,
     ) -> Result<PasskeyOutcome> {
-        let Some(stored) = record.passkey.as_deref() else { return Ok(PasskeyOutcome::Invalid) };
-        let Ok(passkey) = PasskeyRecord::from_field_value(stored) else { return Ok(PasskeyOutcome::Invalid) };
+        let Some(passkey) = record.staged_passkey() else { return Ok(PasskeyOutcome::Invalid) };
         let value = passkey.to_field_value()?;
 
         let existing = self.live_passkeys()?;
@@ -466,14 +465,8 @@ impl Wallet {
             items.iter().map(|i| (i.item_id.as_str(), i.name.as_str())).collect();
         let mut out = Vec::new();
         for (item_id, field_id, record) in self.live_passkeys()? {
-            let stored = record.to_field_value()?;
-            let Ok(value) = serde_json::from_str(&stored) else { continue };
-            out.push(index::PasskeyIndexEntry {
-                title: titles.get(item_id.as_str()).copied().unwrap_or_default().to_string(),
-                item_id,
-                field_id,
-                record: value,
-            });
+            let title = titles.get(item_id.as_str()).copied().unwrap_or_default().to_string();
+            out.push(index::PasskeyIndexEntry::new(item_id, field_id, title, record));
         }
         Ok(out)
     }
@@ -576,6 +569,7 @@ impl Wallet {
 mod tests {
     use super::*;
     use crate::autofill::identity::IdentityKind;
+    use crate::passkey::PasskeyRecord;
     use crate::autofill::keys::generate_keys;
     use tempfile::TempDir;
 
@@ -972,7 +966,7 @@ mod tests {
         let mut r = record(id, "bkv");
         r.op = PendingOp::CreatePasskey;
         r.password = String::new();
-        r.passkey = Some(reg.record.to_field_value().unwrap().to_string());
+        r.passkey = Some(reg.record.to_field_value().unwrap());
         let sealed = journal::seal_record(&r, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
         (sealed, reg.record)
     }

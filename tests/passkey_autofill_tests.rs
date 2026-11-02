@@ -33,19 +33,7 @@ fn stage(keys: &AutofillKeys, rp: &str, user: &str, handle: &[u8]) -> (Vec<u8>, 
         now: 1_793_433_600,
     })
     .unwrap();
-    let record = PendingRecord {
-        record_id: format!("rec-{}", hex(&reg.credential_id)),
-        op: PendingOp::CreatePasskey,
-        item_id: None,
-        title: rp.into(),
-        url: format!("https://{rp}"),
-        identity_value: user.into(),
-        identity_hint: None,
-        password: String::new(),
-        totp_secret: None,
-        created_at: 1_793_433_600,
-        passkey: Some(reg.record.to_field_value().unwrap().to_string()),
-    };
+    let record = PendingRecord::new_passkey(format!("rec-{}", hex(&reg.credential_id)), rp, &reg.record, 1_793_433_600).unwrap();
     let bytes = journal::seal_record(&record, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
     (bytes, reg.record)
 }
@@ -74,8 +62,19 @@ fn a_staged_passkey_signs_before_the_app_opens() {
     let staged = journal::open_with_index_key(&j, &keys.index_key);
     assert_eq!(staged.len(), 1);
     assert_eq!(staged[0].op, PendingOp::CreatePasskey);
-    let record = PasskeyRecord::from_field_value(staged[0].passkey.as_deref().unwrap()).unwrap();
+    let record = staged[0].staged_passkey().unwrap();
     sign::assert(&record, "example.com", &[3; 32], true).unwrap();
+    // The same, through the core's signing entry point.
+    let signed = iwcore::autofill::sign_from_index(&[], &keys.index_key, &j, &[], &iwcore::autofill::SignRequest {
+        credential_id: &record.credential_id,
+        rp_id: "example.com",
+        client_data_hash: &[3; 32],
+        user_verified: true,
+        allow_credentials: &[],
+        prf: None,
+    })
+    .unwrap();
+    assert!(signed.staged);
 }
 
 #[test]
@@ -195,25 +194,18 @@ fn draining_twice_changes_nothing() {
 fn an_invalid_staged_passkey_is_skipped_and_the_rest_drains() {
     let (_t, mut w) = wallet();
     let keys = generate_keys().unwrap();
-    let bad = PendingRecord {
-        record_id: "bad".into(),
-        op: PendingOp::CreatePasskey,
-        item_id: None,
-        title: "x".into(),
-        url: "https://x.example".into(),
-        identity_value: "u".into(),
-        identity_hint: None,
-        password: String::new(),
-        totp_secret: None,
-        created_at: 0,
-        passkey: Some("{\"v\":1,\"rpId\":\"x.example\"}".into()),
-    };
+    // A passkey record whose value does not validate, as JSON from a provider.
+    let bad: PendingRecord = serde_json::from_str(
+        r#"{"record_id":"bad","op":"CreatePasskey","title":"x","url":"https://x.example","identity_value":"u",
+            "password":"","created_at":0,"passkey":"{\"v\":1,\"rpId\":\"x.example\"}"}"#,
+    )
+    .unwrap();
+    assert!(bad.staged_passkey().is_none());
     let mut j = journal::seal_record(&bad, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
     let (good, _) = stage(&keys, "example.com", "bkv", b"h1");
     j.extend_from_slice(&good);
     // And a plain login in the same journal.
-    let login = PendingRecord { record_id: "login".into(), op: PendingOp::Create, passkey: None,
-        password: "pw".into(), url: "https://other.example".into(), identity_value: "me".into(), ..bad.clone() };
+    let login = PendingRecord::new_login("login", "x", "https://other.example", "me", "pw", 0);
     j.extend_from_slice(&journal::seal_record(&login, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap());
 
     let s = drain(&mut w, &keys, &j);
@@ -233,9 +225,10 @@ fn the_index_carries_live_passkeys_only() {
     let entries = index_passkeys(&mut w, &keys);
     assert_eq!(entries.len(), 2, "passkey-only items are included");
     for e in &entries {
-        let r = PasskeyRecord::from_field_value(&e.record.to_string()).unwrap();
-        sign::assert(&r, &r.rp_id, &[1; 32], true).unwrap();
-        let key_b64 = e.record["key"].as_str().unwrap().to_string();
+        let rp = e.summary().rp_id;
+        sign::assert(e.record(), &rp, &[1; 32], true).unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&e.record().to_field_value().unwrap()).unwrap();
+        let key_b64 = stored["key"].as_str().unwrap().to_string();
         assert!(!format!("{e:?}").contains(&key_b64), "Debug must not show the key");
     }
     // Trash one item: gone from the index.
@@ -243,7 +236,7 @@ fn the_index_carries_live_passkeys_only() {
     w.delete_item(&gone).unwrap();
     let entries = index_passkeys(&mut w, &keys);
     assert_eq!(entries.len(), 1);
-    let left = PasskeyRecord::from_field_value(&entries[0].record.to_string()).unwrap();
+    let left = entries[0].summary();
     assert_eq!(left.credential_id, b.credential_id);
     assert_ne!(left.credential_id, a.credential_id);
 }
@@ -266,10 +259,10 @@ fn passkeys_survive_backup_and_restore_and_still_sign_with_the_same_prf() {
 
     let entries = index_passkeys(&mut r, &keys);
     assert_eq!(entries.len(), 1);
-    let back = PasskeyRecord::from_field_value(&entries[0].record.to_string()).unwrap();
+    let back = entries[0].record();
     assert_eq!(back.credential_id, staged.credential_id);
-    sign::assert(&back, "example.com", &[2; 32], true).unwrap();
-    let prf_after = iwcore::passkey::prf::evaluate_salts(&back, &[9; 32], None, true).unwrap();
+    sign::assert(back, "example.com", &[2; 32], true).unwrap();
+    let prf_after = iwcore::passkey::prf::evaluate_salts(back, &[9; 32], None, true).unwrap();
     assert_eq!(prf_before, prf_after, "PRF output must survive a restore");
 }
 

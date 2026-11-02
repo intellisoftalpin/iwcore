@@ -14,6 +14,9 @@
 //! - **the journal** ([`journal`]): logins created in the provider, appended
 //!   there and drained into the vault by the app on its next unlock.
 //!
+//! Passkeys in either file are signed with through [`passkeys`], so a provider
+//! never decodes a passkey record or holds its private key itself.
+//!
 //! Everything in this module is platform neutral. Nothing here touches the
 //! filesystem, the Keychain, or the Android Keystore: callers supply keys and
 //! receive bytes, so the same code serves both platforms.
@@ -51,6 +54,7 @@ pub mod identity;
 pub mod index;
 pub mod journal;
 pub mod keys;
+pub mod passkeys;
 pub mod wallet;
 
 pub use domain::{MatchTier, normalize_host, registrable_domain};
@@ -58,6 +62,7 @@ pub use identity::{IdentityKind, classify};
 pub use index::{IndexEntry, IndexHeader, IndexOptions};
 pub use journal::{DrainKeys, PendingOp, PendingRecord};
 pub use keys::{AutofillKeys, generate_keys};
+pub use passkeys::{HeldPasskeys, PasskeyCandidate, SignRequest, SignedAssertion, sign_from_index};
 pub use wallet::{DrainSummary, PasskeyReplacement};
 
 /// Field type holding a login password.
