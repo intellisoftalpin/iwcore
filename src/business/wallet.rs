@@ -1877,8 +1877,11 @@ pub(crate) mod tests {
         assert_eq!(restored.field_type, "NOTE", "NULL metadata falls back to NOTE");
     }
 
+    /// A raw quarantine row: record type, item id, field id, blob.
+    type QuarantineRowIn<'a> = (&'a str, &'a str, Option<&'a str>, Option<Vec<u8>>);
+
     /// Insert raw quarantine rows into a closed, migrated vault.
-    fn insert_quarantine_rows(db_path: &std::path::Path, rows: &[(&str, &str, Option<&str>, Option<Vec<u8>>)]) {
+    fn insert_quarantine_rows(db_path: &std::path::Path, rows: &[QuarantineRowIn<'_>]) {
         let conn = rusqlite::Connection::open(db_path).unwrap();
         queries::ensure_quarantine_table(&conn).unwrap();
         for (kind, item_id, field_id, blob) in rows {

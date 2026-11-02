@@ -586,6 +586,13 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_host_never_matches() {
+        assert_eq!(match_tier("", "example.com"), None);
+        assert_eq!(match_tier("example.com", ""), None);
+        assert_eq!(match_tier("", ""), None);
+    }
+
+    #[test]
     fn match_tiers_rank_as_documented() {
         assert_eq!(match_tier("example.com", "example.com"), Some(MatchTier::ExactHost));
         assert_eq!(
