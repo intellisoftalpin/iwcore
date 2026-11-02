@@ -650,6 +650,44 @@ mod tests {
     }
 
     #[test]
+    fn wrongly_typed_members_are_refused() {
+        let mut f = creation_fixture();
+        f["pubKeyCredParams"] = json!({"alg": -7});
+        assert!(CreationOptions::parse(&f.to_string()).is_err());
+        let mut f = creation_fixture();
+        f["rp"]["name"] = json!(5);
+        assert!(CreationOptions::parse(&f.to_string()).is_err());
+        let mut f = creation_fixture();
+        f["extensions"]["prf"]["eval"] = json!("salt");
+        assert!(CreationOptions::parse(&f.to_string()).is_err());
+        let mut f = request_fixture();
+        f["extensions"]["prf"]["evalByCredential"] = json!([1, 2]);
+        assert!(RequestOptions::parse(&f.to_string()).is_err());
+    }
+
+    #[test]
+    fn optional_prf_members_and_user_verification_values() {
+        let mut f = request_fixture();
+        f["extensions"]["prf"] = json!({"evalByCredential": null});
+        let o = RequestOptions::parse(&f.to_string()).unwrap();
+        assert_eq!(o.prf, Some(PrfRequest { eval: None, by_credential: Vec::new() }));
+        let mut f = creation_fixture();
+        f["extensions"]["prf"] = json!({});
+        assert_eq!(CreationOptions::parse(&f.to_string()).unwrap().prf, Some(PrfCreate { eval: None }));
+
+        for (value, expected) in [
+            (json!("discouraged"), UserVerification::Discouraged),
+            (json!("required"), UserVerification::Required),
+            (json!("someday"), UserVerification::Preferred),
+            (json!(7), UserVerification::Preferred),
+        ] {
+            let mut f = request_fixture();
+            f["userVerification"] = value;
+            assert_eq!(RequestOptions::parse(&f.to_string()).unwrap().user_verification, expected);
+        }
+    }
+
+    #[test]
     fn other_credential_types_in_lists_are_ignored() {
         let mut f = request_fixture();
         f["allowCredentials"] = json!([{"type": "password", "id": "!!"}, {"type": "public-key", "id": e(&[1; 16])}]);
@@ -741,6 +779,24 @@ mod tests {
         let v: Value = serde_json::from_str(&registration_response_json(&reg, None, None)).unwrap();
         assert!(v["response"].get("clientDataJSON").is_none());
         assert!(v["clientExtensionResults"].get("prf").is_none());
+    }
+
+    #[test]
+    fn assertion_response_carries_prf_results() {
+        let a = sign::Assertion {
+            credential_id: vec![5; 16],
+            authenticator_data: vec![1; 37],
+            signature: vec![2; 70],
+            user_handle: b"u".to_vec(),
+        };
+        let both = prf::PrfOutputs { first: zeroize::Zeroizing::new([3; 32]), second: Some(zeroize::Zeroizing::new([4; 32])) };
+        let v: Value = serde_json::from_str(&assertion_response_json(&a, None, Some(&both))).unwrap();
+        assert_eq!(v["clientExtensionResults"]["prf"]["results"]["first"], e(&[3; 32]));
+        assert_eq!(v["clientExtensionResults"]["prf"]["results"]["second"], e(&[4; 32]));
+        assert!(v["response"].get("clientDataJSON").is_none());
+        let one = prf::PrfOutputs { first: zeroize::Zeroizing::new([3; 32]), second: None };
+        let v: Value = serde_json::from_str(&assertion_response_json(&a, None, Some(&one))).unwrap();
+        assert!(v["clientExtensionResults"]["prf"]["results"].get("second").is_none());
     }
 
     #[test]
