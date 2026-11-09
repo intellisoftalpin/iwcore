@@ -801,9 +801,9 @@ impl Wallet {
                 // NULL/empty blobs exist in real legacy databases (the old
                 // sqlite-net layer wrote and read them without complaint);
                 // migrate them as empty names rather than failing.
-                let decrypted: Option<String> = match blob.as_deref() {
-                    None => Some(String::new()),
-                    Some([]) => Some(String::new()),
+                let decrypted: Option<Zeroizing<String>> = match blob.as_deref() {
+                    None => Some(Zeroizing::default()),
+                    Some([]) => Some(Zeroizing::default()),
                     Some(bytes) => match legacy_key.decrypt(bytes) {
                         Ok(plaintext) => {
                             count_mode(&mut summary, legacy_key.preferred_mode());
@@ -851,9 +851,9 @@ impl Wallet {
                     summary.fields_quarantined += 1;
                     continue;
                 }
-                let decrypted: Option<String> = match blob.as_deref() {
-                    None => Some(String::new()),
-                    Some([]) => Some(String::new()),
+                let decrypted: Option<Zeroizing<String>> = match blob.as_deref() {
+                    None => Some(Zeroizing::default()),
+                    Some([]) => Some(Zeroizing::default()),
                     Some(bytes) => match legacy_key.decrypt(bytes) {
                         Ok(plaintext) => {
                             count_mode(&mut summary, legacy_key.preferred_mode());
