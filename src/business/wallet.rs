@@ -243,7 +243,7 @@ impl Wallet {
     /// Create a new wallet in the specified folder. New wallets are born at the
     /// current (v6) scheme; legacy crypto is never written.
     pub fn create(folder: &Path, password: &str, lang: &str) -> Result<Self> {
-        std::fs::create_dir_all(folder)?;
+        crate::utils::private_fs::create_dir_all(folder)?;
 
         let db_path = folder.join(DATABASE_FILENAME);
         let db = Database::create(&db_path)?;
