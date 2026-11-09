@@ -44,6 +44,16 @@ pub struct DrainSummary {
     /// applied. Nonzero means the journal was written by something else, or
     /// tagged under a key from before a rotation.
     pub unauthenticated: usize,
+    /// Authenticated records an earlier drain already applied, so not
+    /// applied again (see [`Wallet::drain_autofill_journal`]). Nonzero after
+    /// a crash between a drain and deleting the journal, or when old journal
+    /// bytes come back.
+    pub already_applied: usize,
+    /// Bytes at the end of the journal the drain could not read as records
+    /// (see [`journal::DrainRead::unparsed_bytes`]). Nonzero means records
+    /// may have been lost to this drain: keep the journal instead of deleting
+    /// it.
+    pub unparsed_bytes: usize,
 }
 
 /// A staged passkey waiting for the user to confirm that it replaces a live
@@ -59,6 +69,8 @@ pub struct PasskeyReplacement {
 /// What became of one staged passkey.
 enum PasskeyOutcome {
     AlreadyThere,
+    /// Applied by an earlier drain and no longer in the vault: not added again.
+    AlreadyApplied,
     NeedsConfirmation(Box<PasskeyReplacement>),
     AttachedTo(String),
     Created(String),
@@ -124,9 +136,20 @@ impl Wallet {
     /// Import staged logins from the journal into the vault.
     ///
     /// Uses the app-private journal key, so it works regardless of whether the
-    /// index key has since been rotated or invalidated. Deduplicates by
-    /// `record_id`, so a crash between writing an item and deleting the journal
-    /// cannot double-import on the next attempt.
+    /// index key has since been rotated or invalidated.
+    ///
+    /// Each record is applied at most once per vault. The vault remembers the
+    /// `record_id` of every record it applied (bounded, with a `created_at`
+    /// floor for ids it no longer keeps), in the same transaction as the
+    /// drain, and skips them on any later drain: a crash between writing an
+    /// item and deleting the journal cannot double-import, and journal bytes
+    /// that come back later cannot undo a change made since. Such records are
+    /// counted in [`DrainSummary::already_applied`]. A staged passkey still
+    /// waiting in the trash for confirmation is reported again, so the
+    /// question is not lost.
+    ///
+    /// Records are applied in `created_at` order (file order among equal
+    /// times), so of two captures for the same login the later one wins.
     ///
     /// Applies only records that prove they were written by the provider: a
     /// valid tag under `keys.auth_key`, or for legacy records a provider wrap
@@ -167,11 +190,20 @@ impl Wallet {
         self.ensure_unlocked()?;
 
         let read = journal::open_for_drain(journal_bytes, keys);
-        let records = journal::dedupe(read.records);
+        let mut records = journal::dedupe(read.records);
+        records.sort_by_key(|r| r.created_at);
         // All or nothing: a failure part-way leaves the vault as it was, and the
         // journal, which is only deleted after a successful drain, is retried.
-        let mut summary = self.in_transaction(|w| w.drain_records(records, folder_id))?;
+        // The applied set is written in the same transaction.
+        let mut summary = self.in_transaction(|w| {
+            let seen: Vec<(String, i64)> = records.iter().map(|r| (r.record_id.clone(), r.created_at)).collect();
+            let applied = super::applied::load(w.drain_connection()?)?;
+            let summary = w.drain_records(records, folder_id, &applied)?;
+            super::applied::remember(w.drain_connection()?, &seen)?;
+            Ok(summary)
+        })?;
         summary.unauthenticated = read.unauthenticated;
+        summary.unparsed_bytes = read.unparsed_bytes;
         Ok(summary)
     }
 
@@ -213,7 +245,19 @@ impl Wallet {
         })
     }
 
-    fn drain_records(&mut self, records: Vec<PendingRecord>, folder_id: Option<&str>) -> Result<DrainSummary> {
+    fn drain_connection(&self) -> Result<&rusqlite::Connection> {
+        self.db
+            .as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()
+    }
+
+    fn drain_records(
+        &mut self,
+        records: Vec<PendingRecord>,
+        folder_id: Option<&str>,
+        applied: &super::applied::Applied,
+    ) -> Result<DrainSummary> {
         let folder = self.resolve_autofill_folder(folder_id)?;
 
         // Snapshot of the login-shaped vault, taken once. It is kept current by
@@ -232,11 +276,14 @@ impl Wallet {
             passkeys_added: 0,
             pending_replacements: Vec::new(),
             unauthenticated: 0,
+            already_applied: 0,
+            unparsed_bytes: 0,
         };
 
         for record in records {
+            let replayed = applied.contains(&record);
             if record.op == PendingOp::CreatePasskey {
-                match self.apply_staged_passkey(&record, &known, &folder)? {
+                match self.apply_staged_passkey(&record, &known, &folder, replayed)? {
                     PasskeyOutcome::NeedsConfirmation(pending) => summary.pending_replacements.push(*pending),
                     PasskeyOutcome::AttachedTo(item_id) => {
                         summary.passkeys_added = summary.passkeys_added.saturating_add(1);
@@ -247,8 +294,13 @@ impl Wallet {
                         summary.created.push(item_id);
                     }
                     PasskeyOutcome::AlreadyThere => summary.unchanged = summary.unchanged.saturating_add(1),
+                    PasskeyOutcome::AlreadyApplied => summary.already_applied = summary.already_applied.saturating_add(1),
                     PasskeyOutcome::Invalid => summary.skipped = summary.skipped.saturating_add(1),
                 }
+                continue;
+            }
+            if replayed {
+                summary.already_applied = summary.already_applied.saturating_add(1);
                 continue;
             }
 
@@ -306,11 +358,15 @@ impl Wallet {
     ///    curated list login ranking uses), **and** whose identity equals the
     ///    user name (ignoring ASCII case): the passkey is added to that item;
     /// 4. otherwise a new item in the `AutoFill` folder.
+    ///
+    /// A `replayed` record (applied by an earlier drain) only gets step 1:
+    /// anything that would add it again is [`PasskeyOutcome::AlreadyApplied`].
     fn apply_staged_passkey(
         &mut self,
         record: &PendingRecord,
         known: &[index::IndexEntry],
         folder: &str,
+        replayed: bool,
     ) -> Result<PasskeyOutcome> {
         let Some(passkey) = record.staged_passkey() else { return Ok(PasskeyOutcome::Invalid) };
         let value = passkey.to_field_value()?;
@@ -337,6 +393,9 @@ impl Wallet {
                 })),
                 None => PasskeyOutcome::AlreadyThere,
             });
+        }
+        if replayed {
+            return Ok(PasskeyOutcome::AlreadyApplied);
         }
         if let Some((item_id, field_id, current)) = same_account(None) {
             let staged_field = self.add_field_unchecked(item_id, FIELD_PASSKEY, &value, None)?;
@@ -743,8 +802,9 @@ mod tests {
             "a re-drained record must not become a second item"
         );
         assert_eq!(
-            second.unchanged, 1,
-            "the repeated record_id collapses to one, and that one is already in the vault"
+            (second.already_applied, second.unchanged),
+            (1, 0),
+            "the repeated record_id collapses to one, and the vault remembers applying it"
         );
         assert_eq!(second.folder_id, first.folder_id, "folder is reused");
     }
@@ -1202,6 +1262,123 @@ mod tests {
             .filter(|f| !f.deleted && f.field_type == field_type)
             .min_by_key(|f| f.sort_weight)
             .map(|f| f.value.clone())
+    }
+
+    fn sealed(keys: &crate::autofill::AutofillKeys, records: &[PendingRecord]) -> Vec<u8> {
+        let mut journal = Vec::new();
+        for r in records {
+            journal.extend_from_slice(
+                &journal::seal_record(r, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap(),
+            );
+        }
+        journal
+    }
+
+    fn set_password(w: &mut Wallet, item_id: &str, password: &str) {
+        let field = w
+            .get_fields_by_item(item_id)
+            .unwrap()
+            .iter()
+            .find(|f| !f.deleted && f.field_type == FIELD_PASSWORD)
+            .map(|f| f.field_id.clone())
+            .unwrap();
+        w.update_field(&field, password, None).unwrap();
+    }
+
+    #[test]
+    fn old_journal_bytes_drained_again_do_not_roll_a_password_back() {
+        for explicit_update in [false, true] {
+            let (mut w, dir) = wallet();
+            let keys = generate_keys().unwrap();
+            let item = login(&mut w, "GitHub", "https://github.com/login", "bkv", "v1");
+
+            let mut capture = capture("c1", "https://github.com/login", "bkv", "v2");
+            if explicit_update {
+                capture.op = PendingOp::UpdatePassword;
+                capture.item_id = Some(item.clone());
+            }
+            let journal = sealed(&keys, &[capture]);
+            let first = w.drain_autofill_journal(&journal, &dk(&keys), None).unwrap();
+            assert_eq!(first.updated, vec![item.clone()]);
+            assert_eq!(password_of(&mut w, &item, FIELD_PASSWORD).as_deref(), Some("v2"));
+
+            // The user changes the password in the app; later the same bytes
+            // are drained again, even after the vault was closed and reopened.
+            set_password(&mut w, &item, "v3");
+            w.close();
+            let mut w = Wallet::open(dir.path()).unwrap();
+            assert!(w.unlock("test-password").unwrap());
+
+            let again = w.drain_autofill_journal(&journal, &dk(&keys), Some(&first.folder_id)).unwrap();
+            assert_eq!(again.already_applied, 1);
+            assert!(again.updated.is_empty() && again.created.is_empty());
+            assert_eq!(password_of(&mut w, &item, FIELD_PASSWORD).as_deref(), Some("v3"), "explicit: {explicit_update}");
+        }
+    }
+
+    #[test]
+    fn a_drain_reports_a_journal_it_could_not_read_to_the_end() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let good = sealed(&keys, &[record("r1", "bkv")]);
+        let clean = w.drain_autofill_journal(&good, &dk(&keys), None).unwrap();
+        assert_eq!(clean.unparsed_bytes, 0);
+
+        let mut torn = sealed(&keys, &[record("r2", "other")]);
+        torn.truncate(torn.len() / 2);
+        let torn_len = torn.len();
+        let summary = w.drain_autofill_journal(&torn, &dk(&keys), Some(&clean.folder_id)).unwrap();
+        assert_eq!(summary.unparsed_bytes, torn_len);
+        assert!(summary.created.is_empty());
+    }
+
+    #[test]
+    fn a_replayed_record_is_refused_inside_a_journal_with_new_ones() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let old = sealed(&keys, &[capture("c1", "https://a.example/login", "bkv", "pw-a")]);
+        w.drain_autofill_journal(&old, &dk(&keys), None).unwrap();
+
+        let mut mixed = sealed(&keys, &[capture("c2", "https://b.example/login", "bkv", "pw-b")]);
+        mixed.extend_from_slice(&old);
+        let summary = w.drain_autofill_journal(&mixed, &dk(&keys), None).unwrap();
+        assert_eq!((summary.created.len(), summary.already_applied), (1, 1));
+    }
+
+    #[test]
+    fn records_apply_in_creation_order_not_file_order() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let item = login(&mut w, "GitHub", "https://github.com/login", "bkv", "v1");
+
+        let mut newer = capture("c-new", "https://github.com/login", "bkv", "newer");
+        newer.created_at = 2_000;
+        let mut older = capture("c-old", "https://github.com/login", "bkv", "older");
+        older.created_at = 1_000;
+        let journal = sealed(&keys, &[newer, older]);
+        w.drain_autofill_journal(&journal, &dk(&keys), None).unwrap();
+
+        assert_eq!(password_of(&mut w, &item, FIELD_PASSWORD).as_deref(), Some("newer"));
+        assert_eq!(password_of(&mut w, &item, FIELD_OLD_PASSWORD).as_deref(), Some("older"));
+    }
+
+    #[test]
+    fn a_replayed_passkey_whose_item_was_purged_is_not_added_again() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let (j, _) = staged_passkey(&keys, "p1", b"handle");
+        let first = w.drain_autofill_journal(&j, &dk(&keys), None).unwrap();
+        assert_eq!(first.passkeys_added, 1);
+        let item = first.created[0].clone();
+        // Gone for good, trash included.
+        let conn = w.drain_connection().unwrap();
+        conn.execute("DELETE FROM nswallet_fields WHERE item_id = ?1", [&item]).unwrap();
+        conn.execute("DELETE FROM nswallet_items WHERE item_id = ?1", [&item]).unwrap();
+        w.clear_caches();
+
+        let again = w.drain_autofill_journal(&j, &dk(&keys), None).unwrap();
+        assert_eq!((again.passkeys_added, again.already_applied), (0, 1));
+        assert!(w.list_passkeys().unwrap().is_empty());
     }
 
     #[test]

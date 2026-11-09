@@ -228,6 +228,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_backslash_link_names_the_site_a_browser_opens() {
+        let link = "https://bank.com\\@evil.com/login";
+        assert_eq!(login_assetlinks_url(link).as_deref(), Some("https://bank.com/.well-known/assetlinks.json"));
+        assert!(web_domain_matches_url("bank.com", link));
+        assert!(!web_domain_matches_url("evil.com", link));
+    }
+
+    #[test]
     fn rp_id_against_origin_table() {
         let ok = [
             ("example.com", "https://example.com"),

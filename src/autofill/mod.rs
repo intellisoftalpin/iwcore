@@ -48,6 +48,7 @@
     )
 )]
 
+mod applied;
 pub mod crypto;
 pub mod domain;
 pub mod identity;
@@ -60,7 +61,7 @@ pub mod wallet;
 pub use domain::{MatchTier, normalize_host, registrable_domain};
 pub use identity::{IdentityKind, classify};
 pub use index::{IndexEntry, IndexHeader, IndexOptions};
-pub use journal::{DrainKeys, PendingOp, PendingRecord};
+pub use journal::{DrainKeys, PendingLogin, PendingOp, PendingRecord};
 pub use keys::{AutofillKeys, generate_keys};
 pub use passkeys::{HeldPasskeys, PasskeyCandidate, SignRequest, SignedAssertion, sign_from_index};
 pub use wallet::{DrainSummary, PasskeyReplacement};
