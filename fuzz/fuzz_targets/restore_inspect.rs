@@ -1,15 +1,17 @@
 //! A backup file comes from outside (another device, a download, a share):
-//! untrusted. Inspecting it, reading its version and checking compatibility
-//! must return an error for any bytes, never panic or run for long.
+//! untrusted. Inspecting it, reading its version, checking compatibility and
+//! checking a password against it must return an error for any bytes, never
+//! panic or run for long.
 //!
 //! The first byte picks the shape: odd = the bytes are the whole backup file,
 //! even = the bytes are the database inside an otherwise well-formed backup,
 //! so the database checks are reached without the fuzzer first having to
-//! build a valid zip.
+//! build a valid zip. `fuzz/seeds/restore` holds small v6 and legacy wallet
+//! databases in that shape.
 #![no_main]
 use std::io::Write;
 
-use iwcore::backup::{inspect_backup_in, is_backup_compatible_in};
+use iwcore::backup::{check_backup_password_in, inspect_backup_in, is_backup_compatible_in};
 use libfuzzer_sys::fuzz_target;
 
 fn zip_with_database(db: &[u8]) -> Vec<u8> {
@@ -34,4 +36,5 @@ fuzz_target!(|data: &[u8]| {
     let temp_base = dir.path().join("tmp");
     let _ = inspect_backup_in(&backup, &temp_base);
     let _ = is_backup_compatible_in(&backup, "6", &temp_base);
+    let _ = check_backup_password_in(&backup, "Sun001!", &temp_base);
 });

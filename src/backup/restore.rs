@@ -1096,6 +1096,25 @@ mod tests {
         assert!(db_path.exists());
     }
 
+    /// The fuzz seeds for backups stay valid wallet databases.
+    #[test]
+    fn the_restore_fuzz_seeds_pass_inspection() {
+        let seeds = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fuzz/seeds/restore");
+        // The published crate leaves out the fuzz folder.
+        if !seeds.exists() {
+            return;
+        }
+        for name in ["wallet_v6", "wallet_legacy"] {
+            let bytes = fs::read(seeds.join(name)).unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let backup_path = temp_dir.path().join("iwb-20260101-120000-manual.zip");
+            zip_with_db_entry(&backup_path, &bytes[1..]);
+            let base = temp_dir.path().join("tmp");
+            inspect_backup_in(&backup_path, &base).unwrap();
+            assert!(!check_backup_password_in(&backup_path, "Sun001!", &base).unwrap(), "{name}");
+        }
+    }
+
     /// Test: CheckFutureVersionOfDb from C# BackupFixture
     /// Database with version 999 should NOT be compatible
     #[test]

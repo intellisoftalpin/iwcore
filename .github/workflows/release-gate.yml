@@ -95,6 +95,10 @@ jobs:
           - target: cxf_import_apply
             max_len: 1048576
             seeds: seeds/cxf
+          # Room for a small wallet database, starting from fuzz/seeds/restore.
+          - target: restore_inspect
+            max_len: 65536
+            seeds: seeds/restore
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -105,11 +109,12 @@ jobs:
         working-directory: fuzz
         # The prebuilt cargo-fuzz is a static musl binary and would otherwise
         # build the fuzzer for musl, where the sanitizers cannot run.
+        # An input that runs for more than 10 s counts as a failure.
         run: |
           mkdir -p corpus/${{ matrix.target }}
           cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} \
             corpus/${{ matrix.target }} ${{ matrix.seeds }} \
-            -- -max_total_time=1800 -rss_limit_mb=2048 -max_len=${{ matrix.max_len || 4096 }}
+            -- -max_total_time=1800 -timeout=10 -rss_limit_mb=2048 -max_len=${{ matrix.max_len || 4096 }}
       - name: Keep the crashing input
         if: failure()
         uses: actions/upload-artifact@v7
