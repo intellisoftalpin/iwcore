@@ -22,7 +22,7 @@ use std::path::Path;
 
 use rusqlite::config::DbConfig;
 use rusqlite::limits::Limit;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::error::{Result, WalletError};
 
@@ -192,11 +192,55 @@ fn check_wallet_tables(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The one view a restored database may hold: older vaults carry it, and
+/// iwcore never reads it.
+const LEGACY_LABELS_VIEW: &str = "nswallet_labels_view";
+
+/// Require a schema that is safe to open as the live vault, where the schema
+/// is trusted and the app writes: no triggers, no views other than
+/// [`LEGACY_LABELS_VIEW`], no virtual tables, no generated or hidden columns
+/// in any table and no indexes on expressions or with a `WHERE` clause.
+pub(crate) fn check_restorable_schema(conn: &Connection) -> Result<()> {
+    let refused: Option<String> = conn
+        .query_row(
+            "SELECT type || ' ' || name FROM sqlite_schema
+             WHERE type = 'trigger'
+                OR (type = 'view' AND lower(name) <> ?1)
+                OR (type = 'table' AND upper(substr(ltrim(sql), 1, 14)) = 'CREATE VIRTUAL')
+             LIMIT 1",
+            [LEGACY_LABELS_VIEW],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(object) = refused {
+        return Err(not_a_wallet(&format!("the schema holds {object}")));
+    }
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table'")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for table in &tables {
+        if has_computed_columns(conn, table)? {
+            return Err(not_a_wallet(&format!("{table} has computed columns")));
+        }
+        let odd_index: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_index_list(?1, 'main') l
+                 WHERE l.partial <> 0
+                    OR EXISTS (SELECT 1 FROM pragma_index_xinfo(l.name, 'main') x WHERE x.cid = -2))",
+            [table],
+            |row| row.get(0),
+        )?;
+        if odd_index {
+            return Err(not_a_wallet(&format!("{table} has an index on an expression or a condition")));
+        }
+    }
+    Ok(())
+}
+
 /// The database version stored in `nswallet_properties`, `"1"` when the
 /// table has no row or no usable value (as the oldest databases).
 pub(crate) fn read_db_version(conn: &Connection) -> Result<String> {
     use rusqlite::types::Value;
-    use rusqlite::OptionalExtension;
 
     let value = conn
         .query_row("SELECT version FROM nswallet_properties LIMIT 1", [], |row| {
