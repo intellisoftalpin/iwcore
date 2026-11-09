@@ -49,6 +49,11 @@ pub struct DrainSummary {
     /// a crash between a drain and deleting the journal, or when old journal
     /// bytes come back.
     pub already_applied: usize,
+    /// Bytes at the end of the journal the drain could not read as records
+    /// (see [`journal::DrainRead::unparsed_bytes`]). Nonzero means records
+    /// may have been lost to this drain: keep the journal instead of deleting
+    /// it.
+    pub unparsed_bytes: usize,
 }
 
 /// A staged passkey waiting for the user to confirm that it replaces a live
@@ -198,6 +203,7 @@ impl Wallet {
             Ok(summary)
         })?;
         summary.unauthenticated = read.unauthenticated;
+        summary.unparsed_bytes = read.unparsed_bytes;
         Ok(summary)
     }
 
@@ -271,6 +277,7 @@ impl Wallet {
             pending_replacements: Vec::new(),
             unauthenticated: 0,
             already_applied: 0,
+            unparsed_bytes: 0,
         };
 
         for record in records {
@@ -1307,6 +1314,22 @@ mod tests {
             assert!(again.updated.is_empty() && again.created.is_empty());
             assert_eq!(password_of(&mut w, &item, FIELD_PASSWORD).as_deref(), Some("v3"), "explicit: {explicit_update}");
         }
+    }
+
+    #[test]
+    fn a_drain_reports_a_journal_it_could_not_read_to_the_end() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let good = sealed(&keys, &[record("r1", "bkv")]);
+        let clean = w.drain_autofill_journal(&good, &dk(&keys), None).unwrap();
+        assert_eq!(clean.unparsed_bytes, 0);
+
+        let mut torn = sealed(&keys, &[record("r2", "other")]);
+        torn.truncate(torn.len() / 2);
+        let torn_len = torn.len();
+        let summary = w.drain_autofill_journal(&torn, &dk(&keys), Some(&clean.folder_id)).unwrap();
+        assert_eq!(summary.unparsed_bytes, torn_len);
+        assert!(summary.created.is_empty());
     }
 
     #[test]

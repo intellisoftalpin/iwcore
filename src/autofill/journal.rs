@@ -27,7 +27,10 @@
 //! also carries an HMAC-SHA256 tag under the journal auth key (see
 //! [`super::keys`]), a symmetric key held only by the app and its provider, so
 //! the drain applies exactly the records the provider wrote. The tag covers every payload byte before it, version
-//! included, so no part of a record can be altered or exchanged.
+//! included, so no part of a record can be altered or exchanged. The tag does
+//! not say when a record was written, so the vault also remembers which
+//! records it has applied and never applies one twice (see
+//! [`crate::Wallet::drain_autofill_journal`]).
 //!
 //! The drain ([`open_for_drain`]) verifies the tag before it unwraps anything
 //! and refuses a record whose tag does not verify. Such records are counted in
@@ -64,7 +67,10 @@
 //! is only ever appended to. A torn final write costs at most the last record;
 //! every earlier one still opens. Both readers below stop at the first
 //! malformed record and return everything they parsed before it, rather than
-//! failing the whole file.
+//! failing the whole file. Anything after that point is lost to the reader,
+//! including records appended after a torn write; the drain reports how many
+//! bytes it could not read in [`DrainRead::unparsed_bytes`], so the caller can
+//! keep the journal instead of deleting it.
 
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
@@ -527,6 +533,11 @@ pub struct DrainRead {
     /// Well-framed records that were refused because they carry no valid tag
     /// (or, for format 1, no provider wrap under a supplied legacy key).
     pub unauthenticated: usize,
+    /// Bytes at the end of the journal that could not be read as records: a
+    /// torn write, and everything appended after it. Zero for a journal that
+    /// read cleanly to its end. Nonzero means records may have been lost to
+    /// this read, so the journal should be kept rather than deleted.
+    pub unparsed_bytes: usize,
 }
 
 /// Open every record the drain may apply. This is the drain path, and it works
@@ -539,7 +550,7 @@ pub struct DrainRead {
 /// [`DrainRead::unauthenticated`].
 pub fn open_for_drain(journal: &[u8], keys: &DrainKeys<'_>) -> DrainRead {
     let mut unauthenticated = 0usize;
-    let records = parse(journal, |parsed| {
+    let (records, unparsed_bytes) = parse(journal, |parsed| {
         let key = match parsed.tag {
             Some(tag) => {
                 if !tag_verifies(keys.auth_key, parsed.signed, tag) {
@@ -570,7 +581,7 @@ pub fn open_for_drain(journal: &[u8], keys: &DrainKeys<'_>) -> DrainRead {
         };
         Ok(key)
     });
-    DrainRead { records, unauthenticated }
+    DrainRead { records, unauthenticated, unparsed_bytes }
 }
 
 fn unauthenticated_record() -> WalletError {
@@ -586,6 +597,7 @@ pub fn open_with_index_key(journal: &[u8], index_key: &[u8; KEY_LEN]) -> Vec<Pen
         let key = crypto::open(index_key, parsed.wrap_to_index, &header)?;
         into_key(key)
     })
+    .0
 }
 
 /// Count the framed records in a journal without opening any of them.
@@ -610,11 +622,13 @@ pub fn count_records(journal: &[u8]) -> usize {
 /// the data, or a length that does not fit the address space all end it.
 struct Frames<'a> {
     rest: &'a [u8],
+    /// Bytes of the frames returned so far, length prefixes included.
+    consumed: usize,
 }
 
 impl<'a> Frames<'a> {
     fn new(journal: &'a [u8]) -> Self {
-        Self { rest: journal }
+        Self { rest: journal, consumed: 0 }
     }
 }
 
@@ -631,6 +645,7 @@ impl<'a> Iterator for Frames<'a> {
         }
         let (payload, rest) = after.split_at_checked(len)?;
         self.rest = rest;
+        self.consumed = self.consumed.saturating_add(4).saturating_add(len);
         Some(payload)
     }
 }
@@ -688,19 +703,22 @@ struct ParsedRecord<'a> {
 /// Walk the framed stream, unwrapping each record with `unwrap_key`.
 ///
 /// Stops at the first structurally malformed record and returns everything
-/// parsed so far. A record that is well-framed but fails to open (wrong key,
+/// parsed so far, with the number of bytes from that point to the end. A record that is well-framed but fails to open (wrong key,
 /// tampering) is skipped while parsing continues, so one bad record cannot hide
 /// the ones after it.
-fn parse<F>(journal: &[u8], mut unwrap_key: F) -> Vec<PendingRecord>
+fn parse<F>(journal: &[u8], mut unwrap_key: F) -> (Vec<PendingRecord>, usize)
 where
     F: FnMut(&ParsedRecord<'_>) -> Result<Zeroizing<[u8; KEY_LEN]>>,
 {
     let mut out = Vec::new();
+    let mut frames = Frames::new(journal);
+    let mut read_up_to = 0usize;
 
-    for payload in Frames::new(journal) {
+    while let Some(payload) = frames.next() {
         let Some(parsed) = split_payload(payload) else {
             break; // structurally broken, cannot trust anything past here
         };
+        read_up_to = frames.consumed;
         let Ok(key) = unwrap_key(&parsed) else {
             continue; // not ours to read, or tampered; later records may be fine
         };
@@ -713,7 +731,7 @@ where
         }
     }
 
-    out
+    (out, journal.len().saturating_sub(read_up_to))
 }
 
 fn split_payload(payload: &[u8]) -> Option<ParsedRecord<'_>> {
@@ -1127,6 +1145,42 @@ mod tests {
 
         let parsed: PendingLogin = serde_json::from_str(minimal).unwrap();
         assert!(!format!("{parsed:?}").contains("p-secret-9"), "Debug redacts the password");
+    }
+
+    #[test]
+    fn the_drain_reports_what_it_could_not_read() {
+        let keys = generate_keys().unwrap();
+        let dk = DrainKeys { journal_secret: &keys.journal_secret, auth_key: &keys.journal_auth_key, legacy_wrap_keys: &[] };
+        let seal = |id: &str| seal_record(&record(id), &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
+
+        let clean = [seal("a"), seal("b")].concat();
+        let read = open_for_drain(&clean, &dk);
+        assert_eq!((read.records.len(), read.unparsed_bytes), (2, 0));
+        assert_eq!(open_for_drain(&[], &dk).unparsed_bytes, 0);
+
+        // A torn write, then a later append: the later record is lost to the
+        // reader, and the drain says how much it could not read.
+        let first = seal("a");
+        let torn = seal("torn");
+        let torn = &torn[..torn.len() / 2];
+        let later = seal("c");
+        let journal = [first.clone(), torn.to_vec(), later.clone()].concat();
+        let read = open_for_drain(&journal, &dk);
+        assert_eq!(read.records.iter().map(|r| r.record_id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        // The torn frame's length runs into the later record, which then no
+        // longer frames: some of the journal is left unread, and reported.
+        assert!(read.unparsed_bytes > 0 && read.unparsed_bytes < torn.len() + later.len(), "{}", read.unparsed_bytes);
+        assert_eq!(read.unauthenticated, 1, "the misaligned frame does not verify");
+
+        // A torn final write only.
+        let journal = [first.clone(), torn.to_vec()].concat();
+        assert_eq!(open_for_drain(&journal, &dk).unparsed_bytes, torn.len());
+
+        // A well-framed record that does not open is read, not unparsed.
+        let other = generate_keys().unwrap();
+        let foreign = seal_record(&record("x"), &other.journal_public, &other.index_key, &other.journal_auth_key).unwrap();
+        let read = open_for_drain(&[foreign, first].concat(), &dk);
+        assert_eq!((read.records.len(), read.unauthenticated, read.unparsed_bytes), (1, 1, 0));
     }
 
     #[test]
