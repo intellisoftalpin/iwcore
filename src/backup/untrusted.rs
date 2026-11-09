@@ -9,13 +9,19 @@
 //! - every statement on the connection shares one work budget, enforced by a
 //!   progress handler, so no query can run for long;
 //! - `PRAGMA quick_check` must report `ok`;
-//! - the wallet tables must be real tables, not views or virtual tables.
+//! - SQLite's size limits are lowered (string and blob length, expression
+//!   depth, function arguments, columns), so no single value or expression
+//!   can grow large;
+//! - `PRAGMA quick_check` must report `ok`;
+//! - the wallet tables must be real tables, not views or virtual tables, and
+//!   must not have generated or hidden columns.
 
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
 use rusqlite::config::DbConfig;
+use rusqlite::limits::Limit;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::error::{Result, WalletError};
@@ -41,6 +47,19 @@ const REQUIRED_TABLES: [&str; 3] = ["nswallet_items", "nswallet_fields", "nswall
 
 /// Tables that are optional, but must be real tables when present.
 const OPTIONAL_TABLES: [&str; 1] = ["nswallet_crypto"];
+
+/// Largest string or blob on an untrusted connection: 16 MiB. Wallet values
+/// are kilobytes at most.
+pub(crate) const MAX_VALUE_BYTES: i32 = 16 * 1024 * 1024;
+
+/// Deepest expression tree on an untrusted connection.
+const MAX_EXPR_DEPTH: i32 = 100;
+
+/// Most arguments to one SQL function on an untrusted connection.
+const MAX_FUNCTION_ARGS: i32 = 16;
+
+/// Most columns in a table, index or result on an untrusted connection.
+const MAX_COLUMNS: i32 = 100;
 
 /// Whether `bytes` starts with the SQLite file header.
 pub(crate) fn has_sqlite_header(bytes: &[u8]) -> bool {
@@ -91,6 +110,7 @@ pub(crate) fn open_untrusted_with_budget(path: &Path, budget_checks: u64) -> Res
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
     conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA query_only = 1;")?;
+    set_limits(&conn)?;
 
     let mut checks: u64 = 0;
     conn.progress_handler(
@@ -112,7 +132,30 @@ pub(crate) fn open_untrusted_with_budget(path: &Path, budget_checks: u64) -> Res
     Ok(conn)
 }
 
-/// Require the wallet tables to be ordinary tables of the main schema.
+/// Lower SQLite's size limits on an untrusted connection.
+fn set_limits(conn: &Connection) -> Result<()> {
+    for (limit, value) in [
+        (Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES),
+        (Limit::SQLITE_LIMIT_EXPR_DEPTH, MAX_EXPR_DEPTH),
+        (Limit::SQLITE_LIMIT_FUNCTION_ARG, MAX_FUNCTION_ARGS),
+        (Limit::SQLITE_LIMIT_COLUMN, MAX_COLUMNS),
+    ] {
+        conn.set_limit(limit, value)?;
+    }
+    Ok(())
+}
+
+/// Whether `table` of the main schema has a generated or hidden column.
+fn has_computed_columns(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_xinfo(?1, 'main') WHERE hidden <> 0)",
+        [table],
+        |row| row.get(0),
+    )?)
+}
+
+/// Require the wallet tables to be ordinary tables of the main schema,
+/// without generated or hidden columns.
 /// Names are compared without case, as SQLite resolves them.
 fn check_wallet_tables(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare(
@@ -139,6 +182,11 @@ fn check_wallet_tables(conn: &Connection) -> Result<()> {
         match kind_of(name) {
             None | Some("table") => {}
             Some(_) => return Err(not_a_wallet(&format!("{name} is not a table"))),
+        }
+    }
+    for name in REQUIRED_TABLES.iter().chain(OPTIONAL_TABLES.iter()) {
+        if has_computed_columns(conn, name)? {
+            return Err(not_a_wallet(&format!("{name} has computed columns")));
         }
     }
     Ok(())
@@ -402,5 +450,84 @@ mod tests {
         let third = work_budget(std::fs::metadata(&path).unwrap().len()) / 3;
         let conn = open_untrusted_with_budget(&path, third).unwrap();
         assert_eq!(big_count(&conn).unwrap(), 200000);
+    }
+
+    /// A wallet table with a generated column is refused before any row is
+    /// read, whatever the column computes.
+    #[test]
+    fn a_wallet_table_with_a_generated_column_is_refused() {
+        for (table, column) in [
+            ("nswallet_items", "deleted INT AS (length(hex(zeroblob(1000))))"),
+            ("nswallet_fields", "deleted INT GENERATED ALWAYS AS (1) STORED"),
+            ("nswallet_properties", "version TEXT AS ('6')"),
+            ("nswallet_crypto", "id INT AS (1)"),
+        ] {
+            let others: String = ["nswallet_items", "nswallet_fields", "nswallet_properties"]
+                .iter()
+                .filter(|t| **t != table)
+                .map(|t| format!("CREATE TABLE {t} (item_id TEXT, version TEXT);"))
+                .collect();
+            let dir = TempDir::new().unwrap();
+            let path = db_with(
+                dir.path(),
+                &format!("{others} CREATE TABLE {table} (item_id TEXT, {column}); INSERT INTO {table} (item_id) VALUES ('a');"),
+            );
+            let err = open_untrusted(&path).unwrap_err();
+            assert!(
+                matches!(&err, WalletError::BackupError(m) if m.contains("computed columns")),
+                "{table}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_tables_may_have_generated_columns() {
+        let dir = TempDir::new().unwrap();
+        let path = db_with(dir.path(), &format!("{WALLET_SCHEMA} CREATE TABLE extra (a INT, b INT AS (a + 1));"));
+        open_untrusted(&path).unwrap();
+    }
+
+    #[test]
+    fn values_longer_than_the_limit_fail() {
+        let dir = TempDir::new().unwrap();
+        let path = db_with(dir.path(), WALLET_SCHEMA);
+        let conn = open_untrusted(&path).unwrap();
+        let len = |n: i32| conn.query_row("SELECT length(zeroblob(?1))", [n], |r| r.get::<_, i64>(0));
+        assert_eq!(len(MAX_VALUE_BYTES).unwrap(), i64::from(MAX_VALUE_BYTES));
+        assert!(len(MAX_VALUE_BYTES + 1).is_err());
+        assert!(conn
+            .query_row("SELECT length(hex(zeroblob(?1)))", [MAX_VALUE_BYTES / 2 + 1], |r| r.get::<_, i64>(0))
+            .is_err());
+    }
+
+    #[test]
+    fn the_size_limits_are_set() {
+        let dir = TempDir::new().unwrap();
+        let path = db_with(dir.path(), WALLET_SCHEMA);
+        let conn = open_untrusted(&path).unwrap();
+        assert_eq!(conn.limit(Limit::SQLITE_LIMIT_LENGTH).unwrap(), MAX_VALUE_BYTES);
+        assert_eq!(conn.limit(Limit::SQLITE_LIMIT_EXPR_DEPTH).unwrap(), MAX_EXPR_DEPTH);
+        assert_eq!(conn.limit(Limit::SQLITE_LIMIT_FUNCTION_ARG).unwrap(), MAX_FUNCTION_ARGS);
+        assert_eq!(conn.limit(Limit::SQLITE_LIMIT_COLUMN).unwrap(), MAX_COLUMNS);
+
+        let deep = format!("SELECT 1{}", "+1".repeat(200));
+        assert!(conn.query_row(&deep, [], |r| r.get::<_, i64>(0)).is_err());
+        let args = vec!["1"; 20].join(",");
+        assert!(conn.query_row(&format!("SELECT max({args})"), [], |r| r.get::<_, i64>(0)).is_err());
+        let cols = vec!["1"; 101].join(",");
+        assert!(conn.query_row(&format!("SELECT {cols}"), [], |r| r.get::<_, i64>(0)).is_err());
+    }
+
+    /// The schema iwcore writes passes every check.
+    #[test]
+    fn the_wallet_schema_passes_every_check() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.db");
+        let conn = Connection::open(&path).unwrap();
+        for sql in crate::database::schema::CREATE_ALL_TABLES {
+            conn.execute(sql, []).unwrap();
+        }
+        drop(conn);
+        open_untrusted(&path).unwrap();
     }
 }
