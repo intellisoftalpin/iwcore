@@ -8,10 +8,10 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use iwcore::backup::BackupManager;
 use iwcore::Wallet;
-use rusqlite::types::ValueRef;
+use iwcore::backup::BackupManager;
 use rusqlite::Connection;
+use rusqlite::types::ValueRef;
 use tempfile::TempDir;
 
 const TEST_PASSWORD: &str = "KuiperBelt30au";
@@ -19,7 +19,9 @@ const PRE_V6_BACKUP: &str = "nswallet.pre-v6.bak";
 const CHUNK: usize = 16;
 
 fn testdata(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata")
+        .join(name)
 }
 
 fn fresh_real_vault() -> (TempDir, PathBuf) {
@@ -33,7 +35,10 @@ fn fresh_real_vault() -> (TempDir, PathBuf) {
 fn legacy_blobs() -> Vec<Vec<u8>> {
     let conn = Connection::open(testdata("nswallet.dat")).unwrap();
     let mut blobs = Vec::new();
-    for sql in ["SELECT name FROM nswallet_items", "SELECT value FROM nswallet_fields"] {
+    for sql in [
+        "SELECT name FROM nswallet_items",
+        "SELECT value FROM nswallet_fields",
+    ] {
         let mut stmt = conn.prepare(sql).unwrap();
         let rows = stmt
             .query_map([], |r| r.get::<_, Option<Vec<u8>>>(0))
@@ -79,7 +84,7 @@ fn legacy_chunks(skip: &HashSet<Vec<u8>>) -> HashSet<[u8; CHUNK]> {
     legacy_blobs()
         .iter()
         .filter(|b| !skip.contains(*b))
-        .flat_map(|b| b.chunks_exact(CHUNK).map(|c| <[u8; CHUNK]>::try_from(c).unwrap()).collect::<Vec<_>>())
+        .flat_map(|b| b.as_chunks::<CHUNK>().0.to_vec())
         .filter(|c| c.iter().any(|&x| x != c[0]))
         .collect()
 }
@@ -110,8 +115,12 @@ fn zip_entry(zip_path: &Path) -> Vec<u8> {
 
 fn compacted_at(db: &Path) -> Option<String> {
     let conn = Connection::open(db).unwrap();
-    conn.query_row("SELECT compacted_at FROM nswallet_compaction WHERE id = 1", [], |r| r.get(0))
-        .ok()
+    conn.query_row(
+        "SELECT compacted_at FROM nswallet_compaction WHERE id = 1",
+        [],
+        |r| r.get(0),
+    )
+    .ok()
 }
 
 #[test]
@@ -131,14 +140,30 @@ fn upgrade_leaves_no_legacy_bytes_in_the_database_wal_or_backup() {
         .create_backup(wallet.database().unwrap(), true)
         .unwrap();
 
-    assert_eq!(count_legacy(&fs::read(&db).unwrap(), &chunks), 0, "database file");
-    assert_eq!(count_legacy(&read_or_empty(&wal(&folder)), &chunks), 0, "WAL");
+    assert_eq!(
+        count_legacy(&fs::read(&db).unwrap(), &chunks),
+        0,
+        "database file"
+    );
+    assert_eq!(
+        count_legacy(&read_or_empty(&wal(&folder)), &chunks),
+        0,
+        "WAL"
+    );
     assert_eq!(count_legacy(&zip_entry(&backup), &chunks), 0, "backup");
 
     assert!(wallet.retire_pre_v6_snapshot(backups.path()).unwrap());
     drop(wallet);
-    assert_eq!(count_legacy(&fs::read(&db).unwrap(), &chunks), 0, "database file after close");
-    assert_eq!(count_legacy(&read_or_empty(&wal(&folder)), &chunks), 0, "WAL after close");
+    assert_eq!(
+        count_legacy(&fs::read(&db).unwrap(), &chunks),
+        0,
+        "database file after close"
+    );
+    assert_eq!(
+        count_legacy(&read_or_empty(&wal(&folder)), &chunks),
+        0,
+        "WAL after close"
+    );
 }
 
 /// Turn a cleanly upgraded vault into one upgraded the old way: legacy
@@ -147,12 +172,12 @@ fn upgrade_leaves_no_legacy_bytes_in_the_database_wal_or_backup() {
 /// row shares its page with a zero-filled row that stays.
 fn plant_legacy_remnants(db: &Path) {
     let conn = Connection::open(db).unwrap();
-    conn.execute_batch(
-        "PRAGMA secure_delete = OFF; CREATE TABLE leftover (old INTEGER, b BLOB);",
-    )
-    .unwrap();
+    conn.execute_batch("PRAGMA secure_delete = OFF; CREATE TABLE leftover (old INTEGER, b BLOB);")
+        .unwrap();
     {
-        let mut insert = conn.prepare("INSERT INTO leftover (old, b) VALUES (?, ?)").unwrap();
+        let mut insert = conn
+            .prepare("INSERT INTO leftover (old, b) VALUES (?, ?)")
+            .unwrap();
         for blob in legacy_blobs() {
             let filler = vec![0u8; blob.len()];
             insert.execute(rusqlite::params![1, blob]).unwrap();
@@ -178,12 +203,17 @@ fn a_vault_upgraded_without_compaction_is_compacted_once_at_unlock() {
     }
     plant_legacy_remnants(&db);
     let chunks = legacy_chunks(&quarantined_blobs(&db));
-    assert!(count_legacy(&fs::read(&db).unwrap(), &chunks) > 1000, "remnants planted");
+    assert!(
+        count_legacy(&fs::read(&db).unwrap(), &chunks) > 1000,
+        "remnants planted"
+    );
     assert!(compacted_at(&db).is_none());
 
     // A backup taken now still carries them, and so does not count.
     let backups = TempDir::new().unwrap();
-    let old_backup = BackupManager::new(backups.path()).create_backup_from_path(&db, true).unwrap();
+    let old_backup = BackupManager::new(backups.path())
+        .create_backup_from_path(&db, true)
+        .unwrap();
     assert!(count_legacy(&zip_entry(&old_backup), &chunks) > 1000);
 
     // Opening alone changes nothing; a wrong password changes nothing.
@@ -193,8 +223,16 @@ fn a_vault_upgraded_without_compaction_is_compacted_once_at_unlock() {
 
     assert!(wallet.unlock(TEST_PASSWORD).unwrap());
     let marker = compacted_at(&db).expect("marker written at unlock");
-    assert_eq!(count_legacy(&fs::read(&db).unwrap(), &chunks), 0, "database file");
-    assert_eq!(count_legacy(&read_or_empty(&wal(&folder)), &chunks), 0, "WAL");
+    assert_eq!(
+        count_legacy(&fs::read(&db).unwrap(), &chunks),
+        0,
+        "database file"
+    );
+    assert_eq!(
+        count_legacy(&read_or_empty(&wal(&folder)), &chunks),
+        0,
+        "WAL"
+    );
     assert!(wallet.get_items().unwrap().len() > 100, "data intact");
 
     // The backup from before the rebuild does not retire the snapshot.
@@ -225,7 +263,9 @@ fn a_backup_of_another_vault_does_not_retire_the_snapshot() {
     let other_temp = TempDir::new().unwrap();
     let other = Wallet::create(other_temp.path(), "other password", "en").unwrap();
     let backups = TempDir::new().unwrap();
-    BackupManager::new(backups.path()).create_backup(other.database().unwrap(), true).unwrap();
+    BackupManager::new(backups.path())
+        .create_backup(other.database().unwrap(), true)
+        .unwrap();
     assert!(compacted_at(&other_temp.path().join("nswallet.dat")).is_some());
 
     assert!(!wallet.retire_pre_v6_snapshot(backups.path()).unwrap());

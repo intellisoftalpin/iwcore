@@ -770,7 +770,8 @@ impl Wallet {
     /// snapshot (kept until retired), then in a single transaction generate fresh key material,
     /// re-encrypt every item name and field value (active, deleted, and root)
     /// from the legacy scheme to the DEK AEAD scheme, write the crypto record,
-    /// and bump the version to 6.
+    /// and bump the version to 6. After the commit the file is rebuilt
+    /// (`VACUUM` + truncating checkpoint) and the compaction marker stored.
     ///
     /// Tolerance rules (deliberately mirroring what the 5.x app survived):
     /// NULL/empty blobs migrate as empty values; an ACTIVE record that fails
@@ -974,10 +975,10 @@ impl Wallet {
         // failure here must NOT fail the migration; the marker then stays
         // absent and the next unlock repeats the rebuild. Fall back to a
         // plain checkpoint so the file still reflects the migrated state.
-        if self.compact_file().is_err() {
-            if let Some(db) = self.db.as_ref() {
-                let _ = db.checkpoint();
-            }
+        if self.compact_file().is_err()
+            && let Some(db) = self.db.as_ref()
+        {
+            let _ = db.checkpoint();
         }
 
         // 6. Hold the DEK: the vault is now unlocked under v6. Record the
