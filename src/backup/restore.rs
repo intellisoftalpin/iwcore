@@ -298,7 +298,20 @@ pub fn check_backup_password_in(backup_path: &Path, password: &str, temp_base: &
     let temp_dir = temp_dir_in(temp_base)?;
     let db_path = extract_backup(backup_path, temp_dir.path())?;
     let conn = super::untrusted::open_untrusted(&db_path)?;
+    check_backup_kdf_params(&conn)?;
     crate::business::wallet::check_password_on(&conn, password)
+}
+
+/// Refuse a backup whose key derivation costs more than a backup may ask for
+/// (see [`crate::crypto::kdf::KdfParams::check_backup`]), before any
+/// derivation runs.
+fn check_backup_kdf_params(conn: &rusqlite::Connection) -> Result<()> {
+    if let Some(rec) = crate::database::queries::get_crypto_record(conn)? {
+        crate::crypto::kdf::KdfParams { m_cost_kib: rec.m_cost_kib, t_cost: rec.t_cost, p_cost: rec.p_cost }
+            .check_backup()
+            .map_err(|e| WalletError::BackupError(format!("crypto record: {e}")))?;
+    }
+    Ok(())
 }
 
 /// What a backup holds, read without its password. Lets an app warn before a
@@ -971,6 +984,35 @@ mod tests {
         let base = temp_dir.path().join("tmp");
         // No root and no data: the password cannot be verified.
         assert!(check_backup_password_in(&backup_path, "pw", &base).is_err());
+    }
+
+    /// A backup of a vault whose crypto record asks for more than a backup
+    /// may is refused before the password is derived.
+    #[test]
+    fn a_backup_asking_for_a_costly_key_derivation_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let wallet_dir = temp_dir.path().join("w");
+        let wallet = crate::Wallet::create(&wallet_dir, "pw", "en").unwrap();
+        drop(wallet);
+        let db = wallet_dir.join(DATABASE_FILENAME);
+        let base = temp_dir.path().join("tmp");
+        let backup_of = |name: &str| {
+            let path = temp_dir.path().join(name);
+            zip_with_db_entry(&path, &fs::read(&db).unwrap());
+            path
+        };
+        assert!(check_backup_password_in(&backup_of("ok.zip"), "pw", &base).unwrap());
+
+        let set = |sql: &str| rusqlite::Connection::open(&db).unwrap().execute_batch(sql).unwrap();
+        for sql in [
+            "UPDATE nswallet_crypto SET kdf_m_cost = 262145",
+            "UPDATE nswallet_crypto SET kdf_m_cost = 65536, kdf_t_cost = 13",
+            "UPDATE nswallet_crypto SET kdf_t_cost = 3, kdf_p_cost = 5",
+        ] {
+            set(sql);
+            let err = check_backup_password_in(&backup_of("costly.zip"), "pw", &base).unwrap_err();
+            assert!(matches!(&err, WalletError::BackupError(m) if m.contains("for a backup")), "{sql}: {err:?}");
+        }
     }
 
     /// Test: CheckFutureVersionOfDb from C# BackupFixture
