@@ -1144,7 +1144,10 @@ mod tests {
         assert!(PendingRecord::from_login_json("not json").is_err());
 
         let parsed: PendingLogin = serde_json::from_str(minimal).unwrap();
-        assert!(!format!("{parsed:?}").contains("p-secret-9"), "Debug redacts the password");
+        let shown = format!("{parsed:?}");
+        assert!(!shown.contains("p-secret-9"), "Debug redacts the password");
+        assert!(shown.starts_with("PendingLogin"), "{shown}");
+        assert!(shown.contains("\"r2\"") && shown.contains("created_at: 1"), "{shown}");
     }
 
     #[test]

@@ -1416,14 +1416,15 @@ pub(crate) mod tests {
         assert!(legacy_encryption_count(Some("4294967295")).is_err());
     }
 
-    /// A legacy vault claiming a huge encryption count fails the password
-    /// check at once instead of hashing for that long.
+    /// A legacy vault claiming an encryption count above the cap fails the
+    /// password check at once instead of hashing for that long. (The count
+    /// is just above the cap so a broken cap fails fast instead of hanging.)
     #[test]
     fn a_huge_legacy_encryption_count_fails_the_password_check() {
         let (_temp, path) = create_wallet_with_null_email();
         {
             let conn = rusqlite::Connection::open(path.join(DATABASE_FILENAME)).unwrap();
-            conn.execute("UPDATE nswallet_properties SET email = '4294967295'", []).unwrap();
+            conn.execute("UPDATE nswallet_properties SET email = '10001'", []).unwrap();
         }
         let started = std::time::Instant::now();
         let wallet = Wallet::open(&path).unwrap();
