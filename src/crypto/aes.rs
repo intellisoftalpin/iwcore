@@ -355,6 +355,16 @@ fn decrypt_with_key(ciphertext: &[u8], key: &[u8; KEY_LENGTH]) -> Result<Zeroizi
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_raw_password_key_is_the_password_bytes_zero_padded() {
+        let mut want = [0u8; KEY_LENGTH];
+        want[..3].copy_from_slice(b"abc");
+        assert_eq!(*raw_password_key("abc"), want);
+        let long = "0123456789abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(&raw_password_key(long)[..], &long.as_bytes()[..KEY_LENGTH]);
+        assert_eq!(*raw_password_key(""), [0u8; KEY_LENGTH]);
+    }
+
     /// Test vector from C# SecurityFixture.cs - TestCaseEncrypt
     #[test]
     fn test_encrypt_vector() {

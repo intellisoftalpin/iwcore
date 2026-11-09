@@ -91,6 +91,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_stored_hash_is_ignored_without_iterations() {
+        let hash = "ffffffffffffffffffffffffffffffff";
+        assert_eq!(*prepare_key("Sun001!", Some(hash), 0), *prepare_key("Sun001!", None, 0));
+        assert_ne!(*prepare_key("Sun001!", Some(hash), 0), *prepare_key(hash, None, 0));
+        assert_eq!(&prepare_key("Sun001!", Some(hash), 1)[..], hash.as_bytes());
+    }
+
+    #[test]
     fn test_key_short_password() {
         // Password "Sun001!" (7 chars) should be padded to 32
         let key = prepare_key("Sun001!", None, 0);
