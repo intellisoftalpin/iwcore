@@ -122,7 +122,22 @@ pub enum PendingOp {
 /// in a zeroizing buffer, written with [`PendingRecord::new_passkey`] and read back
 /// only as a [`PasskeyRecord`], whose key never leaves the crate except as a
 /// signature.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// For the same reason the record has no public serde implementation: the
+/// crate writes and reads its journal JSON itself, so the staged passkey can
+/// only leave the crate sealed into a journal record. A provider that hands
+/// over a login as JSON parses it into a [`PendingLogin`], which has no
+/// passkey, and converts that.
+///
+/// ```compile_fail
+/// let r = iwcore::autofill::PendingRecord::new_login("r1", "Example", "https://example.com", "bkv", "pw", 0);
+/// let _ = serde_json::to_string(&r);
+/// ```
+///
+/// ```compile_fail
+/// let _: iwcore::autofill::PendingRecord = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, PartialEq, Eq)]
 pub struct PendingRecord {
     /// Random identifier, so a crash between "written to vault" and "journal
     /// deleted" cannot double-import on the next attempt.
@@ -130,7 +145,6 @@ pub struct PendingRecord {
     pub op: PendingOp,
     /// Target item for [`PendingOp::UpdatePassword`]. A record naming an item
     /// that no longer exists degrades to a create rather than being dropped.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
     /// Suggested item name.
     pub title: String,
@@ -143,36 +157,170 @@ pub struct PendingRecord {
     /// field was specifically an email field. A hint naming anything other than
     /// `MAIL`, `USER` or `ACNT` is ignored, so a malformed hint cannot put an
     /// arbitrary field type into the vault.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_hint: Option<String>,
     pub password: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub totp_secret: Option<String>,
     /// Unix seconds. Informational only; never used to expire a record.
     pub created_at: i64,
     /// For [`PendingOp::CreatePasskey`]: the passkey as a `PKEY` field value
     /// (see `passkey::record`), private key included. Absent otherwise, so
     /// records written before passkeys existed read unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "secret_text")]
     pub(crate) passkey: Option<Zeroizing<String>>,
 }
 
-/// Serde for the staged passkey: the same JSON string as always, held in a
-/// zeroizing buffer in memory.
-mod secret_text {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use zeroize::Zeroizing;
+/// A login as a provider hands it over, in the journal record's JSON shape
+/// (`record_id`, `op`, `item_id`, `title`, `url`, `identity_value`,
+/// `identity_hint`, `password`, `totp_secret`, `created_at`). It has no
+/// passkey: a passkey is staged only through [`PendingRecord::new_passkey`].
+/// Unknown members, a `passkey` member included, are ignored.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct PendingLogin {
+    pub record_id: String,
+    pub op: PendingOp,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    pub title: String,
+    pub url: String,
+    pub identity_value: String,
+    #[serde(default)]
+    pub identity_hint: Option<String>,
+    pub password: String,
+    #[serde(default)]
+    pub totp_secret: Option<String>,
+    pub created_at: i64,
+}
 
-    pub(super) fn serialize<S: Serializer>(value: &Option<Zeroizing<String>>, s: S) -> Result<S::Ok, S::Error> {
-        match value {
-            Some(text) => s.serialize_some(text.as_str()),
-            None => s.serialize_none(),
+impl std::fmt::Debug for PendingLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLogin")
+            .field("record_id", &self.record_id)
+            .field("op", &self.op)
+            .field("item_id", &self.item_id)
+            .field("title", &self.title)
+            .field("url", &self.url)
+            .field("identity_value", &self.identity_value)
+            .field("identity_hint", &self.identity_hint)
+            .field("password", &crate::utils::REDACTED)
+            .field("totp_secret", &self.totp_secret.as_ref().map(|_| crate::utils::REDACTED))
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+impl From<PendingLogin> for PendingRecord {
+    fn from(login: PendingLogin) -> Self {
+        Self {
+            record_id: login.record_id,
+            op: login.op,
+            item_id: login.item_id,
+            title: login.title,
+            url: login.url,
+            identity_value: login.identity_value,
+            identity_hint: login.identity_hint,
+            password: login.password,
+            totp_secret: login.totp_secret,
+            created_at: login.created_at,
+            passkey: None,
         }
     }
+}
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Zeroizing<String>>, D::Error> {
-        Ok(Option::<String>::deserialize(d)?.map(Zeroizing::new))
+/// A record's journal JSON, borrowed from the record for sealing. Crate-only,
+/// like everything that can write the staged passkey.
+#[derive(Serialize)]
+pub(crate) struct WireOut<'a> {
+    record_id: &'a str,
+    op: PendingOp,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_id: Option<&'a str>,
+    title: &'a str,
+    url: &'a str,
+    identity_value: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_hint: Option<&'a str>,
+    password: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    totp_secret: Option<&'a str>,
+    created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    passkey: Option<&'a str>,
+}
+
+impl<'a> From<&'a PendingRecord> for WireOut<'a> {
+    fn from(r: &'a PendingRecord) -> Self {
+        Self {
+            record_id: &r.record_id,
+            op: r.op,
+            item_id: r.item_id.as_deref(),
+            title: &r.title,
+            url: &r.url,
+            identity_value: &r.identity_value,
+            identity_hint: r.identity_hint.as_deref(),
+            password: &r.password,
+            totp_secret: r.totp_secret.as_deref(),
+            created_at: r.created_at,
+            passkey: r.passkey.as_deref().map(String::as_str),
+        }
     }
+}
+
+/// A record's journal JSON as read back. The passkey goes straight into a
+/// zeroizing buffer.
+///
+/// The members are spelled out rather than flattened from [`PendingLogin`]:
+/// serde buffers a flattened struct's input, which would leave an unzeroized
+/// copy of the passkey behind.
+#[derive(Deserialize)]
+pub(crate) struct WireIn {
+    record_id: String,
+    op: PendingOp,
+    #[serde(default)]
+    item_id: Option<String>,
+    title: String,
+    url: String,
+    identity_value: String,
+    #[serde(default)]
+    identity_hint: Option<String>,
+    password: String,
+    #[serde(default)]
+    totp_secret: Option<String>,
+    created_at: i64,
+    #[serde(default, deserialize_with = "secret_text")]
+    passkey: Option<Zeroizing<String>>,
+}
+
+fn secret_text<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Zeroizing<String>>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.map(Zeroizing::new))
+}
+
+impl From<WireIn> for PendingRecord {
+    fn from(wire: WireIn) -> Self {
+        Self {
+            record_id: wire.record_id,
+            op: wire.op,
+            item_id: wire.item_id,
+            title: wire.title,
+            url: wire.url,
+            identity_value: wire.identity_value,
+            identity_hint: wire.identity_hint,
+            password: wire.password,
+            totp_secret: wire.totp_secret,
+            created_at: wire.created_at,
+            passkey: wire.passkey,
+        }
+    }
+}
+
+/// The journal JSON of `record`.
+pub(crate) fn encode(record: &PendingRecord) -> Result<Zeroizing<Vec<u8>>> {
+    serde_json::to_vec(&WireOut::from(record))
+        .map(Zeroizing::new)
+        .map_err(|e| WalletError::EncryptionError(format!("journal encode failed: {e}")))
+}
+
+/// The record in `json`, or `None` when it does not read as one.
+pub(crate) fn decode(json: &[u8]) -> Option<PendingRecord> {
+    serde_json::from_slice::<WireIn>(json).ok().map(PendingRecord::from)
 }
 
 impl std::fmt::Debug for PendingRecord {
@@ -194,6 +342,14 @@ impl std::fmt::Debug for PendingRecord {
 }
 
 impl PendingRecord {
+    /// A login a provider handed over as JSON (see [`PendingLogin`]). Never
+    /// carries a passkey.
+    pub fn from_login_json(json: &str) -> Result<Self> {
+        serde_json::from_str::<PendingLogin>(json)
+            .map(Self::from)
+            .map_err(|e| WalletError::InvalidOperation(format!("not a staged login: {e}")))
+    }
+
     /// A staged login: [`PendingOp::Create`] with no item, hint, TOTP secret or
     /// passkey. Set the public fields afterwards for anything else.
     pub fn new_login(
@@ -282,10 +438,7 @@ fn seal_payload(
     index_key: &[u8; KEY_LEN],
     version: u8,
 ) -> Result<Vec<u8>> {
-    let json = Zeroizing::new(
-        serde_json::to_vec(record)
-            .map_err(|e| WalletError::EncryptionError(format!("journal encode failed: {e}")))?,
-    );
+    let json = encode(record)?;
 
     let record_key = crypto::random_key()?;
 
@@ -555,7 +708,7 @@ where
         let Ok(json) = crypto::open(&key, parsed.body, &header).map(Zeroizing::new) else {
             continue;
         };
-        if let Ok(record) = serde_json::from_slice::<PendingRecord>(&json) {
+        if let Some(record) = decode(&json) {
             out.push(record);
         }
     }
@@ -932,16 +1085,48 @@ mod tests {
 
         // On disk the passkey is the stored PKEY value as a JSON string, as
         // the Swift extension and earlier builds write it.
-        let json = serde_json::to_value(&r).unwrap();
+        let bytes = encode(&r).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["passkey"].as_str(), Some(passkey.to_field_value().unwrap().as_str()));
-        let back: PendingRecord = serde_json::from_value(json).unwrap();
+        let back = decode(&bytes).unwrap();
         assert_eq!(back, r);
         assert_eq!(back.staged_passkey().unwrap().credential_id, passkey.credential_id);
 
         let login = PendingRecord::new_login("l1", "Example", "https://example.com", "bkv", "pw", 5);
         assert_eq!(login.op, PendingOp::Create);
         assert!(login.staged_passkey().is_none());
-        assert!(serde_json::to_value(&login).unwrap().get("passkey").is_none());
+        let json: serde_json::Value = serde_json::from_slice(&encode(&login).unwrap()).unwrap();
+        assert!(json.get("passkey").is_none());
+    }
+
+    #[test]
+    fn a_login_from_json_never_carries_a_passkey() {
+        let passkey = crate::passkey::record::tests::sample(true);
+        let staged = PendingRecord::new_passkey("p1", "Example", &passkey, 5).unwrap();
+        // Even the full journal JSON of a staged passkey loses its passkey.
+        let json = String::from_utf8(encode(&staged).unwrap().to_vec()).unwrap();
+        let login = PendingRecord::from_login_json(&json).unwrap();
+        assert!(login.passkey.is_none() && login.staged_passkey().is_none());
+        assert_eq!((login.record_id.as_str(), login.op, login.created_at), ("p1", PendingOp::CreatePasskey, 5));
+
+        let full = r#"{"record_id":"r1","op":"UpdatePassword","item_id":"it","title":"T","url":"https://e.com",
+            "identity_value":"bkv","identity_hint":"MAIL","password":"pw","totp_secret":"JBSW","created_at":7}"#;
+        let r = PendingRecord::from_login_json(full).unwrap();
+        assert_eq!(r.op, PendingOp::UpdatePassword);
+        assert_eq!(r.item_id.as_deref(), Some("it"));
+        assert_eq!(r.identity_hint.as_deref(), Some("MAIL"));
+        assert_eq!(r.totp_secret.as_deref(), Some("JBSW"));
+        // It round-trips through the journal unchanged.
+        assert_eq!(decode(&encode(&r).unwrap()).unwrap(), r);
+
+        let minimal = r#"{"record_id":"r2","op":"Create","title":"T","url":"u","identity_value":"v","password":"p-secret-9","created_at":1}"#;
+        let m = PendingRecord::from_login_json(minimal).unwrap();
+        assert_eq!(m, PendingRecord::new_login("r2", "T", "u", "v", "p-secret-9", 1));
+        assert!(PendingRecord::from_login_json("{}").is_err());
+        assert!(PendingRecord::from_login_json("not json").is_err());
+
+        let parsed: PendingLogin = serde_json::from_str(minimal).unwrap();
+        assert!(!format!("{parsed:?}").contains("p-secret-9"), "Debug redacts the password");
     }
 
     #[test]
