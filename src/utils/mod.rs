@@ -2,6 +2,7 @@
 
 pub mod common;
 pub mod id_gen;
+pub(crate) mod private_fs;
 
 /// Printed by `Debug` in place of a secret.
 pub const REDACTED: &str = "[redacted]";

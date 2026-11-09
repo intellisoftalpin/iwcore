@@ -264,6 +264,29 @@ fn field_weight(index: usize) -> i32 {
     i32::try_from(index).unwrap_or(i32::MAX).saturating_mul(100)
 }
 
+/// Why a web address was left out.
+const NOT_WEB_LINK: &str = "the web address is not http or https";
+
+/// Whether `value` may be stored as a LINK: an `http`/`https` address, or one
+/// with no scheme at all (`example.com`, `example.com:8080/x`), which the apps
+/// open as `https`. Anything else (`javascript:`, `data:`, `file:`, app
+/// schemes) is not a web address.
+fn is_web_link(value: &str) -> bool {
+    let v = value.trim();
+    let scheme_len = v
+        .char_indices()
+        .take_while(|&(i, c)| if i == 0 { c.is_ascii_alphabetic() } else { c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-') })
+        .count();
+    let Some(rest) = v[scheme_len..].strip_prefix(':') else {
+        return true; // no scheme
+    };
+    if scheme_len == 0 || rest.starts_with(|c: char| c.is_ascii_digit()) {
+        return true; // `host:port` is not a scheme
+    }
+    let scheme = &v[..scheme_len];
+    scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+}
+
 fn skip(item: &Item<'_>, ty: &str, reason: &str, out: &mut SkipList) {
     out.push(&item.title, ty, reason);
 }
@@ -288,8 +311,13 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
     let mut f: Vec<PlannedField> = Vec::new();
     for url in &item.urls {
         let url = text::clean(url, text::VALUE_MAX, false);
-        if !url.trim().is_empty() {
+        if url.trim().is_empty() {
+            continue;
+        }
+        if is_web_link(&url) {
             f.push(system("LINK", url));
+        } else {
+            skip(item, "url", NOT_WEB_LINK, skipped);
         }
     }
 
@@ -409,7 +437,11 @@ fn map_item(item: &Item<'_>, counts: &mut KindCounts, skipped: &mut SkipList) ->
                     f.push(system("USER", u));
                 }
                 if let Some(u) = ef(cred, "url") {
-                    f.push(system("LINK", u));
+                    if is_web_link(&u) {
+                        f.push(system("LINK", u));
+                    } else {
+                        skip(item, ty, NOT_WEB_LINK, skipped);
+                    }
                 }
                 if let Some(t) = ef(cred, "keyType") {
                     f.push(custom("Key type", "text", t));
@@ -864,6 +896,31 @@ mod tests {
 
     fn doc(items: &str) -> String {
         format!(r#"{{"version": {{"major": 1}}, "exporterDisplayName": "X", "accounts": [{{"id": "a", "items": [{items}]}}]}}"#)
+    }
+
+    #[test]
+    fn only_web_addresses_are_kept_as_links() {
+        for ok in ["https://example.com", "HTTP://example.com/x", "example.com", "example.com:8080/x", "localhost:3000", "//example.com", ""] {
+            assert!(is_web_link(ok), "{ok}");
+        }
+        for bad in ["javascript:alert(1)", " JavaScript:alert(1)", "data:text/html,x", "file:///etc/passwd", "intent://x#Intent;end", "ftp://h", "a:b", "x-app:open", "httpx://h"] {
+            assert!(!is_web_link(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_non_web_link_is_skipped_with_a_reason() {
+        let api = r#"{"type": "api-key", "key": {"fieldType": "concealed-string", "value": "k"}, "url": {"fieldType": "string", "value": "data:text/html,x"}}"#;
+        let items = format!(
+            r#"{{"title": "T", "scope": {{"urls": ["https://ok.example", "javascript:alert(1)", "file:///etc/passwd"]}}, "credentials": [{api}]}}"#
+        );
+        let p = plan(&parse(&doc(&items)).unwrap()).unwrap();
+        let links: Vec<&str> = p.items[0].fields.iter().filter(|f| f.kind == Kind::System("LINK")).map(|f| f.value.as_str()).collect();
+        assert_eq!(links, ["https://ok.example"]);
+        let skipped = p.skipped.into_vec();
+        let got: Vec<(&str, &str, &str)> = skipped.iter().map(|s| (s.item_title.as_str(), s.credential_type.as_str(), s.reason.as_str())).collect();
+        assert_eq!(got, [("T", "url", NOT_WEB_LINK), ("T", "url", NOT_WEB_LINK), ("T", "api-key", NOT_WEB_LINK)]);
+        assert!(p.items[0].fields.iter().any(|f| f.value.as_str() == "k"), "the rest of the credential is kept");
     }
 
     #[test]

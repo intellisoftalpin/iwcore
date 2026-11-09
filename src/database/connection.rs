@@ -44,6 +44,10 @@ impl Database {
 
     /// Create a new database with all tables
     pub fn create(path: &Path) -> Result<Self> {
+        // An empty file is an empty database; creating it first makes the
+        // file (and the WAL and shared-memory files SQLite derives from it)
+        // private to the owner.
+        crate::utils::private_fs::touch_new(path)?;
         let conn = Connection::open(path)?;
         Self::configure(&conn)?;
 

@@ -7,7 +7,8 @@
 //! 4. If re_encryption_count > 0: apply MD5 that many times
 //! 5. UTF-8 encode to 32 bytes
 
-use super::md5::md5_hex;
+use md5::{Digest, Md5};
+use zeroize::Zeroizing;
 
 /// Key length for AES-256 (32 bytes = 256 bits)
 pub const KEY_LENGTH: usize = 32;
@@ -26,21 +27,16 @@ pub const KEY_LENGTH: usize = 32;
 /// # Returns
 ///
 /// A 32-byte key suitable for AES-256 encryption
-pub fn prepare_key(password: &str, hash: Option<&str>, re_encryption_count: u32) -> [u8; KEY_LENGTH] {
-    let key_string = if let Some(h) = hash {
-        if !h.is_empty() && re_encryption_count > 0 {
-            // Use provided hash directly
-            h.to_string()
-        } else {
-            derive_key_from_password(password, re_encryption_count)
-        }
-    } else {
-        derive_key_from_password(password, re_encryption_count)
+pub fn prepare_key(password: &str, hash: Option<&str>, re_encryption_count: u32) -> Zeroizing<[u8; KEY_LENGTH]> {
+    let key_string = match hash {
+        // Use provided hash directly
+        Some(h) if !h.is_empty() && re_encryption_count > 0 => Zeroizing::new(h.to_string()),
+        _ => derive_key_from_password(password, re_encryption_count),
     };
 
     // Convert to UTF-8 bytes and ensure exactly 32 bytes: copy up to
     // KEY_LENGTH bytes, zero-pad the rest.
-    let mut key = [0u8; KEY_LENGTH];
+    let mut key = Zeroizing::new([0u8; KEY_LENGTH]);
     for (dst, src) in key.iter_mut().zip(key_string.as_bytes()) {
         *dst = *src;
     }
@@ -48,18 +44,22 @@ pub fn prepare_key(password: &str, hash: Option<&str>, re_encryption_count: u32)
     key
 }
 
-/// Derive key from password with optional MD5 iterations
-fn derive_key_from_password(password: &str, re_encryption_count: u32) -> String {
+/// Derive key from password with optional MD5 iterations. Every
+/// intermediate string is wiped when dropped; the buffers are sized up front
+/// so no growth leaves an unwiped copy behind.
+fn derive_key_from_password(password: &str, re_encryption_count: u32) -> Zeroizing<String> {
     // Step 1: Pad password by doubling until >= 32 chars. An empty password
     // cannot be padded: it stays empty (an all-zero key) instead of looping
-    // forever.
-    let mut padded = password.to_string();
+    // forever. At most one copy beyond 32 chars, of up to 4 bytes each.
+    let mut padded = Zeroizing::new(String::with_capacity(password.len() + 4 * KEY_LENGTH));
+    padded.push_str(password);
     while !password.is_empty() && padded.chars().count() < KEY_LENGTH {
         padded.push_str(password);
     }
 
     // Step 2: Truncate to exactly 32 characters
-    let truncated: String = padded.chars().take(KEY_LENGTH).collect();
+    let mut truncated = Zeroizing::new(String::with_capacity(4 * KEY_LENGTH));
+    truncated.extend(padded.chars().take(KEY_LENGTH));
 
     // Step 3: Apply MD5 iterations if re_encryption_count > 0
     if re_encryption_count > 0 {
@@ -69,11 +69,19 @@ fn derive_key_from_password(password: &str, re_encryption_count: u32) -> String 
     }
 }
 
-/// Apply MD5 hash repeatedly
-fn apply_md5_iterations(input: &str, count: u32) -> String {
-    let mut result = input.to_string();
+/// Apply MD5 hash repeatedly, in place in one wiped buffer.
+fn apply_md5_iterations(input: &str, count: u32) -> Zeroizing<String> {
+    let mut result = Zeroizing::new(String::with_capacity(input.len().max(2 * 16)));
+    result.push_str(input);
     for _ in 0..count {
-        result = md5_hex(&result);
+        let mut digest = Zeroizing::new([0u8; 16]);
+        digest.copy_from_slice(&Md5::digest(result.as_bytes()));
+        result.clear();
+        for b in digest.iter() {
+            for nibble in [b >> 4, b & 0x0f] {
+                result.push(char::from_digit(u32::from(nibble), 16).unwrap_or('0'));
+            }
+        }
     }
     result
 }
@@ -147,24 +155,34 @@ mod tests {
         // First pad "test" to "testtesttesttesttesttesttesttest" (32 chars)
         // Then apply MD5 once
         let padded: String = "test".repeat(8);
-        let expected_hash = super::md5_hex(&padded);
+        let expected_hash = crate::crypto::md5::md5_hex(&padded);
         assert_eq!(&key[..], expected_hash.as_bytes());
     }
 
     #[test]
     fn test_key_empty_password_terminates() {
         // An empty password must not hang the padding loop.
-        assert_eq!(prepare_key("", None, 0), [0u8; KEY_LENGTH]);
-        assert_eq!(prepare_key("", Some(""), 200), md5_iterated_empty(200));
+        assert_eq!(*prepare_key("", None, 0), [0u8; KEY_LENGTH]);
+        assert_eq!(*prepare_key("", Some(""), 200), md5_iterated_empty(200));
     }
 
     fn md5_iterated_empty(count: u32) -> [u8; KEY_LENGTH] {
         let mut s = String::new();
         for _ in 0..count {
-            s = super::md5_hex(&s);
+            s = crate::crypto::md5::md5_hex(&s);
         }
         let mut key = [0u8; KEY_LENGTH];
         key.copy_from_slice(s.as_bytes());
         key
+    }
+
+    #[test]
+    fn md5_iterations_match_the_hex_chain() {
+        let mut s = "Sun001!Sun001!Sun001!Sun001!Sun0".to_string();
+        for _ in 0..3 {
+            s = crate::crypto::md5::md5_hex(&s);
+        }
+        assert_eq!(&prepare_key("Sun001!", None, 3)[..], s.as_bytes());
+        assert_eq!(apply_md5_iterations("x", 0).as_str(), "x");
     }
 }

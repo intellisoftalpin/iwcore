@@ -3,13 +3,14 @@
 //! Creates ZIP backup files containing the database.
 
 use std::path::{Path, PathBuf};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read, Write};
 use chrono::Utc;
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 use crate::error::{Result, WalletError};
 use crate::database::Database;
+use crate::utils::private_fs;
 use crate::DATABASE_FILENAME;
 use super::{BACKUP_PREFIX, BACKUP_AUTO, BACKUP_MANUAL, BACKUP_DATE_FORMAT};
 
@@ -22,7 +23,7 @@ pub fn create_backup(backup_folder: &Path, db: &Database, manual: bool) -> Resul
     db.checkpoint()?;
 
     // Ensure backup folder exists
-    fs::create_dir_all(backup_folder)?;
+    private_fs::create_dir_all(backup_folder)?;
 
     // Generate backup filename
     let now = Utc::now();
@@ -44,14 +45,14 @@ pub fn create_backup(backup_folder: &Path, db: &Database, manual: bool) -> Resul
         .map_err(|e| WalletError::BackupError(format!("Failed to read database: {}", e)))?;
 
     // Create ZIP file
-    let zip_file = File::create(&backup_path)
+    let zip_file = private_fs::create_file(&backup_path)
         .map_err(|e| WalletError::BackupError(format!("Failed to create backup file: {}", e)))?;
     let mut zip = ZipWriter::new(zip_file);
 
     // Add database to ZIP
     let options = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
-        .unix_permissions(0o644);
+        .unix_permissions(0o600);
 
     zip.start_file(DATABASE_FILENAME, options)
         .map_err(|e| WalletError::BackupError(format!("Failed to add file to zip: {}", e)))?;
@@ -77,7 +78,7 @@ pub fn create_backup_from_path(backup_folder: &Path, db_path: &Path, manual: boo
     }
 
     // Ensure backup folder exists
-    fs::create_dir_all(backup_folder)?;
+    private_fs::create_dir_all(backup_folder)?;
 
     // Generate backup filename
     let now = Utc::now();
@@ -98,14 +99,14 @@ pub fn create_backup_from_path(backup_folder: &Path, db_path: &Path, manual: boo
         .map_err(|e| WalletError::BackupError(format!("Failed to read database: {}", e)))?;
 
     // Create ZIP file
-    let zip_file = File::create(&backup_path)
+    let zip_file = private_fs::create_file(&backup_path)
         .map_err(|e| WalletError::BackupError(format!("Failed to create backup file: {}", e)))?;
     let mut zip = ZipWriter::new(zip_file);
 
     // Add database to ZIP
     let options = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
-        .unix_permissions(0o644);
+        .unix_permissions(0o600);
 
     zip.start_file(DATABASE_FILENAME, options)
         .map_err(|e| WalletError::BackupError(format!("Failed to add file to zip: {}", e)))?;
@@ -137,6 +138,24 @@ mod tests {
 
         assert!(backup_path.exists());
         assert!(backup_path.file_name().unwrap().to_str().unwrap().contains("manual"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backups_and_their_folder_are_private() {
+        use crate::utils::private_fs::{mode, DIR_MODE, FILE_MODE};
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("nswallet.dat");
+        let db = Database::create(&db_path).unwrap();
+        let backup_dir = temp_dir.path().join("a/backups");
+        let made = create_backup(&backup_dir, &db, true).unwrap();
+        assert_eq!((mode(&backup_dir), mode(&temp_dir.path().join("a"))), (DIR_MODE, DIR_MODE));
+        assert_eq!(mode(&made), FILE_MODE);
+        let other_dir = temp_dir.path().join("b");
+        let made = create_backup_from_path(&other_dir, &db_path, false).unwrap();
+        assert_eq!((mode(&other_dir), mode(&made)), (DIR_MODE, FILE_MODE));
+        let mut zip = zip::ZipArchive::new(File::open(&made).unwrap()).unwrap();
+        assert_eq!(zip.by_index(0).unwrap().unix_mode().map(|m| m & 0o777), Some(FILE_MODE));
     }
 
     #[test]
