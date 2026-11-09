@@ -159,6 +159,10 @@ jobs:
           - { area: autofill, shard: 2, shards: 4 }
           - { area: autofill, shard: 3, shards: 4 }
           - { area: restore, shard: 0, shards: 1 }
+          - { area: storage, shard: 0, shards: 4 }
+          - { area: storage, shard: 1, shards: 4 }
+          - { area: storage, shard: 2, shards: 4 }
+          - { area: storage, shard: 3, shards: 4 }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -183,7 +187,7 @@ jobs:
               echo "- $f: $(wc -l < mutants.out/$f.txt 2>/dev/null || echo 0)"
             done
             echo '```'
-            cat mutants.out/missed.txt 2>/dev/null
+            cat mutants.out/missed.txt 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7

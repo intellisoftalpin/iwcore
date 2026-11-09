@@ -30,7 +30,8 @@ case "$area" in
     tests='test(/^cxf::/) | binary(cxf_tests) | binary(cxf_memory)'
     ;;
   autofill)
-    files=(-f src/autofill/wallet.rs -f src/autofill/index.rs -f src/autofill/journal.rs)
+    files=(-f src/autofill/wallet.rs -f src/autofill/index.rs -f src/autofill/journal.rs
+           -f src/autofill/applied.rs -f src/autofill/domain.rs)
     tests='test(/^(autofill|passkey)::/) | binary(passkey_autofill_tests) | binary(cxf_tests)'
     tests+=' | binary(compat_tests) | binary(redaction_tests) | binary(wipe_on_drop)'
     ;;
@@ -38,6 +39,12 @@ case "$area" in
     files=(-f src/backup/restore.rs)
     tests='test(/^(backup|business::wallet)::/) | binary(backup_tests) | binary(compat_tests)'
     tests+=' | binary(integration_tests) | binary(migration_tests) | binary(passkey_autofill_tests)'
+    ;;
+  storage)
+    files=(-f src/backup/untrusted.rs -f src/backup/create.rs -f src/business/wallet.rs
+           -f src/crypto/kdf.rs -f src/crypto/key.rs -f src/crypto/aes.rs
+           -f src/database/connection.rs -f src/database/queries.rs -f src/utils/private_fs.rs)
+    tests='all()'
     ;;
   *)
     echo "unknown area: $area" >&2
