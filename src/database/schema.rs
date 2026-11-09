@@ -30,6 +30,20 @@ CREATE TABLE IF NOT EXISTS nswallet_crypto (
 )
 "#;
 
+/// SQL to create the compaction marker table (single row, id = 1).
+///
+/// `compacted_at` records when the whole database file was last rebuilt
+/// (`VACUUM`), so free pages hold nothing from before that point. Written
+/// for new vaults, after the v5->v6 upgrade, and once at unlock for vaults
+/// upgraded before the marker existed. A backup taken after that point
+/// carries the row too.
+pub const CREATE_COMPACTION_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS nswallet_compaction (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    compacted_at TEXT NOT NULL
+)
+"#;
+
 /// SQL to create the items table
 pub const CREATE_ITEMS_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS nswallet_items (

@@ -21,10 +21,21 @@ impl Database {
     /// instead of riding out a short contention window.
     const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+    /// Apply the per-connection settings every wallet connection uses.
+    ///
+    /// `secure_delete` makes SQLite overwrite deleted content and freed pages
+    /// with zeros, so values that were changed or removed do not stay
+    /// readable in the file's free space.
+    fn configure(conn: &Connection) -> Result<()> {
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+        conn.execute_batch("PRAGMA secure_delete = ON")?;
+        Ok(())
+    }
+
     /// Open a database at the specified path
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+        Self::configure(&conn)?;
         Ok(Self {
             path: path.to_path_buf(),
             conn: Some(conn),
@@ -34,7 +45,7 @@ impl Database {
     /// Create a new database with all tables
     pub fn create(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+        Self::configure(&conn)?;
 
         // Create all tables
         for sql in schema::CREATE_ALL_TABLES {
@@ -109,6 +120,16 @@ impl Database {
     /// This should be called after write operations to ensure data is persisted.
     pub fn checkpoint(&self) -> Result<()> {
         self.connection()?.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        Ok(())
+    }
+
+    /// Rebuild the whole database file (`VACUUM`) and fold the result back
+    /// from the WAL, truncating it. Afterwards the file holds only live
+    /// content: no free pages or unused cell space from earlier writes.
+    /// Must run outside a transaction.
+    pub(crate) fn vacuum(&self) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute_batch("PRAGMA secure_delete = ON; VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
 }

@@ -300,6 +300,9 @@ impl Wallet {
                 dek_wrapped,
             })?;
             queries::create_item(conn, ROOT_ID, ROOT_PARENT_ID, &encrypted_root, "", true)?;
+            // A new file has never held anything but v6 data.
+            queries::set_compacted_at(conn, &queries::now_timestamp())?;
+            queries::checkpoint(conn)?;
         }
 
         self.add_system_labels()?;
@@ -334,6 +337,13 @@ impl Wallet {
             match unwrap_with_password(&rec, password)? {
                 Some(dek) => {
                     self.unlocked = Some(Unlocked { dek });
+                    // Vaults upgraded before the file was rebuilt after the
+                    // upgrade get that rebuild once, now. Best effort: when
+                    // it cannot run (e.g. no space for the rebuild) the
+                    // marker stays absent and the next unlock tries again.
+                    if self.compacted_at()?.is_none() {
+                        let _ = self.compact_file();
+                    }
                     self.clear_caches();
                     self.add_system_labels()?;
                     Ok(true)
@@ -649,6 +659,29 @@ impl Wallet {
         Ok(())
     }
 
+    /// When the database file was last rebuilt as a whole (see
+    /// [`Wallet::compact_file`]), from the marker stored in the vault.
+    fn compacted_at(&self) -> Result<Option<String>> {
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+        queries::get_compacted_at(conn)
+    }
+
+    /// Rebuild the database file (`VACUUM`, then a truncating WAL
+    /// checkpoint) so no free page or unused cell space keeps content from
+    /// before, then store the compaction marker. The marker is written only
+    /// after the rebuild succeeded, so an interrupted run is simply repeated.
+    fn compact_file(&self) -> Result<()> {
+        let db = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
+        db.vacuum()?;
+        let conn = db.connection()?;
+        queries::set_compacted_at(conn, &queries::now_timestamp())?;
+        queries::checkpoint(conn)?;
+        Ok(())
+    }
+
     /// Whether the pre-v6 snapshot ([`PRE_V6_BACKUP_FILENAME`]) is still in
     /// the wallet folder.
     pub fn has_pre_v6_snapshot(&self) -> bool {
@@ -780,6 +813,10 @@ impl Wallet {
 
         let db = self.db.as_mut()
             .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
+        // Overwrite replaced and removed records as they go (also set for
+        // every wallet connection; repeated here because the rewrite below
+        // depends on it).
+        db.connection()?.execute_batch("PRAGMA secure_delete = ON")?;
         db.begin_transaction()?;
 
         let result = (|| -> Result<()> {
@@ -915,12 +952,17 @@ impl Wallet {
             }
         }
 
-        // 5. Best-effort checkpoint so the on-disk file fully reflects the
-        // migrated state. The commit above is already durable (in the WAL), so a
-        // checkpoint failure must NOT fail the migration: SQLite will checkpoint
-        // automatically later. Making this fatal would surface a spurious error
-        // on an otherwise-successful, already-committed v6 migration.
-        let _ = self.db.as_ref().unwrap().checkpoint();
+        // 5. Rebuild the file (VACUUM + truncating checkpoint) so no page
+        // keeps a record in the old format, then store the compaction
+        // marker. Best effort: the commit above is already durable, so a
+        // failure here must NOT fail the migration; the marker then stays
+        // absent and the next unlock repeats the rebuild. Fall back to a
+        // plain checkpoint so the file still reflects the migrated state.
+        if self.compact_file().is_err() {
+            if let Some(db) = self.db.as_ref() {
+                let _ = db.checkpoint();
+            }
+        }
 
         // 6. Hold the DEK: the vault is now unlocked under v6. Record the
         // outcome for the app's diagnostics log.
