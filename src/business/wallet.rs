@@ -87,9 +87,21 @@ fn random_bytes(n: usize) -> Result<Vec<u8>> {
 /// `IWProperties::default()` and was never a valid fallback here. Using it
 /// as the fallback silently derived the wrong AES key for every vault with a
 /// NULL `email` column, making a correct password look "wrong" on import.
-fn legacy_encryption_count(email: Option<&str>) -> u32 {
-    email.and_then(|s| s.parse().ok()).unwrap_or(0)
+///
+/// Real vaults use `0` or `200`; a count above [`MAX_LEGACY_ENCRYPTION_COUNT`]
+/// is refused, since every password check would run that many hash rounds.
+fn legacy_encryption_count(email: Option<&str>) -> Result<u32> {
+    let count = email.and_then(|s| s.parse().ok()).unwrap_or(0);
+    if count > MAX_LEGACY_ENCRYPTION_COUNT {
+        return Err(WalletError::InvalidInput(format!(
+            "legacy encryption count {count} is above {MAX_LEGACY_ENCRYPTION_COUNT}"
+        )));
+    }
+    Ok(count)
 }
+
+/// Largest legacy encryption count accepted from a database.
+const MAX_LEGACY_ENCRYPTION_COUNT: u32 = 10_000;
 
 /// KDF name stored in the crypto record of a v6 vault.
 const KDF_ARGON2ID: &str = "argon2id";
@@ -170,7 +182,7 @@ pub(crate) fn check_password_on(conn: &rusqlite::Connection, password: &str) -> 
     if let Some(rec) = crypto_rec {
         Ok(unwrap_with_password(&rec, password)?.is_some())
     } else {
-        let encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()));
+        let encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()))?;
         let mut key_chain = crypto::legacy::LegacyKeyChain::new(password, encryption_count);
         match &root_blob {
             Some(encrypted_name) => Ok(key_chain.decrypt(encrypted_name).is_ok()),
@@ -336,7 +348,7 @@ impl Wallet {
             )
         };
 
-        self.encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()));
+        self.encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()))?;
 
         if let Some(rec) = crypto_rec {
             // v6 vault: derive KEK from the stored params and unwrap the DEK.
@@ -618,7 +630,7 @@ impl Wallet {
             database_id: raw_props.database_id,
             lang: raw_props.lang,
             version: raw_props.version,
-            encryption_count: legacy_encryption_count(raw_props.email.as_deref()),
+            encryption_count: legacy_encryption_count(raw_props.email.as_deref())?,
             sync_timestamp: raw_props.sync_timestamp.as_ref().and_then(|s| parse_timestamp(s)),
             update_timestamp: raw_props.update_timestamp.as_ref().and_then(|s| parse_timestamp(s)),
         })
@@ -1378,6 +1390,35 @@ pub(crate) mod tests {
     /// actually used - deriving the wrong AES key and reporting the correct
     /// password as wrong. `check_password` must succeed with the real
     /// password and still reject a wrong one.
+    #[test]
+    fn the_legacy_encryption_count_is_parsed_and_capped() {
+        assert_eq!(legacy_encryption_count(None).unwrap(), 0);
+        assert_eq!(legacy_encryption_count(Some("")).unwrap(), 0);
+        assert_eq!(legacy_encryption_count(Some("x")).unwrap(), 0);
+        assert_eq!(legacy_encryption_count(Some("200")).unwrap(), 200);
+        assert_eq!(
+            legacy_encryption_count(Some("10000")).unwrap(),
+            MAX_LEGACY_ENCRYPTION_COUNT
+        );
+        assert!(legacy_encryption_count(Some("10001")).is_err());
+        assert!(legacy_encryption_count(Some("4294967295")).is_err());
+    }
+
+    /// A legacy vault claiming a huge encryption count fails the password
+    /// check at once instead of hashing for that long.
+    #[test]
+    fn a_huge_legacy_encryption_count_fails_the_password_check() {
+        let (_temp, path) = create_wallet_with_null_email();
+        {
+            let conn = rusqlite::Connection::open(path.join(DATABASE_FILENAME)).unwrap();
+            conn.execute("UPDATE nswallet_properties SET email = '4294967295'", []).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let wallet = Wallet::open(&path).unwrap();
+        assert!(matches!(wallet.check_password("TestPassword123"), Err(WalletError::InvalidInput(_))));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
     #[test]
     fn test_check_password_after_reopen_null_email() {
         let (_temp, path) = create_wallet_with_null_email();
