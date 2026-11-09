@@ -353,6 +353,38 @@ pub fn inspect_backup_in(backup_path: &Path, temp_base: &Path) -> Result<BackupI
     Ok(BackupInspection { db_version, created, item_count, passkey_count })
 }
 
+/// Which vault a backup belongs to and whether its file was rebuilt after
+/// the format upgrade. Read without the backup's password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackupOrigin {
+    /// The database version string (`"6"` for current vaults).
+    pub(crate) db_version: String,
+    /// The vault's `database_id`, if the properties row has one.
+    pub(crate) database_id: Option<String>,
+    /// The compaction marker the backup's database carries, if any.
+    pub(crate) compacted_at: Option<String>,
+}
+
+/// Read a backup's [`BackupOrigin`], with the same untrusted-file checks as
+/// [`inspect_backup_in`].
+pub(crate) fn backup_origin_in(backup_path: &Path, temp_base: &Path) -> Result<BackupOrigin> {
+    use rusqlite::OptionalExtension;
+
+    let temp_dir = temp_dir_in(temp_base)?;
+    let db_path = extract_backup(backup_path, temp_dir.path())?;
+    let conn = super::untrusted::open_untrusted(&db_path)?;
+
+    let db_version = super::untrusted::read_db_version(&conn)?;
+    let database_id = conn
+        .query_row("SELECT database_id FROM nswallet_properties LIMIT 1", [], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten();
+    let compacted_at = crate::database::queries::get_compacted_at(&conn)?;
+    Ok(BackupOrigin { db_version, database_id, compacted_at })
+}
+
 /// Check database version directly from a database file (not a backup)
 pub fn get_db_version(db_path: &Path) -> Result<String> {
     use rusqlite::Connection;

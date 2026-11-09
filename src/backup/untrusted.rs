@@ -40,7 +40,7 @@ const WORK_BUDGET_BYTES_PER_CHECK: u64 = 1024;
 const REQUIRED_TABLES: [&str; 3] = ["nswallet_items", "nswallet_fields", "nswallet_properties"];
 
 /// Tables that are optional, but must be real tables when present.
-const OPTIONAL_TABLES: [&str; 1] = ["nswallet_crypto"];
+const OPTIONAL_TABLES: [&str; 2] = ["nswallet_crypto", "nswallet_compaction"];
 
 /// Whether `bytes` starts with the SQLite file header.
 pub(crate) fn has_sqlite_header(bytes: &[u8]) -> bool {

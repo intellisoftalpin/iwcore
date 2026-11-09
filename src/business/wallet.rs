@@ -97,16 +97,22 @@ const KDF_ARGON2ID: &str = "argon2id";
 /// First database version written with the v6 crypto scheme.
 const V6: u32 = 6;
 
-/// Whether `backup_folder` holds a backup that passes inspection and reports
-/// database version >= 6. Inspection extracts into a temporary folder under
-/// `temp_base`.
-fn has_v6_backup(backup_folder: &Path, temp_base: &Path) -> Result<bool> {
+/// Whether `backup_folder` holds a backup that can stand in for the pre-v6
+/// snapshot of the vault `database_id`: it passes inspection, reports
+/// database version >= 6, belongs to the same vault (same `database_id`) and
+/// carries the compaction marker, i.e. it was taken after the file was
+/// rebuilt following the upgrade. Inspection extracts into a temporary folder
+/// under `temp_base`.
+fn has_v6_backup(backup_folder: &Path, temp_base: &Path, database_id: &str) -> Result<bool> {
     let backups = crate::backup::BackupManager::new(backup_folder).list_backups()?;
     Ok(backups.iter().any(|b| {
-        crate::backup::inspect_backup_in(&b.path, temp_base)
+        crate::backup::backup_origin_in(&b.path, temp_base)
             .ok()
-            .and_then(|i| i.db_version.parse::<u32>().ok())
-            .is_some_and(|v| v >= V6)
+            .is_some_and(|o| {
+                o.db_version.parse::<u32>().is_ok_and(|v| v >= V6)
+                    && o.database_id.as_deref() == Some(database_id)
+                    && o.compacted_at.is_some()
+            })
     }))
 }
 
@@ -696,26 +702,36 @@ impl Wallet {
     /// can replace it. It is deleted only when all of these hold:
     /// - the wallet is unlocked (else [`WalletError::Locked`]), which proves
     ///   the converted vault opens with the password;
-    /// - the vault is v6 (it has a crypto record and version >= 6);
+    /// - the vault is v6 (it has a crypto record and version >= 6) and its
+    ///   file has been rebuilt since the upgrade (compaction marker present);
     /// - the snapshot exists;
     /// - `backup_folder` holds at least one backup that passes
-    ///   [`crate::backup::inspect_backup_in`] and reports database version >= 6.
+    ///   [`crate::backup::inspect_backup_in`], reports database version >= 6,
+    ///   has this vault's database id, and was taken after the rebuild (its
+    ///   database carries the compaction marker).
     ///
     /// Backups are inspected through a temporary folder inside the wallet
     /// folder. Backups that fail inspection are skipped, not reported.
     /// Calling it again after the snapshot is gone returns `Ok(false)`.
     pub fn retire_pre_v6_snapshot(&self, backup_folder: &Path) -> Result<bool> {
         self.ensure_unlocked()?;
-        {
+        let database_id = {
             let conn = self.db.as_ref()
                 .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
                 .connection()?;
             let version: u32 = migrations::get_database_version(conn)?.parse().unwrap_or(0);
-            if version < V6 || queries::get_crypto_record(conn)?.is_none() {
+            if version < V6
+                || queries::get_crypto_record(conn)?.is_none()
+                || queries::get_compacted_at(conn)?.is_none()
+            {
                 return Ok(false);
             }
-        }
-        if !self.has_pre_v6_snapshot() || !has_v6_backup(backup_folder, &self.folder)? {
+            match queries::get_database_id(conn)? {
+                Some(id) => id,
+                None => return Ok(false),
+            }
+        };
+        if !self.has_pre_v6_snapshot() || !has_v6_backup(backup_folder, &self.folder, &database_id)? {
             return Ok(false);
         }
         std::fs::remove_file(self.folder.join(PRE_V6_BACKUP_FILENAME)).map_err(|e| {
@@ -1082,6 +1098,8 @@ pub(crate) mod tests {
             "UPDATE nswallet_properties SET version = '5'",
             "UPDATE nswallet_properties SET version = 'x'",
             "DELETE FROM nswallet_crypto",
+            "DELETE FROM nswallet_compaction",
+            "UPDATE nswallet_properties SET database_id = 'another'",
         ] {
             let (wallet, temp) = create_test_wallet();
             let backups = v6_backup_folder(temp.path());

@@ -7,6 +7,7 @@
 mod create;
 mod restore;
 pub(crate) mod untrusted;
+pub(crate) use restore::backup_origin_in;
 
 // Re-export version checking functions
 pub use restore::{
