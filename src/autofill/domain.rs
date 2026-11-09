@@ -111,9 +111,11 @@ pub fn normalize_host(raw: &str) -> Option<String> {
     // Protocol-relative form (`//example.com/x`), which users do paste.
     let after_scheme = after_scheme.strip_prefix("//").unwrap_or(after_scheme);
 
-    // Authority ends at the first path, query or fragment delimiter.
+    // Authority ends at the first path, query or fragment delimiter. A
+    // backslash counts as a path delimiter too, as it does in browsers for
+    // http(s): `https://a.com\@b.com/` opens a.com, so it must name a.com.
     let authority = after_scheme
-        .split(['/', '?', '#'])
+        .split(['/', '?', '#', '\\'])
         .next()
         .unwrap_or(after_scheme);
     if authority.is_empty() {
@@ -533,6 +535,25 @@ mod tests {
         assert_eq!(digit_to_char(35), Some('9'));
         assert_eq!(digit_to_char(36), None);
         assert_eq!(digit_to_char(u32::MAX), None);
+    }
+
+    #[test]
+    fn a_backslash_ends_the_authority_as_in_a_browser() {
+        assert_eq!(normalize_host("https://bank.com\\@evil.com/").as_deref(), Some("bank.com"));
+        assert_eq!(normalize_host("https://bank.com\\@evil.com/login").as_deref(), Some("bank.com"));
+        assert_eq!(normalize_host("bank.com\\@evil.com").as_deref(), Some("bank.com"));
+        assert_eq!(normalize_host("https://user@bank.com\\path").as_deref(), Some("bank.com"));
+        assert_eq!(normalize_host("https://bank.com:443\\x").as_deref(), Some("bank.com"));
+        assert_eq!(normalize_host("https://\\evil.com"), None);
+    }
+
+    #[test]
+    fn an_encoded_at_sign_is_not_a_userinfo_delimiter() {
+        // `%40` stays part of the host, which then is no valid host at all.
+        assert_eq!(normalize_host("https://bank.com%40evil.com/"), None);
+        // In the userinfo it is just an encoded character.
+        assert_eq!(normalize_host("https://me%40mail.com@bank.com/").as_deref(), Some("bank.com"));
+        assert_eq!(normalize_host("https://bank.com%40evil.com@real.com/").as_deref(), Some("real.com"));
     }
 
     #[test]
