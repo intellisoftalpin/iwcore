@@ -545,6 +545,11 @@ mod tests {
     }
 
     #[test]
+    fn the_value_limit_is_16_mib() {
+        assert_eq!(MAX_VALUE_BYTES, 16_777_216);
+    }
+
+    #[test]
     fn the_size_limits_are_set() {
         let dir = TempDir::new().unwrap();
         let path = db_with(dir.path(), WALLET_SCHEMA);

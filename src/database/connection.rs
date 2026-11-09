@@ -150,6 +150,19 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn every_connection_overwrites_deleted_content_and_waits_when_busy() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("settings.db");
+        for db in [Database::create(&db_path).unwrap(), Database::open(&db_path).unwrap()] {
+            let conn = db.connection().unwrap();
+            let secure: i64 = conn.query_row("PRAGMA secure_delete", [], |r| r.get(0)).unwrap();
+            assert_eq!(secure, 1);
+            let busy: i64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap();
+            assert_eq!(busy, 5000);
+        }
+    }
+
+    #[test]
     fn test_checkpoint_no_error() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");

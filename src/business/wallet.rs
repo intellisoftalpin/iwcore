@@ -1075,6 +1075,21 @@ pub(crate) mod tests {
         (wallet, temp_dir)
     }
 
+    /// A vault that already carries the compaction marker is not rebuilt
+    /// again at unlock: the marker keeps its value.
+    #[test]
+    fn an_unlock_does_not_compact_a_vault_again() {
+        let (mut wallet, _temp) = create_test_wallet();
+        {
+            let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+            queries::set_compacted_at(conn, "kept-marker").unwrap();
+        }
+        assert_eq!(wallet.compacted_at().unwrap().as_deref(), Some("kept-marker"));
+        wallet.lock();
+        assert!(wallet.unlock("TestPassword123").unwrap());
+        assert_eq!(wallet.compacted_at().unwrap().as_deref(), Some("kept-marker"));
+    }
+
     /// A closed v6 wallet whose crypto record was then changed by `sql`.
     fn wallet_with_crypto_record_changed(sql: &str) -> (TempDir, std::path::PathBuf) {
         let (wallet, temp) = create_test_wallet();
