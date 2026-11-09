@@ -416,6 +416,21 @@ pub fn get_quarantine_rows(conn: &Connection) -> Result<Vec<QuarantineRow>> {
     rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+/// Delete every quarantined record and erase it from the file: VACUUM
+/// rewrites the database without the freed pages, and the checkpoint empties
+/// the WAL. Returns how many records were deleted; 0 when the table does not
+/// exist. Must run outside a transaction (VACUUM cannot run inside one).
+pub fn discard_quarantine(conn: &Connection) -> Result<u32> {
+    let removed = quarantine_count(conn)?;
+    if removed == 0 {
+        return Ok(0);
+    }
+    conn.execute("DELETE FROM nswallet_quarantine", [])?;
+    conn.execute_batch("VACUUM")?;
+    checkpoint(conn)?;
+    Ok(removed)
+}
+
 /// Remove a recovered record from quarantine (same transaction as the
 /// restore of its live row).
 pub fn delete_quarantine_row(conn: &Connection, rowid: i64) -> Result<()> {

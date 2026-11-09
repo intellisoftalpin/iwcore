@@ -404,6 +404,18 @@ impl Wallet {
         queries::quarantine_count(conn)
     }
 
+    /// Permanently delete every quarantined record (the ones that did not
+    /// decrypt under the master password during the upgrade and that the user
+    /// gives up on recovering), then compact the database so their bytes are
+    /// gone from the file. Returns how many records were deleted.
+    pub fn discard_quarantined(&mut self) -> Result<u32> {
+        self.ensure_unlocked()?;
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+        queries::discard_quarantine(conn)
+    }
+
     /// Try to recover quarantined records with `password` (which may differ
     /// from the vault's master password: old-app flows could re-create the
     /// root under a new password while the data stayed under the previous
@@ -1715,6 +1727,55 @@ pub(crate) mod tests {
         let item_id = items.iter().find(|i| i.name == "Legacy Item").unwrap().item_id.clone();
         let fields = wallet.get_fields_by_item(&item_id).unwrap();
         assert_eq!(fields[0].value, "legacy_secret");
+    }
+
+    /// Discarding quarantined records deletes them and erases their bytes
+    /// from the database file; a second call has nothing left to do.
+    #[test]
+    fn test_discard_quarantined_erases_the_records() {
+        use rusqlite::Connection;
+        let password_b = "CompletelyOther456";
+        let (_temp, path) = create_legacy_vault_with_data(0);
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let new_root = crypto::legacy::encrypt("recreated-root", password_b, 0, None).unwrap();
+            conn.execute(
+                "UPDATE nswallet_items SET name = ? WHERE item_id = '__ROOT__'",
+                rusqlite::params![new_root],
+            ).unwrap();
+        }
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(matches!(wallet.discard_quarantined(), Err(WalletError::Locked)));
+        assert!(wallet.unlock(password_b).unwrap());
+        assert_eq!(wallet.quarantine_count().unwrap(), 3);
+        let blobs: Vec<Vec<u8>> = {
+            let conn = Connection::open(&db_path).unwrap();
+            let mut stmt = conn.prepare("SELECT blob FROM nswallet_quarantine").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().map(|b| b.unwrap()).collect()
+        };
+        assert_eq!(blobs.len(), 3);
+        assert!(blobs.iter().all(|b| b.len() >= 16));
+
+        assert_eq!(wallet.discard_quarantined().unwrap(), 3);
+        assert_eq!(wallet.quarantine_count().unwrap(), 0);
+        assert_eq!(wallet.discard_quarantined().unwrap(), 0);
+        let mut bytes = std::fs::read(&db_path).unwrap();
+        bytes.extend(std::fs::read(db_path.with_extension("dat-wal")).unwrap_or_default());
+        for blob in &blobs {
+            assert!(!bytes.windows(blob.len()).any(|w| w == blob.as_slice()), "a discarded blob is still in the file");
+        }
+        // The vault itself is untouched and still opens.
+        assert!(wallet.get_items().unwrap().iter().all(|i| i.name != "Legacy Item"));
+        wallet.lock();
+        assert!(wallet.unlock(password_b).unwrap());
+    }
+
+    #[test]
+    fn test_discard_quarantined_without_a_quarantine_table() {
+        let (mut wallet, _t) = create_test_wallet();
+        assert_eq!(wallet.discard_quarantined().unwrap(), 0);
     }
 
     /// Cases 7-9: the old-app hidden root re-creation replay. Root under
