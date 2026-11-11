@@ -172,6 +172,14 @@ pub struct PendingRecord {
     /// (see `passkey::record`), private key included. Absent otherwise, so
     /// records written before passkeys existed read unchanged.
     pub(crate) passkey: Option<Zeroizing<String>>,
+    /// Never replace a login the vault already holds. Set by a provider for a
+    /// capture it could not attribute to the site it names (an app that only
+    /// claims a web domain): the drain then always creates a new entry, or
+    /// skips an exact duplicate, but never moves a stored password to `OLDP`.
+    /// Applies to [`PendingOp::Create`] and [`PendingOp::UpdatePassword`]
+    /// alike; an update marked this way is filed as a new entry. Absent from
+    /// the journal JSON when false, so ordinary records are unchanged.
+    pub create_only: bool,
 }
 
 /// A login as a provider hands it over, in the journal record's JSON shape
@@ -227,8 +235,20 @@ impl From<PendingLogin> for PendingRecord {
             totp_secret: login.totp_secret,
             created_at: login.created_at,
             passkey: None,
+            create_only: false,
         }
     }
+}
+
+/// [`PendingLogin`] plus the `create_only` member, for
+/// [`PendingRecord::from_login_json`]. Kept apart so `PendingLogin` stays as
+/// it was in 0.7.0.
+#[derive(Deserialize)]
+struct LoginIn {
+    #[serde(flatten)]
+    login: PendingLogin,
+    #[serde(default)]
+    create_only: bool,
 }
 
 /// A record's journal JSON, borrowed from the record for sealing. Crate-only,
@@ -250,6 +270,13 @@ pub(crate) struct WireOut<'a> {
     created_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     passkey: Option<&'a str>,
+    #[serde(skip_serializing_if = "is_false")]
+    create_only: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes the field by reference
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl<'a> From<&'a PendingRecord> for WireOut<'a> {
@@ -266,6 +293,7 @@ impl<'a> From<&'a PendingRecord> for WireOut<'a> {
             totp_secret: r.totp_secret.as_deref(),
             created_at: r.created_at,
             passkey: r.passkey.as_deref().map(String::as_str),
+            create_only: r.create_only,
         }
     }
 }
@@ -293,6 +321,8 @@ pub(crate) struct WireIn {
     created_at: i64,
     #[serde(default, deserialize_with = "secret_text")]
     passkey: Option<Zeroizing<String>>,
+    #[serde(default)]
+    create_only: bool,
 }
 
 fn secret_text<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Zeroizing<String>>, D::Error> {
@@ -313,6 +343,7 @@ impl From<WireIn> for PendingRecord {
             totp_secret: wire.totp_secret,
             created_at: wire.created_at,
             passkey: wire.passkey,
+            create_only: wire.create_only,
         }
     }
 }
@@ -343,16 +374,18 @@ impl std::fmt::Debug for PendingRecord {
             .field("totp_secret", &self.totp_secret.as_ref().map(|_| crate::utils::REDACTED))
             .field("created_at", &self.created_at)
             .field("passkey", &self.passkey.as_ref().map(|_| crate::utils::REDACTED))
+            .field("create_only", &self.create_only)
             .finish()
     }
 }
 
 impl PendingRecord {
-    /// A login a provider handed over as JSON (see [`PendingLogin`]). Never
-    /// carries a passkey.
+    /// A login a provider handed over as JSON (see [`PendingLogin`]), plus an
+    /// optional boolean `create_only` member (see [`PendingRecord::create_only`]).
+    /// Never carries a passkey.
     pub fn from_login_json(json: &str) -> Result<Self> {
-        serde_json::from_str::<PendingLogin>(json)
-            .map(Self::from)
+        serde_json::from_str::<LoginIn>(json)
+            .map(|wire| Self { create_only: wire.create_only, ..Self::from(wire.login) })
             .map_err(|e| WalletError::InvalidOperation(format!("not a staged login: {e}")))
     }
 
@@ -378,6 +411,7 @@ impl PendingRecord {
             totp_secret: None,
             created_at,
             passkey: None,
+            create_only: false,
         }
     }
 
@@ -819,6 +853,33 @@ mod tests {
         open_for_drain(journal, &DrainKeys { journal_secret: secret, auth_key: auth, legacy_wrap_keys: &[] }).records
     }
 
+    #[test]
+    fn create_only_round_trips_and_is_absent_from_ordinary_records() {
+        let plain = record("p1");
+        let bytes = encode(&plain).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("create_only"));
+        assert!(!decode(&bytes).unwrap().create_only);
+
+        let mut marked = record("m1");
+        marked.create_only = true;
+        let bytes = encode(&marked).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("\"create_only\":true"));
+        assert_eq!(decode(&bytes).unwrap(), marked);
+    }
+
+    #[test]
+    fn a_provider_login_may_ask_to_be_created_only() {
+        let base = r#""record_id":"r1","op":"Create","title":"T","url":"https://example.com","identity_value":"bkv","password":"pw","created_at":1"#;
+        assert!(!PendingRecord::from_login_json(&format!("{{{base}}}")).unwrap().create_only);
+        assert!(!PendingRecord::from_login_json(&format!("{{{base},\"create_only\":false}}")).unwrap().create_only);
+        let marked = PendingRecord::from_login_json(&format!("{{{base},\"create_only\":true}}")).unwrap();
+        assert!(marked.create_only);
+        assert_eq!(marked.record_id, "r1");
+        assert!(marked.staged_passkey().is_none());
+        assert!(PendingRecord::from_login_json(&format!("{{{base},\"create_only\":\"yes\"}}")).is_err());
+        assert!(format!("{marked:?}").contains("create_only: true"));
+    }
+
     fn record(id: &str) -> PendingRecord {
         PendingRecord {
             record_id: id.to_string(),
@@ -832,6 +893,7 @@ mod tests {
             totp_secret: None,
             created_at: 1_700_000_000,
             passkey: None,
+            create_only: false,
         }
     }
 

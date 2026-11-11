@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.1
+
+### Added
+
+- **`PendingRecord::create_only`.** A provider marks a login it could not
+  attribute to the site it names (for example an app that only claims a web
+  domain). The drain never replaces a stored login with such a record: an exact
+  duplicate is skipped, anything else becomes a new entry, also when the record
+  is an update naming an item. `PendingRecord::from_login_json` reads an
+  optional boolean `create_only` member. The member is written to the journal
+  only when set, so ordinary records are byte for byte as before.
+
 ## 0.7.0
 
 ### Breaking changes

@@ -76,6 +76,7 @@ impl Registration {
             created_at: now,
             // Moved out of the wiping wrapper, not copied.
             passkey: Some(stored),
+            create_only: false,
         })
     }
 }
