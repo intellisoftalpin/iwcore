@@ -305,18 +305,23 @@ impl Wallet {
             }
 
             // An explicit update wins outright: the provider named an item, so
-            // there is nothing to reconcile.
-            let mut target = match record.op {
-                PendingOp::UpdatePassword => record.item_id.clone(),
-                PendingOp::CreatePasskey => unreachable!("handled above"),
-                PendingOp::Create => match Self::reconcile(&known, &record) {
-                    Some(Match::Same) => {
-                        summary.unchanged = summary.unchanged.saturating_add(1);
-                        continue;
+            // there is nothing to reconcile. A create-only record never
+            // replaces anything: an exact duplicate is skipped, everything else
+            // becomes a new entry, whatever item it names.
+            let mut target = match (record.op, record.create_only) {
+                (PendingOp::CreatePasskey, _) => unreachable!("handled above"),
+                (PendingOp::UpdatePassword, false) => record.item_id.clone(),
+                (PendingOp::Create, _) | (PendingOp::UpdatePassword, true) => {
+                    match Self::reconcile(&known, &record) {
+                        Some(Match::Same) => {
+                            summary.unchanged = summary.unchanged.saturating_add(1);
+                            continue;
+                        }
+                        Some(Match::PasswordChanged(_)) if record.create_only => None,
+                        Some(Match::PasswordChanged(item_id)) => Some(item_id),
+                        None => None,
                     }
-                    Some(Match::PasswordChanged(item_id)) => Some(item_id),
-                    None => None,
-                },
+                }
             };
 
             if let Some(item_id) = target.take()
@@ -655,6 +660,7 @@ mod tests {
             totp_secret: None,
             created_at: 1_700_000_000,
             passkey: None,
+            create_only: false,
         }
     }
 
@@ -948,6 +954,7 @@ mod tests {
             totp_secret: None,
             created_at: 0,
             passkey: None,
+            create_only: false,
         };
         let journal =
             journal::seal_record(&staged, &keys.journal_public, &keys.index_key, &keys.journal_auth_key).unwrap();
@@ -1242,6 +1249,7 @@ mod tests {
             totp_secret: None,
             created_at: 1_700_000_000,
             passkey: None,
+            create_only: false,
         }
     }
 
@@ -1422,6 +1430,66 @@ mod tests {
             password_of(&mut w, &item, FIELD_OLD_PASSWORD).as_deref(),
             Some("hunter2")
         );
+    }
+
+    #[test]
+    fn a_create_only_capture_with_a_new_password_is_a_new_login_and_replaces_nothing() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let item = login(&mut w, "GitHub", "https://github.com/login", "bkv", "hunter2");
+
+        let mut unverified = capture("r1", "https://github.com/settings", "bkv", "attacker");
+        unverified.create_only = true;
+        let summary = w
+            .drain_autofill_journal(&seal_all(&[unverified], &keys), &dk(&keys), None)
+            .unwrap();
+
+        assert_eq!(summary.created.len(), 1);
+        assert!(summary.updated.is_empty());
+        assert_ne!(summary.created[0], item);
+        assert_eq!(password_of(&mut w, &item, FIELD_PASSWORD).as_deref(), Some("hunter2"));
+        assert_eq!(password_of(&mut w, &item, FIELD_OLD_PASSWORD), None);
+        assert_eq!(
+            password_of(&mut w, &summary.created[0], FIELD_PASSWORD).as_deref(),
+            Some("attacker")
+        );
+    }
+
+    #[test]
+    fn a_create_only_update_naming_an_item_is_filed_as_a_new_login() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let item = login(&mut w, "GitHub", "https://github.com/login", "bkv", "hunter2");
+
+        let mut update = capture("r1", "https://github.com/login", "bkv", "attacker");
+        update.op = PendingOp::UpdatePassword;
+        update.item_id = Some(item.clone());
+        update.create_only = true;
+        let summary = w
+            .drain_autofill_journal(&seal_all(&[update], &keys), &dk(&keys), None)
+            .unwrap();
+
+        assert_eq!(summary.created.len(), 1);
+        assert!(summary.updated.is_empty());
+        assert_eq!(password_of(&mut w, &item, FIELD_PASSWORD).as_deref(), Some("hunter2"));
+        assert_eq!(password_of(&mut w, &item, FIELD_OLD_PASSWORD), None);
+    }
+
+    #[test]
+    fn a_create_only_capture_the_vault_already_holds_is_dropped() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        login(&mut w, "GitHub", "https://github.com/login", "bkv", "hunter2");
+
+        let mut same = capture("r1", "https://github.com/login", "bkv", "hunter2");
+        same.create_only = true;
+        let summary = w
+            .drain_autofill_journal(&seal_all(&[same], &keys), &dk(&keys), None)
+            .unwrap();
+
+        assert_eq!(summary.unchanged, 1);
+        assert!(summary.created.is_empty());
+        assert!(summary.updated.is_empty());
     }
 
     #[test]
