@@ -87,9 +87,21 @@ fn random_bytes(n: usize) -> Result<Vec<u8>> {
 /// `IWProperties::default()` and was never a valid fallback here. Using it
 /// as the fallback silently derived the wrong AES key for every vault with a
 /// NULL `email` column, making a correct password look "wrong" on import.
-fn legacy_encryption_count(email: Option<&str>) -> u32 {
-    email.and_then(|s| s.parse().ok()).unwrap_or(0)
+///
+/// Real vaults use `0` or `200`; a count above [`MAX_LEGACY_ENCRYPTION_COUNT`]
+/// is refused, since every password check would run that many hash rounds.
+fn legacy_encryption_count(email: Option<&str>) -> Result<u32> {
+    let count = email.and_then(|s| s.parse().ok()).unwrap_or(0);
+    if count > MAX_LEGACY_ENCRYPTION_COUNT {
+        return Err(WalletError::InvalidInput(format!(
+            "legacy encryption count {count} is above {MAX_LEGACY_ENCRYPTION_COUNT}"
+        )));
+    }
+    Ok(count)
 }
+
+/// Largest legacy encryption count accepted from a database.
+const MAX_LEGACY_ENCRYPTION_COUNT: u32 = 10_000;
 
 /// KDF name stored in the crypto record of a v6 vault.
 const KDF_ARGON2ID: &str = "argon2id";
@@ -97,16 +109,22 @@ const KDF_ARGON2ID: &str = "argon2id";
 /// First database version written with the v6 crypto scheme.
 const V6: u32 = 6;
 
-/// Whether `backup_folder` holds a backup that passes inspection and reports
-/// database version >= 6. Inspection extracts into a temporary folder under
-/// `temp_base`.
-fn has_v6_backup(backup_folder: &Path, temp_base: &Path) -> Result<bool> {
+/// Whether `backup_folder` holds a backup that can stand in for the pre-v6
+/// snapshot of the vault `database_id`: it passes inspection, reports
+/// database version >= 6, belongs to the same vault (same `database_id`) and
+/// carries the compaction marker, i.e. it was taken after the file was
+/// rebuilt following the upgrade. Inspection extracts into a temporary folder
+/// under `temp_base`.
+fn has_v6_backup(backup_folder: &Path, temp_base: &Path, database_id: &str) -> Result<bool> {
     let backups = crate::backup::BackupManager::new(backup_folder).list_backups()?;
     Ok(backups.iter().any(|b| {
-        crate::backup::inspect_backup_in(&b.path, temp_base)
+        crate::backup::backup_origin_in(&b.path, temp_base)
             .ok()
-            .and_then(|i| i.db_version.parse::<u32>().ok())
-            .is_some_and(|v| v >= V6)
+            .is_some_and(|o| {
+                o.db_version.parse::<u32>().is_ok_and(|v| v >= V6)
+                    && o.database_id.as_deref() == Some(database_id)
+                    && o.compacted_at.is_some()
+            })
     }))
 }
 
@@ -164,7 +182,7 @@ pub(crate) fn check_password_on(conn: &rusqlite::Connection, password: &str) -> 
     if let Some(rec) = crypto_rec {
         Ok(unwrap_with_password(&rec, password)?.is_some())
     } else {
-        let encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()));
+        let encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()))?;
         let mut key_chain = crypto::legacy::LegacyKeyChain::new(password, encryption_count);
         match &root_blob {
             Some(encrypted_name) => Ok(key_chain.decrypt(encrypted_name).is_ok()),
@@ -243,7 +261,7 @@ impl Wallet {
     /// Create a new wallet in the specified folder. New wallets are born at the
     /// current (v6) scheme; legacy crypto is never written.
     pub fn create(folder: &Path, password: &str, lang: &str) -> Result<Self> {
-        std::fs::create_dir_all(folder)?;
+        crate::utils::private_fs::create_dir_all(folder)?;
 
         let db_path = folder.join(DATABASE_FILENAME);
         let db = Database::create(&db_path)?;
@@ -300,6 +318,9 @@ impl Wallet {
                 dek_wrapped,
             })?;
             queries::create_item(conn, ROOT_ID, ROOT_PARENT_ID, &encrypted_root, "", true)?;
+            // A new file has never held anything but v6 data.
+            queries::set_compacted_at(conn, &queries::now_timestamp())?;
+            queries::checkpoint(conn)?;
         }
 
         self.add_system_labels()?;
@@ -327,13 +348,20 @@ impl Wallet {
             )
         };
 
-        self.encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()));
+        self.encryption_count = legacy_encryption_count(props.as_ref().and_then(|p| p.email.as_deref()))?;
 
         if let Some(rec) = crypto_rec {
             // v6 vault: derive KEK from the stored params and unwrap the DEK.
             match unwrap_with_password(&rec, password)? {
                 Some(dek) => {
                     self.unlocked = Some(Unlocked { dek });
+                    // Vaults upgraded before the file was rebuilt after the
+                    // upgrade get that rebuild once, now. Best effort: when
+                    // it cannot run (e.g. no space for the rebuild) the
+                    // marker stays absent and the next unlock tries again.
+                    if self.compacted_at()?.is_none() {
+                        let _ = self.compact_file();
+                    }
                     self.clear_caches();
                     self.add_system_labels()?;
                     Ok(true)
@@ -402,6 +430,18 @@ impl Wallet {
             .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
             .connection()?;
         queries::quarantine_count(conn)
+    }
+
+    /// Permanently delete every quarantined record (the ones that did not
+    /// decrypt under the master password during the upgrade and that the user
+    /// gives up on recovering), then compact the database so their bytes are
+    /// gone from the file. Returns how many records were deleted.
+    pub fn discard_quarantined(&mut self) -> Result<u32> {
+        self.ensure_unlocked()?;
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+        queries::discard_quarantine(conn)
     }
 
     /// Try to recover quarantined records with `password` (which may differ
@@ -602,7 +642,7 @@ impl Wallet {
             database_id: raw_props.database_id,
             lang: raw_props.lang,
             version: raw_props.version,
-            encryption_count: legacy_encryption_count(raw_props.email.as_deref()),
+            encryption_count: legacy_encryption_count(raw_props.email.as_deref())?,
             sync_timestamp: raw_props.sync_timestamp.as_ref().and_then(|s| parse_timestamp(s)),
             update_timestamp: raw_props.update_timestamp.as_ref().and_then(|s| parse_timestamp(s)),
         })
@@ -649,6 +689,29 @@ impl Wallet {
         Ok(())
     }
 
+    /// When the database file was last rebuilt as a whole (see
+    /// [`Wallet::compact_file`]), from the marker stored in the vault.
+    fn compacted_at(&self) -> Result<Option<String>> {
+        let conn = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
+            .connection()?;
+        queries::get_compacted_at(conn)
+    }
+
+    /// Rebuild the database file (`VACUUM`, then a truncating WAL
+    /// checkpoint) so no free page or unused cell space keeps content from
+    /// before, then store the compaction marker. The marker is written only
+    /// after the rebuild succeeded, so an interrupted run is simply repeated.
+    fn compact_file(&self) -> Result<()> {
+        let db = self.db.as_ref()
+            .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
+        db.vacuum()?;
+        let conn = db.connection()?;
+        queries::set_compacted_at(conn, &queries::now_timestamp())?;
+        queries::checkpoint(conn)?;
+        Ok(())
+    }
+
     /// Whether the pre-v6 snapshot ([`PRE_V6_BACKUP_FILENAME`]) is still in
     /// the wallet folder.
     pub fn has_pre_v6_snapshot(&self) -> bool {
@@ -663,26 +726,36 @@ impl Wallet {
     /// can replace it. It is deleted only when all of these hold:
     /// - the wallet is unlocked (else [`WalletError::Locked`]), which proves
     ///   the converted vault opens with the password;
-    /// - the vault is v6 (it has a crypto record and version >= 6);
+    /// - the vault is v6 (it has a crypto record and version >= 6) and its
+    ///   file has been rebuilt since the upgrade (compaction marker present);
     /// - the snapshot exists;
     /// - `backup_folder` holds at least one backup that passes
-    ///   [`crate::backup::inspect_backup_in`] and reports database version >= 6.
+    ///   [`crate::backup::inspect_backup_in`], reports database version >= 6,
+    ///   has this vault's database id, and was taken after the rebuild (its
+    ///   database carries the compaction marker).
     ///
     /// Backups are inspected through a temporary folder inside the wallet
     /// folder. Backups that fail inspection are skipped, not reported.
     /// Calling it again after the snapshot is gone returns `Ok(false)`.
     pub fn retire_pre_v6_snapshot(&self, backup_folder: &Path) -> Result<bool> {
         self.ensure_unlocked()?;
-        {
+        let database_id = {
             let conn = self.db.as_ref()
                 .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?
                 .connection()?;
             let version: u32 = migrations::get_database_version(conn)?.parse().unwrap_or(0);
-            if version < V6 || queries::get_crypto_record(conn)?.is_none() {
+            if version < V6
+                || queries::get_crypto_record(conn)?.is_none()
+                || queries::get_compacted_at(conn)?.is_none()
+            {
                 return Ok(false);
             }
-        }
-        if !self.has_pre_v6_snapshot() || !has_v6_backup(backup_folder, &self.folder)? {
+            match queries::get_database_id(conn)? {
+                Some(id) => id,
+                None => return Ok(false),
+            }
+        };
+        if !self.has_pre_v6_snapshot() || !has_v6_backup(backup_folder, &self.folder, &database_id)? {
             return Ok(false);
         }
         std::fs::remove_file(self.folder.join(PRE_V6_BACKUP_FILENAME)).map_err(|e| {
@@ -721,7 +794,8 @@ impl Wallet {
     /// snapshot (kept until retired), then in a single transaction generate fresh key material,
     /// re-encrypt every item name and field value (active, deleted, and root)
     /// from the legacy scheme to the DEK AEAD scheme, write the crypto record,
-    /// and bump the version to 6.
+    /// and bump the version to 6. After the commit the file is rebuilt
+    /// (`VACUUM` + truncating checkpoint) and the compaction marker stored.
     ///
     /// Tolerance rules (deliberately mirroring what the 5.x app survived):
     /// NULL/empty blobs migrate as empty values; an ACTIVE record that fails
@@ -780,6 +854,10 @@ impl Wallet {
 
         let db = self.db.as_mut()
             .ok_or_else(|| WalletError::DatabaseError("Database not open".to_string()))?;
+        // Overwrite replaced and removed records as they go (also set for
+        // every wallet connection; repeated here because the rewrite below
+        // depends on it).
+        db.connection()?.execute_batch("PRAGMA secure_delete = ON")?;
         db.begin_transaction()?;
 
         let result = (|| -> Result<()> {
@@ -801,9 +879,9 @@ impl Wallet {
                 // NULL/empty blobs exist in real legacy databases (the old
                 // sqlite-net layer wrote and read them without complaint);
                 // migrate them as empty names rather than failing.
-                let decrypted: Option<String> = match blob.as_deref() {
-                    None => Some(String::new()),
-                    Some([]) => Some(String::new()),
+                let decrypted: Option<Zeroizing<String>> = match blob.as_deref() {
+                    None => Some(Zeroizing::default()),
+                    Some([]) => Some(Zeroizing::default()),
                     Some(bytes) => match legacy_key.decrypt(bytes) {
                         Ok(plaintext) => {
                             count_mode(&mut summary, legacy_key.preferred_mode());
@@ -851,9 +929,9 @@ impl Wallet {
                     summary.fields_quarantined += 1;
                     continue;
                 }
-                let decrypted: Option<String> = match blob.as_deref() {
-                    None => Some(String::new()),
-                    Some([]) => Some(String::new()),
+                let decrypted: Option<Zeroizing<String>> = match blob.as_deref() {
+                    None => Some(Zeroizing::default()),
+                    Some([]) => Some(Zeroizing::default()),
                     Some(bytes) => match legacy_key.decrypt(bytes) {
                         Ok(plaintext) => {
                             count_mode(&mut summary, legacy_key.preferred_mode());
@@ -915,12 +993,17 @@ impl Wallet {
             }
         }
 
-        // 5. Best-effort checkpoint so the on-disk file fully reflects the
-        // migrated state. The commit above is already durable (in the WAL), so a
-        // checkpoint failure must NOT fail the migration: SQLite will checkpoint
-        // automatically later. Making this fatal would surface a spurious error
-        // on an otherwise-successful, already-committed v6 migration.
-        let _ = self.db.as_ref().unwrap().checkpoint();
+        // 5. Rebuild the file (VACUUM + truncating checkpoint) so no page
+        // keeps a record in the old format, then store the compaction
+        // marker. Best effort: the commit above is already durable, so a
+        // failure here must NOT fail the migration; the marker then stays
+        // absent and the next unlock repeats the rebuild. Fall back to a
+        // plain checkpoint so the file still reflects the migrated state.
+        if self.compact_file().is_err()
+            && let Some(db) = self.db.as_ref()
+        {
+            let _ = db.checkpoint();
+        }
 
         // 6. Hold the DEK: the vault is now unlocked under v6. Record the
         // outcome for the app's diagnostics log.
@@ -992,6 +1075,21 @@ pub(crate) mod tests {
         (wallet, temp_dir)
     }
 
+    /// A vault that already carries the compaction marker is not rebuilt
+    /// again at unlock: the marker keeps its value.
+    #[test]
+    fn an_unlock_does_not_compact_a_vault_again() {
+        let (mut wallet, _temp) = create_test_wallet();
+        {
+            let conn = wallet.db.as_ref().unwrap().connection().unwrap();
+            queries::set_compacted_at(conn, "kept-marker").unwrap();
+        }
+        assert_eq!(wallet.compacted_at().unwrap().as_deref(), Some("kept-marker"));
+        wallet.lock();
+        assert!(wallet.unlock("TestPassword123").unwrap());
+        assert_eq!(wallet.compacted_at().unwrap().as_deref(), Some("kept-marker"));
+    }
+
     /// A closed v6 wallet whose crypto record was then changed by `sql`.
     fn wallet_with_crypto_record_changed(sql: &str) -> (TempDir, std::path::PathBuf) {
         let (wallet, temp) = create_test_wallet();
@@ -1040,6 +1138,8 @@ pub(crate) mod tests {
             "UPDATE nswallet_properties SET version = '5'",
             "UPDATE nswallet_properties SET version = 'x'",
             "DELETE FROM nswallet_crypto",
+            "DELETE FROM nswallet_compaction",
+            "UPDATE nswallet_properties SET database_id = 'another'",
         ] {
             let (wallet, temp) = create_test_wallet();
             let backups = v6_backup_folder(temp.path());
@@ -1317,6 +1417,36 @@ pub(crate) mod tests {
     /// actually used - deriving the wrong AES key and reporting the correct
     /// password as wrong. `check_password` must succeed with the real
     /// password and still reject a wrong one.
+    #[test]
+    fn the_legacy_encryption_count_is_parsed_and_capped() {
+        assert_eq!(legacy_encryption_count(None).unwrap(), 0);
+        assert_eq!(legacy_encryption_count(Some("")).unwrap(), 0);
+        assert_eq!(legacy_encryption_count(Some("x")).unwrap(), 0);
+        assert_eq!(legacy_encryption_count(Some("200")).unwrap(), 200);
+        assert_eq!(
+            legacy_encryption_count(Some("10000")).unwrap(),
+            MAX_LEGACY_ENCRYPTION_COUNT
+        );
+        assert!(legacy_encryption_count(Some("10001")).is_err());
+        assert!(legacy_encryption_count(Some("4294967295")).is_err());
+    }
+
+    /// A legacy vault claiming an encryption count above the cap fails the
+    /// password check at once instead of hashing for that long. (The count
+    /// is just above the cap so a broken cap fails fast instead of hanging.)
+    #[test]
+    fn a_huge_legacy_encryption_count_fails_the_password_check() {
+        let (_temp, path) = create_wallet_with_null_email();
+        {
+            let conn = rusqlite::Connection::open(path.join(DATABASE_FILENAME)).unwrap();
+            conn.execute("UPDATE nswallet_properties SET email = '10001'", []).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let wallet = Wallet::open(&path).unwrap();
+        assert!(matches!(wallet.check_password("TestPassword123"), Err(WalletError::InvalidInput(_))));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
     #[test]
     fn test_check_password_after_reopen_null_email() {
         let (_temp, path) = create_wallet_with_null_email();
@@ -1715,6 +1845,55 @@ pub(crate) mod tests {
         let item_id = items.iter().find(|i| i.name == "Legacy Item").unwrap().item_id.clone();
         let fields = wallet.get_fields_by_item(&item_id).unwrap();
         assert_eq!(fields[0].value, "legacy_secret");
+    }
+
+    /// Discarding quarantined records deletes them and erases their bytes
+    /// from the database file; a second call has nothing left to do.
+    #[test]
+    fn test_discard_quarantined_erases_the_records() {
+        use rusqlite::Connection;
+        let password_b = "CompletelyOther456";
+        let (_temp, path) = create_legacy_vault_with_data(0);
+        let db_path = path.join(crate::DATABASE_FILENAME);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let new_root = crypto::legacy::encrypt("recreated-root", password_b, 0, None).unwrap();
+            conn.execute(
+                "UPDATE nswallet_items SET name = ? WHERE item_id = '__ROOT__'",
+                rusqlite::params![new_root],
+            ).unwrap();
+        }
+
+        let mut wallet = Wallet::open(&path).unwrap();
+        assert!(matches!(wallet.discard_quarantined(), Err(WalletError::Locked)));
+        assert!(wallet.unlock(password_b).unwrap());
+        assert_eq!(wallet.quarantine_count().unwrap(), 3);
+        let blobs: Vec<Vec<u8>> = {
+            let conn = Connection::open(&db_path).unwrap();
+            let mut stmt = conn.prepare("SELECT blob FROM nswallet_quarantine").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().map(|b| b.unwrap()).collect()
+        };
+        assert_eq!(blobs.len(), 3);
+        assert!(blobs.iter().all(|b| b.len() >= 16));
+
+        assert_eq!(wallet.discard_quarantined().unwrap(), 3);
+        assert_eq!(wallet.quarantine_count().unwrap(), 0);
+        assert_eq!(wallet.discard_quarantined().unwrap(), 0);
+        let mut bytes = std::fs::read(&db_path).unwrap();
+        bytes.extend(std::fs::read(db_path.with_extension("dat-wal")).unwrap_or_default());
+        for blob in &blobs {
+            assert!(!bytes.windows(blob.len()).any(|w| w == blob.as_slice()), "a discarded blob is still in the file");
+        }
+        // The vault itself is untouched and still opens.
+        assert!(wallet.get_items().unwrap().iter().all(|i| i.name != "Legacy Item"));
+        wallet.lock();
+        assert!(wallet.unlock(password_b).unwrap());
+    }
+
+    #[test]
+    fn test_discard_quarantined_without_a_quarantine_table() {
+        let (mut wallet, _t) = create_test_wallet();
+        assert_eq!(wallet.discard_quarantined().unwrap(), 0);
     }
 
     /// Cases 7-9: the old-app hidden root re-creation replay. Root under

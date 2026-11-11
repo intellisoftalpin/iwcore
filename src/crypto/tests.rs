@@ -37,7 +37,7 @@ fn test_stress_short_strings() {
         let decrypted = decrypt(&encrypted, &password, 0, None)
             .unwrap_or_else(|_| panic!("Decryption should succeed, iteration {}", i));
 
-        assert_eq!(decrypted, plaintext, "Mismatch at iteration {}", i);
+        assert_eq!(decrypted.as_str(), plaintext, "Mismatch at iteration {}", i);
     }
 }
 
@@ -61,7 +61,7 @@ fn test_stress_long_strings() {
         let decrypted = decrypt(&encrypted, &password, 0, None)
             .unwrap_or_else(|_| panic!("Decryption should succeed, iteration {}", i));
 
-        assert_eq!(decrypted, plaintext, "Mismatch at iteration {}", i);
+        assert_eq!(decrypted.as_str(), plaintext, "Mismatch at iteration {}", i);
     }
 }
 
@@ -86,7 +86,7 @@ fn test_stress_huge_strings() {
         let decrypted = decrypt(&encrypted, &password, 0, None)
             .unwrap_or_else(|_| panic!("Decryption should succeed, iteration {}", i));
 
-        assert_eq!(decrypted, plaintext, "Mismatch at iteration {}", i);
+        assert_eq!(decrypted.as_str(), plaintext, "Mismatch at iteration {}", i);
     }
 }
 
@@ -99,7 +99,7 @@ fn test_special_characters() {
     let encrypted = encrypt(plaintext, password, 0, None).unwrap();
     let decrypted = decrypt(&encrypted, password, 0, None).unwrap();
 
-    assert_eq!(decrypted, plaintext);
+    assert_eq!(decrypted.as_str(), plaintext);
 }
 
 /// Test with Cyrillic characters
@@ -111,7 +111,7 @@ fn test_cyrillic_data() {
     let encrypted = encrypt(plaintext, password, 0, None).unwrap();
     let decrypted = decrypt(&encrypted, password, 0, None).unwrap();
 
-    assert_eq!(decrypted, plaintext);
+    assert_eq!(decrypted.as_str(), plaintext);
 }
 
 /// Test iOS workaround for legacy data
@@ -142,14 +142,14 @@ fn test_ios_workaround() {
     let mut buffer = vec![0u8; padded_len];
     buffer[..data.len()].copy_from_slice(data);
 
-    let encryptor = Encryptor::<Aes256>::new(&ios_key.into(), &[0u8; 16].into());
+    let encryptor = Encryptor::<Aes256>::new(&(*ios_key).into(), &[0u8; 16].into());
     let encrypted = encryptor
         .encrypt_padded::<Pkcs7>(&mut buffer, data.len())
         .unwrap();
 
     // Normal decryption should work due to iOS fallback
     let decrypted = decrypt(encrypted, password, 0, None).unwrap();
-    assert_eq!(decrypted, plaintext);
+    assert_eq!(decrypted.as_str(), plaintext);
 }
 
 /// Test encryption output size
@@ -196,7 +196,7 @@ fn test_block_aligned_16_char() {
     assert_eq!(encrypted, expected.to_vec());
 
     let decrypted = decrypt(&encrypted, password, 0, None).unwrap();
-    assert_eq!(decrypted, plaintext);
+    assert_eq!(decrypted.as_str(), plaintext);
 }
 
 /// Test block-aligned plaintext (32 chars → MD5+plaintext = 64 bytes = 4 blocks)
@@ -224,7 +224,7 @@ fn test_block_aligned_32_char() {
     assert_eq!(encrypted, expected.to_vec());
 
     let decrypted = decrypt(&encrypted, password, 0, None).unwrap();
-    assert_eq!(decrypted, plaintext);
+    assert_eq!(decrypted.as_str(), plaintext);
 }
 
 /// Regression vector: re_encryption_count=200 (app default)
@@ -252,7 +252,7 @@ fn test_regression_vector_count_200() {
 
     // Verify decryption of hardcoded bytes works
     let decrypted = decrypt(&expected, password, 200, None).unwrap();
-    assert_eq!(decrypted, plaintext);
+    assert_eq!(decrypted.as_str(), plaintext);
 }
 
 /// Regression vector: Cyrillic password + plaintext with re_encryption_count=200
@@ -279,7 +279,7 @@ fn test_regression_vector_cyrillic_count_200() {
 
     // Verify decryption of hardcoded bytes works
     let decrypted = decrypt(&expected, password, 200, None).unwrap();
-    assert_eq!(decrypted, plaintext);
+    assert_eq!(decrypted.as_str(), plaintext);
 }
 
 /// Test with hash parameter
@@ -293,5 +293,5 @@ fn test_with_hash_parameter() {
     let encrypted = encrypt(plaintext, password, 1, Some(hash)).unwrap();
     let decrypted = decrypt(&encrypted, password, 1, Some(hash)).unwrap();
 
-    assert_eq!(decrypted, plaintext);
+    assert_eq!(decrypted.as_str(), plaintext);
 }

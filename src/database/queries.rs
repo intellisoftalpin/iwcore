@@ -146,6 +146,44 @@ pub struct CryptoRecord {
     pub dek_wrapped: Vec<u8>,
 }
 
+// ============================================================================
+// Compaction marker (nswallet_compaction)
+// ============================================================================
+
+/// When the database file was last rebuilt by a full `VACUUM`, or `None` when
+/// the marker table is absent or empty. Works on a read-only connection.
+pub(crate) fn get_compacted_at(conn: &Connection) -> Result<Option<String>> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'nswallet_compaction'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT compacted_at FROM nswallet_compaction WHERE id = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
+/// Record `compacted_at` as the time of the last full rebuild of the file,
+/// creating the marker table when needed.
+pub(crate) fn set_compacted_at(conn: &Connection, compacted_at: &str) -> Result<()> {
+    conn.execute_batch(crate::database::schema::CREATE_COMPACTION_TABLE)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO nswallet_compaction (id, compacted_at) VALUES (1, ?)",
+        params![compacted_at],
+    )?;
+    Ok(())
+}
+
 /// Create the crypto table if it does not exist (used by the migration on an
 /// existing v5 database). Safe to call repeatedly.
 pub fn ensure_crypto_table(conn: &Connection) -> Result<()> {
@@ -414,6 +452,21 @@ pub fn get_quarantine_rows(conn: &Connection) -> Result<Vec<QuarantineRow>> {
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Delete every quarantined record and erase it from the file: VACUUM
+/// rewrites the database without the freed pages, and the checkpoint empties
+/// the WAL. Returns how many records were deleted; 0 when the table does not
+/// exist. Must run outside a transaction (VACUUM cannot run inside one).
+pub fn discard_quarantine(conn: &Connection) -> Result<u32> {
+    let removed = quarantine_count(conn)?;
+    if removed == 0 {
+        return Ok(0);
+    }
+    conn.execute("DELETE FROM nswallet_quarantine", [])?;
+    conn.execute_batch("VACUUM")?;
+    checkpoint(conn)?;
+    Ok(removed)
 }
 
 /// Remove a recovered record from quarantine (same transaction as the

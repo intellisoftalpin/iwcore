@@ -1,6 +1,6 @@
 [package]
 name = "iwcore"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -17,7 +17,7 @@ exclude = ["docs", "fuzz", "scripts"]
 [dependencies]
 # Database
 # `hooks`: the progress handler that bounds work on a backup's database.
-rusqlite = { version = "0.41.1", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "hooks", "limits"] }
 
 # Crypto - current scheme (XChaCha20-Poly1305 + Argon2id)
 chacha20poly1305 = "0.11.0"

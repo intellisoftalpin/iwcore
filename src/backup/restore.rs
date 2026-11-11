@@ -34,7 +34,10 @@ fn entry_limit(max_bytes: u64, compressed_size: u64) -> u64 {
 /// Restore a backup to the database path.
 ///
 /// The database entry must start with the SQLite header, which is checked
-/// before anything is written. The entry is then streamed into a temporary
+/// before anything is written. Before it replaces the database, the copy
+/// must pass the checks of [`inspect_backup_in`] and hold no triggers, no
+/// views (except the labels view of older vaults), no virtual tables, no
+/// generated columns and no expression or partial indexes. The entry is then streamed into a temporary
 /// file beside `db_path`, never held in memory as a whole, and refused if it
 /// grows past [`MAX_RESTORED_DB_BYTES`] or inflates more than 1000 times its
 /// compressed size (entries up to 1 MiB are exempt from the ratio). Only a
@@ -114,6 +117,13 @@ fn restore_backup_with(
     temp.as_file_mut()
         .sync_all()
         .map_err(|e| WalletError::BackupError(format!("Failed to write database: {}", e)))?;
+
+    // The copy is checked like any untrusted database, and its schema must be
+    // safe to open as the live vault, before it replaces anything.
+    {
+        let conn = super::untrusted::open_untrusted(temp.path())?;
+        super::untrusted::check_restorable_schema(&conn)?;
+    }
 
     replace_database(temp, db_path, persist)
 }
@@ -298,7 +308,20 @@ pub fn check_backup_password_in(backup_path: &Path, password: &str, temp_base: &
     let temp_dir = temp_dir_in(temp_base)?;
     let db_path = extract_backup(backup_path, temp_dir.path())?;
     let conn = super::untrusted::open_untrusted(&db_path)?;
+    check_backup_kdf_params(&conn)?;
     crate::business::wallet::check_password_on(&conn, password)
+}
+
+/// Refuse a backup whose key derivation costs more than a backup may ask for
+/// (see [`crate::crypto::kdf::KdfParams::check_backup`]), before any
+/// derivation runs.
+fn check_backup_kdf_params(conn: &rusqlite::Connection) -> Result<()> {
+    if let Some(rec) = crate::database::queries::get_crypto_record(conn)? {
+        crate::crypto::kdf::KdfParams { m_cost_kib: rec.m_cost_kib, t_cost: rec.t_cost, p_cost: rec.p_cost }
+            .check_backup()
+            .map_err(|e| WalletError::BackupError(format!("crypto record: {e}")))?;
+    }
+    Ok(())
 }
 
 /// What a backup holds, read without its password. Lets an app warn before a
@@ -353,6 +376,38 @@ pub fn inspect_backup_in(backup_path: &Path, temp_base: &Path) -> Result<BackupI
     Ok(BackupInspection { db_version, created, item_count, passkey_count })
 }
 
+/// Which vault a backup belongs to and whether its file was rebuilt after
+/// the format upgrade. Read without the backup's password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackupOrigin {
+    /// The database version string (`"6"` for current vaults).
+    pub(crate) db_version: String,
+    /// The vault's `database_id`, if the properties row has one.
+    pub(crate) database_id: Option<String>,
+    /// The compaction marker the backup's database carries, if any.
+    pub(crate) compacted_at: Option<String>,
+}
+
+/// Read a backup's [`BackupOrigin`], with the same untrusted-file checks as
+/// [`inspect_backup_in`].
+pub(crate) fn backup_origin_in(backup_path: &Path, temp_base: &Path) -> Result<BackupOrigin> {
+    use rusqlite::OptionalExtension;
+
+    let temp_dir = temp_dir_in(temp_base)?;
+    let db_path = extract_backup(backup_path, temp_dir.path())?;
+    let conn = super::untrusted::open_untrusted(&db_path)?;
+
+    let db_version = super::untrusted::read_db_version(&conn)?;
+    let database_id = conn
+        .query_row("SELECT database_id FROM nswallet_properties LIMIT 1", [], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten();
+    let compacted_at = crate::database::queries::get_compacted_at(&conn)?;
+    Ok(BackupOrigin { db_version, database_id, compacted_at })
+}
+
 /// Check database version directly from a database file (not a backup)
 pub fn get_db_version(db_path: &Path) -> Result<String> {
     use rusqlite::Connection;
@@ -387,8 +442,24 @@ mod tests {
     use tempfile::TempDir;
     use std::io::Write;
 
-    /// Entry content of [`create_test_backup`]: the SQLite header and a tail.
-    const TEST_DB: &str = "SQLite format 3\0test database content";
+    /// Bytes that start like an SQLite database but are not one.
+    const FAKE_DB: &str = "SQLite format 3\0test database content";
+
+    /// Entry content of [`create_test_backup`]: an empty wallet database.
+    fn test_db() -> Vec<u8> {
+        static DB: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        DB.get_or_init(|| {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("t.db");
+            drop(crate::database::Database::create(&path).unwrap());
+            fs::read(&path).unwrap()
+        })
+        .clone()
+    }
+
+    fn test_db_len() -> u64 {
+        test_db().len() as u64
+    }
 
     fn create_test_backup(dir: &Path) -> PathBuf {
         use zip::write::SimpleFileOptions;
@@ -400,7 +471,7 @@ mod tests {
 
         let options = SimpleFileOptions::default();
         zip.start_file(DATABASE_FILENAME, options).unwrap();
-        zip.write_all(TEST_DB.as_bytes()).unwrap();
+        zip.write_all(&test_db()).unwrap();
         zip.finish().unwrap();
 
         backup_path
@@ -423,8 +494,7 @@ mod tests {
         let db_path = extract_backup(&backup_path, &target_dir).unwrap();
 
         assert!(db_path.exists());
-        let content = fs::read_to_string(&db_path).unwrap();
-        assert_eq!(content, TEST_DB);
+        assert_eq!(fs::read(&db_path).unwrap(), test_db());
     }
 
     #[test]
@@ -436,8 +506,7 @@ mod tests {
         restore_backup(&backup_path, &db_path).unwrap();
 
         assert!(db_path.exists());
-        let content = fs::read_to_string(&db_path).unwrap();
-        assert_eq!(content, TEST_DB);
+        assert_eq!(fs::read(&db_path).unwrap(), test_db());
     }
 
     #[test]
@@ -449,7 +518,7 @@ mod tests {
         fs::write(&db_path, b"OLD DATABASE").unwrap();
 
         restore_backup(&backup_path, &db_path).unwrap();
-        assert_eq!(fs::read_to_string(&db_path).unwrap(), TEST_DB);
+        assert_eq!(fs::read(&db_path).unwrap(), test_db());
     }
 
     #[test]
@@ -460,8 +529,7 @@ mod tests {
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         fs::write(&db_path, b"OLD DATABASE").unwrap();
 
-        // TEST_DB is 37 bytes.
-        let err = restore_backup_capped(&backup_path, &db_path, 36).unwrap_err();
+        let err = restore_backup_capped(&backup_path, &db_path, test_db_len() - 1).unwrap_err();
         assert!(matches!(err, WalletError::BackupError(_)));
         assert_eq!(fs::read_to_string(&db_path).unwrap(), "OLD DATABASE");
         // No temp file left behind.
@@ -469,8 +537,8 @@ mod tests {
         assert_eq!(leftovers.len(), 1);
 
         // Exactly at the limit is fine.
-        restore_backup_capped(&backup_path, &db_path, 37).unwrap();
-        assert_eq!(fs::read_to_string(&db_path).unwrap(), TEST_DB);
+        restore_backup_capped(&backup_path, &db_path, test_db_len()).unwrap();
+        assert_eq!(fs::read(&db_path).unwrap(), test_db());
     }
 
     #[test]
@@ -509,7 +577,7 @@ mod tests {
 
         restore_backup(&backup_path, &db_path).unwrap();
         assert!(!wal.exists() && !shm.exists());
-        assert_eq!(fs::read_to_string(&db_path).unwrap(), TEST_DB);
+        assert_eq!(fs::read(&db_path).unwrap(), test_db());
     }
 
     #[test]
@@ -655,13 +723,13 @@ mod tests {
     fn restore_enforces_the_limit_on_the_bytes_read_when_the_declared_size_lies() {
         let temp_dir = TempDir::new().unwrap();
         let backup_path = create_test_backup(temp_dir.path());
-        declare_uncompressed_size(&backup_path, 36);
+        declare_uncompressed_size(&backup_path, u32::try_from(test_db_len() - 1).unwrap());
         let db_path = temp_dir.path().join("w").join(DATABASE_FILENAME);
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         fs::write(&db_path, b"OLD DATABASE").unwrap();
 
-        // Declares exactly the limit, inflates to 37.
-        let err = restore_backup_capped(&backup_path, &db_path, 36).unwrap_err();
+        // Declares exactly the limit, inflates one byte past it.
+        let err = restore_backup_capped(&backup_path, &db_path, test_db_len() - 1).unwrap_err();
         assert!(matches!(err, WalletError::BackupError(_)));
         assert_eq!(fs::read_to_string(&db_path).unwrap(), "OLD DATABASE");
     }
@@ -697,7 +765,7 @@ mod tests {
         let db_path = old_database_with_sidecars(&dir);
 
         restore_backup(&backup_path, &db_path).unwrap();
-        assert_eq!(fs::read_to_string(&db_path).unwrap(), TEST_DB);
+        assert_eq!(fs::read(&db_path).unwrap(), test_db());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "only the database is left");
     }
 
@@ -748,7 +816,7 @@ mod tests {
         fs::write(sidecar(&dir, &format!("-wal{PARKED_SUFFIX}")), b"stale").unwrap();
 
         restore_backup(&backup_path, &db_path).unwrap();
-        assert_eq!(fs::read_to_string(&db_path).unwrap(), TEST_DB);
+        assert_eq!(fs::read(&db_path).unwrap(), test_db());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
     }
 
@@ -762,7 +830,7 @@ mod tests {
         fs::create_dir(sidecar(temp_dir.path(), "-wal")).unwrap();
 
         restore_backup(&backup_path, &db_path).unwrap();
-        assert_eq!(fs::read_to_string(&db_path).unwrap(), TEST_DB);
+        assert_eq!(fs::read(&db_path).unwrap(), test_db());
         assert!(!sidecar(temp_dir.path(), "-wal").exists());
     }
 
@@ -774,7 +842,7 @@ mod tests {
         let backup_path = zip_of_db(
             dir,
             "new.zip",
-            "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('restored');",
+            &format!("{MINIMAL_WALLET_SCHEMA} CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('restored');"),
         );
         // The previous database plus a leftover rollback journal.
         let db_path = dir.join("w").join(DATABASE_FILENAME);
@@ -951,7 +1019,8 @@ mod tests {
     #[test]
     fn a_backup_that_is_not_an_sqlite_database_is_refused() {
         let temp_dir = TempDir::new().unwrap();
-        let backup_path = create_test_backup(temp_dir.path());
+        let backup_path = temp_dir.path().join("fake.zip");
+        zip_with_db_entry(&backup_path, FAKE_DB.as_bytes());
         let base = temp_dir.path().join("tmp");
 
         assert!(matches!(inspect_backup_in(&backup_path, &base), Err(WalletError::BackupError(_))));
@@ -971,6 +1040,111 @@ mod tests {
         let base = temp_dir.path().join("tmp");
         // No root and no data: the password cannot be verified.
         assert!(check_backup_password_in(&backup_path, "pw", &base).is_err());
+    }
+
+    /// A backup of a vault whose crypto record asks for more than a backup
+    /// may is refused before the password is derived.
+    #[test]
+    fn a_backup_asking_for_a_costly_key_derivation_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let wallet_dir = temp_dir.path().join("w");
+        let wallet = crate::Wallet::create(&wallet_dir, "pw", "en").unwrap();
+        drop(wallet);
+        let db = wallet_dir.join(DATABASE_FILENAME);
+        let base = temp_dir.path().join("tmp");
+        let backup_of = |name: &str| {
+            let path = temp_dir.path().join(name);
+            zip_with_db_entry(&path, &fs::read(&db).unwrap());
+            path
+        };
+        assert!(check_backup_password_in(&backup_of("ok.zip"), "pw", &base).unwrap());
+
+        let set = |sql: &str| rusqlite::Connection::open(&db).unwrap().execute_batch(sql).unwrap();
+        for sql in [
+            "UPDATE nswallet_crypto SET kdf_m_cost = 262145",
+            "UPDATE nswallet_crypto SET kdf_m_cost = 65536, kdf_t_cost = 13",
+            "UPDATE nswallet_crypto SET kdf_t_cost = 3, kdf_p_cost = 5",
+        ] {
+            set(sql);
+            let err = check_backup_password_in(&backup_of("costly.zip"), "pw", &base).unwrap_err();
+            assert!(matches!(&err, WalletError::BackupError(m) if m.contains("for a backup")), "{sql}: {err:?}");
+        }
+    }
+
+    /// A backup whose schema would run code in the live vault is refused,
+    /// and the previous database stays as it was.
+    #[test]
+    fn a_backup_with_code_in_its_schema_is_not_restored() {
+        for (what, sql) in [
+            ("trigger", "CREATE TRIGGER t AFTER INSERT ON nswallet_items BEGIN DELETE FROM nswallet_fields; END;"),
+            ("view", "CREATE VIEW v AS SELECT 1;"),
+            ("virtual table", "CREATE VIRTUAL TABLE v USING fts5(a);"),
+            ("generated column", "CREATE TABLE g (a INT, b INT AS (a * 2));"),
+            ("expression index", "CREATE INDEX i ON nswallet_items (length(item_id));"),
+            ("partial index", "CREATE INDEX i ON nswallet_items (item_id) WHERE deleted = 0;"),
+        ] {
+            let temp_dir = TempDir::new().unwrap();
+            let backup_path = zip_of_db(temp_dir.path(), "b.zip", &format!("{MINIMAL_WALLET_SCHEMA} {sql}"));
+            let db_path = old_database_with_sidecars(temp_dir.path());
+            let err = restore_backup(&backup_path, &db_path).unwrap_err();
+            assert!(matches!(err, WalletError::BackupError(_)), "{what}: {err:?}");
+            assert_old_database_intact(temp_dir.path(), &db_path);
+        }
+    }
+
+    #[test]
+    fn a_backup_that_fails_inspection_is_not_restored() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = endless_view_backup(temp_dir.path());
+        let db_path = old_database_with_sidecars(temp_dir.path());
+        assert!(restore_backup(&backup_path, &db_path).is_err());
+        assert_old_database_intact(temp_dir.path(), &db_path);
+
+        let fake = temp_dir.path().join("fake.zip");
+        zip_with_db_entry(&fake, FAKE_DB.as_bytes());
+        assert!(restore_backup(&fake, &db_path).is_err());
+        assert_old_database_intact(temp_dir.path(), &db_path);
+    }
+
+    /// Plain indexes, the labels view of older vaults and the schema iwcore
+    /// writes restore.
+    #[test]
+    fn a_backup_with_the_usual_schema_restores() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_path = zip_of_db(
+            temp_dir.path(),
+            "b.zip",
+            &format!(
+                "{MINIMAL_WALLET_SCHEMA}
+                 CREATE TABLE nswallet_labels (field_type, label_name, value_type, icon, system, change_timestamp, deleted);
+                 {};
+                 CREATE INDEX i ON nswallet_items (item_id);
+                 CREATE UNIQUE INDEX j ON nswallet_fields (item_id, type);",
+                crate::database::schema::CREATE_LABELS_VIEW
+            ),
+        );
+        let db_path = temp_dir.path().join("w").join(DATABASE_FILENAME);
+        restore_backup(&backup_path, &db_path).unwrap();
+        assert!(db_path.exists());
+    }
+
+    /// The fuzz seeds for backups stay valid wallet databases.
+    #[test]
+    fn the_restore_fuzz_seeds_pass_inspection() {
+        let seeds = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fuzz/seeds/restore");
+        // The published crate leaves out the fuzz folder.
+        if !seeds.exists() {
+            return;
+        }
+        for name in ["wallet_v6", "wallet_legacy"] {
+            let bytes = fs::read(seeds.join(name)).unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let backup_path = temp_dir.path().join("iwb-20260101-120000-manual.zip");
+            zip_with_db_entry(&backup_path, &bytes[1..]);
+            let base = temp_dir.path().join("tmp");
+            inspect_backup_in(&backup_path, &base).unwrap();
+            assert!(!check_backup_password_in(&backup_path, "Sun001!", &base).unwrap(), "{name}");
+        }
     }
 
     /// Test: CheckFutureVersionOfDb from C# BackupFixture

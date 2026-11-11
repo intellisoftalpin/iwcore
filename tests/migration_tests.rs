@@ -73,7 +73,7 @@ fn legacy_snapshot(db_path: &Path, password: &str) -> Snapshot {
             .collect();
         let mut chain = legacy::LegacyKeyChain::new(password, enc_count);
         for (id, blob, deleted) in rows {
-            if let Ok(pt) = chain.decrypt(&blob) {
+            if let Ok(pt) = chain.decrypt(&blob).map(|p| p.to_string()) {
                 if deleted != 0 {
                     deleted_items.insert(id, pt);
                 } else {
@@ -96,7 +96,7 @@ fn legacy_snapshot(db_path: &Path, password: &str) -> Snapshot {
             .collect();
         let mut chain = legacy::LegacyKeyChain::new(password, enc_count);
         for (iid, fid, blob, deleted) in rows {
-            if let Ok(pt) = chain.decrypt(&blob) {
+            if let Ok(pt) = chain.decrypt(&blob).map(|p| p.to_string()) {
                 if deleted != 0 {
                     deleted_fields.insert((iid, fid), pt);
                 } else {

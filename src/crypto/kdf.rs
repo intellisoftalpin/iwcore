@@ -38,6 +38,14 @@ pub const KDF_MAX_T_COST: u32 = 100;
 /// Largest parallelism accepted from a stored vault record.
 pub const KDF_MAX_P_COST: u32 = 16;
 
+/// Largest memory cost accepted from a backup before its password is
+/// checked: four times the default, 256 MiB.
+pub const BACKUP_KDF_MAX_M_COST_KIB: u32 = 4 * ARGON2_M_COST_KIB;
+/// Largest time cost accepted from a backup: four times the default.
+pub const BACKUP_KDF_MAX_T_COST: u32 = 4 * ARGON2_T_COST;
+/// Largest parallelism accepted from a backup.
+pub const BACKUP_KDF_MAX_P_COST: u32 = 4;
+
 /// Argon2id cost parameters for a vault. Stored per-vault and used verbatim on
 /// unlock, so older vaults remain decryptable after the consts are raised.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +88,28 @@ impl KdfParams {
                 "KDF memory cost {} KiB is outside {min_m}..={KDF_MAX_M_COST_KIB}",
                 self.m_cost_kib
             ));
+        }
+        Ok(())
+    }
+
+    /// Check parameters read from a backup, which can come from anywhere,
+    /// before deriving with them: [`KdfParams::check_stored`], and at most
+    /// [`BACKUP_KDF_MAX_M_COST_KIB`], [`BACKUP_KDF_MAX_T_COST`] and
+    /// [`BACKUP_KDF_MAX_P_COST`], so one password attempt on a backup stays
+    /// within a few times the cost of a default vault.
+    pub fn check_backup(&self) -> Result<(), String> {
+        self.check_stored()?;
+        if self.m_cost_kib > BACKUP_KDF_MAX_M_COST_KIB {
+            return Err(format!(
+                "KDF memory cost {} KiB is above {BACKUP_KDF_MAX_M_COST_KIB} for a backup",
+                self.m_cost_kib
+            ));
+        }
+        if self.t_cost > BACKUP_KDF_MAX_T_COST {
+            return Err(format!("KDF time cost {} is above {BACKUP_KDF_MAX_T_COST} for a backup", self.t_cost));
+        }
+        if self.p_cost > BACKUP_KDF_MAX_P_COST {
+            return Err(format!("KDF parallelism {} is above {BACKUP_KDF_MAX_P_COST} for a backup", self.p_cost));
         }
         Ok(())
     }
@@ -177,6 +207,29 @@ mod tests {
         assert!(bad(65_536, 3, 0));
         assert!(bad(u32::MAX, 3, KDF_MAX_P_COST + 1));
         assert!(bad(u32::MAX, 3, u32::MAX));
+    }
+
+    #[test]
+    fn backup_bounds_accept_the_edges_and_the_defaults() {
+        let ok = |m, t, p| KdfParams { m_cost_kib: m, t_cost: t, p_cost: p }.check_backup();
+        KdfParams::current().check_backup().unwrap();
+        fast().check_backup().unwrap();
+        ok(BACKUP_KDF_MAX_M_COST_KIB, BACKUP_KDF_MAX_T_COST, BACKUP_KDF_MAX_P_COST).unwrap();
+        assert_eq!(BACKUP_KDF_MAX_M_COST_KIB, 256 * 1024);
+        assert_eq!(BACKUP_KDF_MAX_T_COST, 12);
+    }
+
+    #[test]
+    fn backup_bounds_are_tighter_than_the_stored_bounds() {
+        let bad = |m, t, p| KdfParams { m_cost_kib: m, t_cost: t, p_cost: p }.check_backup().is_err();
+        assert!(bad(BACKUP_KDF_MAX_M_COST_KIB + 1, 3, 1));
+        assert!(bad(65_536, BACKUP_KDF_MAX_T_COST + 1, 1));
+        assert!(bad(65_536, 3, BACKUP_KDF_MAX_P_COST + 1));
+        assert!(bad(KDF_MAX_M_COST_KIB, KDF_MAX_T_COST, KDF_MAX_P_COST));
+        // Whatever the stored check refuses, the backup check refuses too.
+        assert!(bad(7, 1, 1));
+        assert!(bad(65_536, 0, 1));
+        assert!(bad(65_536, 3, 0));
     }
 
     #[test]

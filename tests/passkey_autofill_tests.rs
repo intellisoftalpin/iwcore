@@ -194,8 +194,8 @@ fn draining_twice_changes_nothing() {
 fn an_invalid_staged_passkey_is_skipped_and_the_rest_drains() {
     let (_t, mut w) = wallet();
     let keys = generate_keys().unwrap();
-    // A passkey record whose value does not validate, as JSON from a provider.
-    let bad: PendingRecord = serde_json::from_str(
+    // A passkey record that carries no passkey, as a provider's JSON gives it.
+    let bad = PendingRecord::from_login_json(
         r#"{"record_id":"bad","op":"CreatePasskey","title":"x","url":"https://x.example","identity_value":"u",
             "password":"","created_at":0,"passkey":"{\"v\":1,\"rpId\":\"x.example\"}"}"#,
     )

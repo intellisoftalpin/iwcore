@@ -21,10 +21,21 @@ impl Database {
     /// instead of riding out a short contention window.
     const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+    /// Apply the per-connection settings every wallet connection uses.
+    ///
+    /// `secure_delete` makes SQLite overwrite deleted content and freed pages
+    /// with zeros, so values that were changed or removed do not stay
+    /// readable in the file's free space.
+    fn configure(conn: &Connection) -> Result<()> {
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+        conn.execute_batch("PRAGMA secure_delete = ON")?;
+        Ok(())
+    }
+
     /// Open a database at the specified path
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+        Self::configure(&conn)?;
         Ok(Self {
             path: path.to_path_buf(),
             conn: Some(conn),
@@ -33,8 +44,12 @@ impl Database {
 
     /// Create a new database with all tables
     pub fn create(path: &Path) -> Result<Self> {
+        // An empty file is an empty database; creating it first makes the
+        // file (and the WAL and shared-memory files SQLite derives from it)
+        // private to the owner.
+        crate::utils::private_fs::touch_new(path)?;
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+        Self::configure(&conn)?;
 
         // Create all tables
         for sql in schema::CREATE_ALL_TABLES {
@@ -111,6 +126,16 @@ impl Database {
         self.connection()?.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
     }
+
+    /// Rebuild the whole database file (`VACUUM`) and fold the result back
+    /// from the WAL, truncating it. Afterwards the file holds only live
+    /// content: no free pages or unused cell space from earlier writes.
+    /// Must run outside a transaction.
+    pub(crate) fn vacuum(&self) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute_batch("PRAGMA secure_delete = ON; VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
 }
 
 impl Drop for Database {
@@ -123,6 +148,19 @@ impl Drop for Database {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn every_connection_overwrites_deleted_content_and_waits_when_busy() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("settings.db");
+        for db in [Database::create(&db_path).unwrap(), Database::open(&db_path).unwrap()] {
+            let conn = db.connection().unwrap();
+            let secure: i64 = conn.query_row("PRAGMA secure_delete", [], |r| r.get(0)).unwrap();
+            assert_eq!(secure, 1);
+            let busy: i64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap();
+            assert_eq!(busy, 5000);
+        }
+    }
 
     #[test]
     fn test_checkpoint_no_error() {

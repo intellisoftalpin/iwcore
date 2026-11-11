@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.7.0
+
+### Breaking changes
+
+- `autofill::PendingRecord` no longer implements `Serialize` or `Deserialize`.
+  Logins written by a provider are read with `PendingRecord::from_login_json`
+  or through the new `autofill::PendingLogin` (`From<PendingLogin>`). The
+  journal bytes are unchanged.
+- `DrainSummary` gains `already_applied` and `unparsed_bytes`;
+  `journal::DrainRead` gains `unparsed_bytes`.
+- `crypto::prepare_key` / `crypto::legacy::prepare_key` return
+  `Zeroizing<[u8; 32]>`; `LegacyKeyChain::decrypt` returns
+  `Zeroizing<String>`.
+
+### Hardening
+
+- **Format upgrade compacts the database.** Every wallet connection uses
+  `secure_delete`; the v5 to v6 upgrade runs `VACUUM` and a truncating WAL
+  checkpoint after it commits, and a vault upgraded by an older version is
+  compacted once at its next unlock. `retire_pre_v6_snapshot` now needs a
+  backup of the same vault taken after that compaction.
+- **`Wallet::discard_quarantined`** deletes records that could not be
+  recovered during the upgrade and compacts the file.
+- **Backups from outside.** Wallet tables with generated or hidden columns are
+  refused, and the read-only connection sets SQLite length, expression depth,
+  argument and column limits. Checking a backup password uses tighter Argon2
+  bounds than the live vault (memory <= 256 MiB, time <= 12, lanes <= 4), and
+  a legacy encryption count above 10,000 is refused.
+- **Restore** opens the backup's database as untrusted and refuses triggers,
+  views, virtual tables, generated columns and expression or partial indexes
+  before anything is replaced.
+- **AutoFill journal.** The vault remembers which records it has applied, so a
+  record is never applied twice; records are applied in creation order. The
+  drain reports bytes it could not read.
+- **Link hosts** end at a backslash, as in browsers.
+- **CXF import** keeps only http and https web addresses as links; others are
+  listed in `preview.skipped`.
+- **Legacy key material** and decrypted legacy values are wiped after use.
+- **File modes.** On Unix, new wallet and backup folders are 0700 and the
+  database and backup files 0600.
+- **Fuzzing** has a per-input time limit; the backup target also checks the
+  password and starts from real wallet seeds.
+
 ## 0.6.0
 
 ### Hardening
