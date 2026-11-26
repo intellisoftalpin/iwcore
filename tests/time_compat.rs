@@ -20,9 +20,9 @@ trait Secs {
     fn unix_seconds(&self) -> i64;
 }
 
-impl Secs for chrono::DateTime<chrono::Utc> {
+impl Secs for iwcore::Timestamp {
     fn unix_seconds(&self) -> i64 {
-        self.timestamp()
+        self.as_second()
     }
 }
 
@@ -189,4 +189,54 @@ fn csv_and_xml_exports_print_timestamps_as_before() {
     assert!(xml.contains("\"2023-12-15T10:30:45+00:00\""), "{xml}");
     let at = xml.split("exported_at=\"").nth(1).and_then(|r| r.split('"').next()).unwrap();
     assert!(is_chrono_rfc3339(at, "+00:00"), "{at}");
+}
+
+/// Days from 1970-01-01 to a proleptic Gregorian date (H. Hinnant's
+/// algorithm): an oracle that shares no code with either library.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+proptest::proptest! {
+    /// Every database timestamp of years 0000..=9998 parses to the instant
+    /// the oracle computes and prints back unchanged; serde and the backup
+    /// file name agree with it.
+    #[test]
+    fn every_stored_timestamp_round_trips(
+        y in 0i64..=9998, m in 1i64..=12, d in 1i64..=31, h in 0i64..24, mi in 0i64..60, s in 0i64..60,
+    ) {
+        let d = d.min(days_in_month(y, m));
+        let text = format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}");
+        let want = days_from_civil(y, m, d) * 86_400 + h * 3600 + mi * 60 + s;
+        let t = parse_timestamp(&text).unwrap();
+        proptest::prop_assert_eq!(secs(&t), want);
+        proptest::prop_assert_eq!(format_timestamp(&t), text.clone());
+        let name = format!("iwb-{y:04}{m:02}{d:02}-{h:02}{mi:02}{s:02}-auto.zip");
+        proptest::prop_assert_eq!(get_date_from_backup_filename(&name).map(|t| secs(&t)), Some(want));
+        let iso = format!("\"{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z\"");
+        let back: iwcore::Timestamp = serde_json::from_value(serde_json::json!({
+            "item_id": "i", "parent_id": "p", "name": "n", "icon": "x", "folder": false,
+            "create_timestamp": serde_json::from_str::<serde_json::Value>(&iso).unwrap(),
+            "change_timestamp": serde_json::from_str::<serde_json::Value>(&iso).unwrap(),
+            "deleted": false
+        }))
+        .map(|i: iwcore::IWItem| i.change_timestamp)
+        .unwrap();
+        proptest::prop_assert_eq!(secs(&back), want);
+    }
 }

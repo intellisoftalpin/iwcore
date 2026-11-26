@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.0
+## 0.7.2
 
 ### Added
 
@@ -29,6 +29,22 @@
 
 ### Breaking changes
 
+- **chrono replaced by jiff** (chrono is unmaintained, RUSTSEC-2026-0543).
+  Every timestamp in the API is now `iwcore::Timestamp` (`jiff::Timestamp`,
+  re-exported together with `iwcore::jiff`): `IWItem`, `IWField`, `IWLabel`
+  and `IWProperties` timestamps, `BackupInfo::timestamp`,
+  `BackupInspection::created`, `queries::{format_timestamp, parse_timestamp}`,
+  `utils::{now, format_datetime, parse_datetime, parse_short_date}`,
+  `backup::get_date_from_backup_filename`. Read seconds with `as_second()`
+  instead of `timestamp()`. Stored and exported values are unchanged:
+  database text, backup file names, JSON (`...Z`), CSV and XML
+  (`...+00:00`) print exactly as before, and the same inputs parse
+  (`tests/time_compat.rs` holds the results recorded from chrono, plus a
+  property test against an independent calendar oracle). Differences only
+  outside real data: a leap second `:60` reads as `:59`; instants after
+  9999-12-30 22:00 UTC and years past 9999 are refused (an unreadable stored
+  timestamp already read as "now"); a CXF export timestamp past `i64::MAX`
+  dates the import folder today instead of 1969.
 - **Full Public Suffix List for logins.** `registrable_domain` and
   `is_public_suffix` use the full list (ICANN and private sections), as
   passkeys already did; the curated subset is gone. Two customers of a hosting

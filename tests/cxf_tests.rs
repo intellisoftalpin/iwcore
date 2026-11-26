@@ -557,7 +557,7 @@ fn import_folder_names() {
     ]);
     // No timestamp: the date of the import.
     let undated = names(doc(0, vec![account("me", "", "aQ")]));
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let today = iwcore::jiff::tz::TimeZone::UTC.to_datetime(iwcore::Timestamp::now()).strftime("%Y-%m-%d").to_string();
     assert_eq!(undated, vec![format!("Imported from Other {today}")]);
 }
 

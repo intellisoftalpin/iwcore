@@ -247,35 +247,29 @@ fn unpct(s: &str) -> String {
 }
 
 /// Last day of a `YYYY-MM` month as the vault's `YYYYMMDD` date; `None` for
-/// anything else, including a month outside 1–12 or a year chrono cannot hold.
+/// anything else, including a month outside 1–12 or a year outside the
+/// calendar (-9999..=9999; chrono, used before 0.7.2, also held years past
+/// 9999).
 pub(crate) fn year_month_to_last_day(ym: &str) -> Option<String> {
     let (y, m) = ym.trim().split_once('-')?;
-    let (y, m): (i32, u32) = (y.parse().ok()?, m.parse().ok()?);
-    if !(1..=12).contains(&m) {
-        return None;
-    }
-    let first_next = if m == 12 {
-        chrono::NaiveDate::from_ymd_opt(y.checked_add(1)?, 1, 1)?
-    } else {
-        chrono::NaiveDate::from_ymd_opt(y, m.checked_add(1)?, 1)?
-    };
-    Some(first_next.pred_opt()?.format("%Y%m%d").to_string())
+    let (y, m): (i16, i8) = (y.parse().ok()?, m.parse().ok()?);
+    let last = jiff::civil::Date::new(y, m, 1).ok()?.last_of_month();
+    Some(last.strftime("%Y%m%d").to_string())
 }
 
 /// `YYYY-MM-DD` as `YYYYMMDD`; anything else unchanged.
 pub(crate) fn iso_date_to_vault(date: &str) -> String {
-    chrono::NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d")
-        .map(|d| d.format("%Y%m%d").to_string())
-        .unwrap_or_else(|_| date.to_string())
+    crate::time::parse_date(date.trim(), "%Y-%m-%d")
+        .map(|d| d.strftime("%Y%m%d").to_string())
+        .unwrap_or_else(|| date.to_string())
 }
 
 /// `YYYYMMDD` (or `YYYY-MM-DD`) as `YYYY-MM-DD`; `None` if neither.
 pub(crate) fn vault_date_to_iso(date: &str) -> Option<String> {
     let d = date.trim();
-    chrono::NaiveDate::parse_from_str(d, "%Y%m%d")
-        .or_else(|_| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d"))
-        .ok()
-        .map(|d| d.format("%Y-%m-%d").to_string())
+    crate::time::parse_date(d, "%Y%m%d")
+        .or_else(|| crate::time::parse_date(d, "%Y-%m-%d"))
+        .map(|d| d.strftime("%Y-%m-%d").to_string())
 }
 
 #[cfg(test)]
@@ -397,6 +391,9 @@ mod tests {
             assert!(year_month_to_last_day(ym).is_none(), "{ym}");
         }
         assert_eq!(year_month_to_last_day("9999-12").as_deref(), Some("99991231"));
+        assert_eq!(year_month_to_last_day("0001-01").as_deref(), Some("00010131"));
+        assert!(year_month_to_last_day("12345-01").is_none());
+        assert!(year_month_to_last_day("2024-+1").is_some(), "a + on the month parsed before too");
         assert_eq!(year_month_to_last_day(" 2024-1 ").as_deref(), Some("20240131"));
     }
 

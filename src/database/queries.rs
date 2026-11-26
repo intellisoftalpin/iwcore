@@ -4,27 +4,25 @@
 //! For business-level operations, use the Wallet API.
 
 use rusqlite::{Connection, OptionalExtension, params};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use crate::error::Result;
 
 /// Timestamp format used in database
 pub const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
 /// Format a DateTime for database storage
-pub fn format_timestamp(dt: &DateTime<Utc>) -> String {
-    dt.format(TIMESTAMP_FORMAT).to_string()
+pub fn format_timestamp(dt: &Timestamp) -> String {
+    crate::time::format_utc(dt, TIMESTAMP_FORMAT)
 }
 
 /// Parse a timestamp from database
-pub fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
-    chrono::NaiveDateTime::parse_from_str(s, TIMESTAMP_FORMAT)
-        .ok()
-        .map(|ndt| DateTime::from_naive_utc_and_offset(ndt, Utc))
+pub fn parse_timestamp(s: &str) -> Option<Timestamp> {
+    crate::time::parse_utc(s, TIMESTAMP_FORMAT)
 }
 
 /// Get current timestamp formatted for database
 pub fn now_timestamp() -> String {
-    format_timestamp(&Utc::now())
+    format_timestamp(&crate::time::now())
 }
 
 // ============================================================================
@@ -358,7 +356,7 @@ pub fn ensure_quarantine_table(conn: &Connection) -> Result<()> {
 }
 
 fn quarantine_now() -> String {
-    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    now_timestamp()
 }
 
 /// Quarantine an item: snapshot its blob AND structural metadata from the
@@ -1261,7 +1259,6 @@ pub struct RawLabel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Datelike, Timelike};
 
     fn conn_with_all_tables() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1357,13 +1354,13 @@ mod tests {
 
     #[test]
     fn test_format_timestamp() {
-        let dt = Utc.with_ymd_and_hms(2023, 12, 15, 10, 30, 45).unwrap();
+        let dt = crate::time::utc(2023, 12, 15, 10, 30, 45);
         assert_eq!(format_timestamp(&dt), "2023-12-15 10:30:45");
     }
 
     #[test]
     fn test_parse_timestamp() {
-        let ts = parse_timestamp("2023-12-15 10:30:45").unwrap();
+        let ts = crate::time::civil(&parse_timestamp("2023-12-15 10:30:45").unwrap());
         assert_eq!(ts.year(), 2023);
         assert_eq!(ts.month(), 12);
         assert_eq!(ts.day(), 15);

@@ -126,7 +126,6 @@ pub(crate) fn compute_path(item: &IWItem, items_map: &HashMap<&str, &IWItem>) ->
 mod tests {
     use super::*;
     use crate::database::models::IWField;
-    use chrono::Utc;
 
     fn make_item(id: &str, name: &str, parent_id: Option<&str>, folder: bool, deleted: bool) -> IWItem {
         IWItem {
@@ -135,8 +134,8 @@ mod tests {
             name: name.to_string(),
             icon: "icon".to_string(),
             folder,
-            create_timestamp: Utc::now(),
-            change_timestamp: Utc::now(),
+            create_timestamp: crate::time::now(),
+            change_timestamp: crate::time::now(),
             deleted,
         }
     }
@@ -151,7 +150,7 @@ mod tests {
             icon: "icon".to_string(),
             value_type: "text".to_string(),
             sort_weight,
-            change_timestamp: Utc::now(),
+            change_timestamp: crate::time::now(),
             deleted,
             expired: false,
             expiring: false,

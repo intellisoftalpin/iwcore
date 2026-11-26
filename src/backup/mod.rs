@@ -24,7 +24,7 @@ pub use restore::{
 
 use std::path::{Path, PathBuf};
 use std::fs;
-use chrono::{DateTime, Utc, TimeZone, NaiveDateTime};
+use jiff::Timestamp;
 use crate::database::Database;
 use crate::error::Result;
 
@@ -172,7 +172,8 @@ impl BackupManager {
             return Ok(0);
         }
 
-        let cutoff = Utc::now() - chrono::Duration::days(max_age_days as i64);
+        // Past the representable range nothing is old enough to delete.
+        let cutoff = crate::time::add_days(crate::time::now(), -i64::from(max_age_days)).unwrap_or(Timestamp::MIN);
         let mut deleted = 0;
 
         for backup in auto_backups.iter().skip(min_keep) {
@@ -192,7 +193,7 @@ pub struct BackupInfo {
     /// Path to the backup file
     pub path: PathBuf,
     /// Backup timestamp
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// Backup type (auto, manual, or imported)
     pub backup_type: BackupType,
     /// File size in bytes
@@ -217,8 +218,7 @@ fn parse_backup_filename(filename: &str, path: &Path) -> Option<BackupInfo> {
     }
 
     let datetime_str = format!("{}-{}", date_str, time_str);
-    let ndt = NaiveDateTime::parse_from_str(&datetime_str, BACKUP_DATE_FORMAT).ok()?;
-    let timestamp = Utc.from_utc_datetime(&ndt);
+    let timestamp = crate::time::parse_utc(&datetime_str, BACKUP_DATE_FORMAT)?;
 
     // Parse type
     let type_str = type_part.trim_end_matches(".zip");
@@ -240,7 +240,7 @@ fn parse_backup_filename(filename: &str, path: &Path) -> Option<BackupInfo> {
 }
 
 /// Parse date from backup filename (for compatibility)
-pub fn get_date_from_backup_filename(filename: &str) -> Option<DateTime<Utc>> {
+pub fn get_date_from_backup_filename(filename: &str) -> Option<Timestamp> {
     let name = Path::new(filename)
         .file_name()
         .and_then(|n| n.to_str())?;
@@ -255,14 +255,12 @@ pub fn get_date_from_backup_filename(filename: &str) -> Option<DateTime<Utc>> {
     }
 
     let datetime_str = format!("{}-{}", date_str, time_str);
-    let ndt = NaiveDateTime::parse_from_str(&datetime_str, BACKUP_DATE_FORMAT).ok()?;
-    Some(Utc.from_utc_datetime(&ndt))
+    crate::time::parse_utc(&datetime_str, BACKUP_DATE_FORMAT)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Datelike, Timelike};
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -278,9 +276,9 @@ mod tests {
         let info = parse_backup_filename("iwb-20171203-113108-auto.zip", &path).unwrap();
 
         assert_eq!(info.backup_type, BackupType::Auto);
-        assert_eq!(info.timestamp.year(), 2017);
-        assert_eq!(info.timestamp.month(), 12);
-        assert_eq!(info.timestamp.day(), 3);
+        assert_eq!(crate::time::civil(&info.timestamp).year(), 2017);
+        assert_eq!(crate::time::civil(&info.timestamp).month(), 12);
+        assert_eq!(crate::time::civil(&info.timestamp).day(), 3);
     }
 
     #[test]
@@ -294,9 +292,9 @@ mod tests {
         let info = parse_backup_filename("nswb-20171203-113108-auto.zip", &path).unwrap();
 
         assert_eq!(info.backup_type, BackupType::Auto);
-        assert_eq!(info.timestamp.year(), 2017);
-        assert_eq!(info.timestamp.month(), 12);
-        assert_eq!(info.timestamp.day(), 3);
+        assert_eq!(crate::time::civil(&info.timestamp).year(), 2017);
+        assert_eq!(crate::time::civil(&info.timestamp).month(), 12);
+        assert_eq!(crate::time::civil(&info.timestamp).day(), 3);
     }
 
     #[test]
@@ -310,14 +308,14 @@ mod tests {
         let info = parse_backup_filename("iwb-20231215-143022-imported.zip", &path).unwrap();
 
         assert_eq!(info.backup_type, BackupType::Imported);
-        assert_eq!(info.timestamp.year(), 2023);
-        assert_eq!(info.timestamp.month(), 12);
-        assert_eq!(info.timestamp.day(), 15);
+        assert_eq!(crate::time::civil(&info.timestamp).year(), 2023);
+        assert_eq!(crate::time::civil(&info.timestamp).month(), 12);
+        assert_eq!(crate::time::civil(&info.timestamp).day(), 15);
     }
 
     #[test]
     fn test_get_date_from_backup_filename() {
-        let date = get_date_from_backup_filename("iwb-20171203-113108-auto.zip").unwrap();
+        let date = crate::time::civil(&get_date_from_backup_filename("iwb-20171203-113108-auto.zip").unwrap());
         assert_eq!(date.year(), 2017);
         assert_eq!(date.month(), 12);
         assert_eq!(date.day(), 3);
@@ -328,7 +326,7 @@ mod tests {
 
     #[test]
     fn test_get_date_from_legacy_backup_filename() {
-        let date = get_date_from_backup_filename("nswb-20171203-113108-auto.zip").unwrap();
+        let date = crate::time::civil(&get_date_from_backup_filename("nswb-20171203-113108-auto.zip").unwrap());
         assert_eq!(date.year(), 2017);
         assert_eq!(date.month(), 12);
         assert_eq!(date.day(), 3);
@@ -340,7 +338,7 @@ mod tests {
     #[test]
     fn test_get_date_from_full_path_iwb_prefix() {
         // Full path with new iwb- prefix should parse correctly
-        let date = get_date_from_backup_filename("/var/backups/wallet/iwb-20231215-143022-manual.zip").unwrap();
+        let date = crate::time::civil(&get_date_from_backup_filename("/var/backups/wallet/iwb-20231215-143022-manual.zip").unwrap());
         assert_eq!(date.year(), 2023);
         assert_eq!(date.month(), 12);
         assert_eq!(date.day(), 15);
@@ -507,9 +505,9 @@ mod tests {
 
         let info = parse_backup_filename("iwb-20231215-143022-manual.zip", &path).unwrap();
         assert_eq!(info.backup_type, BackupType::Manual);
-        assert_eq!(info.timestamp.year(), 2023);
-        assert_eq!(info.timestamp.month(), 12);
-        assert_eq!(info.timestamp.day(), 15);
+        assert_eq!(crate::time::civil(&info.timestamp).year(), 2023);
+        assert_eq!(crate::time::civil(&info.timestamp).month(), 12);
+        assert_eq!(crate::time::civil(&info.timestamp).day(), 15);
     }
 
     #[test]
@@ -608,12 +606,12 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         // 3 recent auto backups (today-ish via current year)
-        let now = Utc::now();
+        let now = crate::time::now();
         for i in 0..3 {
-            let ts = now - chrono::Duration::days(i);
+            let ts = crate::time::add_days(now, -i).unwrap();
             let file = temp_dir.path().join(format!(
                 "iwb-{}-auto.zip",
-                ts.format(BACKUP_DATE_FORMAT)
+                crate::time::format_utc(&ts, BACKUP_DATE_FORMAT)
             ));
             std::fs::File::create(&file).unwrap().write_all(b"test").unwrap();
         }

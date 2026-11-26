@@ -519,7 +519,6 @@ pub fn entry_identity_kind(entry: &IndexEntry) -> Option<IdentityKind> {
 mod tests {
     use super::*;
     use crate::autofill::keys::generate_keys;
-    use chrono::Utc;
 
     fn header() -> IndexHeader {
         IndexHeader {
@@ -551,8 +550,8 @@ mod tests {
             name: name.into(),
             icon: String::new(),
             folder,
-            create_timestamp: Utc::now(),
-            change_timestamp: Utc::now(),
+            create_timestamp: crate::time::now(),
+            change_timestamp: crate::time::now(),
             deleted,
         }
     }
@@ -567,7 +566,7 @@ mod tests {
             icon: String::new(),
             value_type: String::new(),
             sort_weight: weight,
-            change_timestamp: Utc::now(),
+            change_timestamp: crate::time::now(),
             deleted: false,
             expired: false,
             expiring: false,

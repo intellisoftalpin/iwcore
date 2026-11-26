@@ -1,6 +1,6 @@
 //! Common utility functions
 
-use chrono::{DateTime, Utc, NaiveDateTime};
+use jiff::Timestamp;
 
 /// Date format for database storage
 pub const DB_DATE_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
@@ -9,20 +9,18 @@ pub const DB_DATE_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 pub const SHORT_DATE_FORMAT: &str = "%Y%m%d";
 
 /// Convert DateTime to database string format
-pub fn format_datetime(dt: &DateTime<Utc>) -> String {
-    dt.format(DB_DATE_FORMAT).to_string()
+pub fn format_datetime(dt: &Timestamp) -> String {
+    crate::time::format_utc(dt, DB_DATE_FORMAT)
 }
 
 /// Parse database datetime string
-pub fn parse_datetime(s: &str) -> Option<DateTime<Utc>> {
-    NaiveDateTime::parse_from_str(s, DB_DATE_FORMAT)
-        .ok()
-        .map(|ndt| DateTime::from_naive_utc_and_offset(ndt, Utc))
+pub fn parse_datetime(s: &str) -> Option<Timestamp> {
+    crate::time::parse_utc(s, DB_DATE_FORMAT)
 }
 
 /// Get current UTC datetime
-pub fn now() -> DateTime<Utc> {
-    Utc::now()
+pub fn now() -> Timestamp {
+    crate::time::now()
 }
 
 /// Convert a string to asterisks (for masking passwords)
@@ -56,18 +54,18 @@ pub fn format_time(time: &str) -> String {
 }
 
 /// Parse short date (YYYYMMDD) to DateTime
-pub fn parse_short_date(s: &str) -> Option<DateTime<Utc>> {
+pub fn parse_short_date(s: &str) -> Option<Timestamp> {
     if s.len() != 8 {
         return None;
     }
 
-    let year: i32 = s[0..4].parse().ok()?;
-    let month: u32 = s[4..6].parse().ok()?;
-    let day: u32 = s[6..8].parse().ok()?;
+    let year: i16 = s.get(0..4)?.parse().ok()?;
+    let month: i8 = s.get(4..6)?.parse().ok()?;
+    let day: i8 = s.get(6..8)?.parse().ok()?;
 
-    chrono::NaiveDate::from_ymd_opt(year, month, day)
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .map(|ndt| DateTime::from_naive_utc_and_offset(ndt, Utc))
+    jiff::civil::Date::new(year, month, day)
+        .ok()
+        .and_then(crate::time::start_of_day)
 }
 
 /// Remove text between and including the specified tags
@@ -92,7 +90,6 @@ pub fn remove_tags(text: &str, start_tag: &str, end_tag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Datelike};
 
     #[test]
     fn test_mask_string() {
@@ -135,7 +132,7 @@ mod tests {
     /// Test: CheckDateToDBConversion from C# CommonFixture
     #[test]
     fn test_date_to_db_conversion() {
-        let dt = Utc.with_ymd_and_hms(2016, 12, 15, 17, 23, 54).unwrap();
+        let dt = crate::time::utc(2016, 12, 15, 17, 23, 54);
         let converted = format_datetime(&dt);
         assert_eq!("2016-12-15 17:23:54", converted);
     }
@@ -144,14 +141,14 @@ mod tests {
     #[test]
     fn test_db_datetime_conversion() {
         let db_value = "2016-12-15 17:23:54";
-        let expected = Utc.with_ymd_and_hms(2016, 12, 15, 17, 23, 54).unwrap();
+        let expected = crate::time::utc(2016, 12, 15, 17, 23, 54);
         let converted = parse_datetime(db_value).unwrap();
         assert_eq!(expected, converted);
     }
 
     #[test]
     fn test_parse_short_date() {
-        let dt = parse_short_date("20231215").unwrap();
+        let dt = crate::time::civil(&parse_short_date("20231215").unwrap());
         assert_eq!(dt.year(), 2023);
         assert_eq!(dt.month(), 12);
         assert_eq!(dt.day(), 15);
@@ -173,9 +170,9 @@ mod tests {
 
     #[test]
     fn test_now() {
-        let before = Utc::now();
+        let before = jiff::Timestamp::now();
         let result = now();
-        let after = Utc::now();
+        let after = jiff::Timestamp::now();
         assert!(result >= before);
         assert!(result <= after);
     }

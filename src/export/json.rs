@@ -15,7 +15,8 @@ const VERSION: &str = "1";
 struct JsonExport<'a> {
     format: &'static str,
     version: &'static str,
-    exported_at: chrono::DateTime<chrono::Utc>,
+    #[serde(with = "crate::time::serde_rfc3339")]
+    exported_at: jiff::Timestamp,
     items: Vec<&'a IWItem>,
     fields: Vec<&'a IWField>,
 }
@@ -25,7 +26,7 @@ pub fn generate_json(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
     let payload = JsonExport {
         format: FORMAT,
         version: VERSION,
-        exported_at: chrono::Utc::now(),
+        exported_at: crate::time::now(),
         items: items.iter().filter(|i| !i.deleted).collect(),
         fields: fields.iter().filter(|f| !f.deleted).collect(),
     };
@@ -37,7 +38,6 @@ pub fn generate_json(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use serde_json::Value;
 
     fn make_item(id: &str, name: &str, parent_id: Option<&str>, folder: bool, deleted: bool) -> IWItem {
@@ -47,8 +47,8 @@ mod tests {
             name: name.to_string(),
             icon: "icon".to_string(),
             folder,
-            create_timestamp: Utc::now(),
-            change_timestamp: Utc::now(),
+            create_timestamp: crate::time::now(),
+            change_timestamp: crate::time::now(),
             deleted,
         }
     }
@@ -63,7 +63,7 @@ mod tests {
             icon: "icon".to_string(),
             value_type: "text".to_string(),
             sort_weight: 0,
-            change_timestamp: Utc::now(),
+            change_timestamp: crate::time::now(),
             deleted,
             expired: false,
             expiring: false,

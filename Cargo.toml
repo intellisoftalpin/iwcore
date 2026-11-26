@@ -1,6 +1,6 @@
 [package]
 name = "iwcore"
-version = "0.8.0"
+version = "0.7.2"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -38,7 +38,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 
 # Utilities
-chrono = { version = "0.4.45", features = ["serde"] }
+# Dates and times. Default features off: iwcore works in UTC only and needs
+# no time zone database. chrono was replaced (unmaintained, RUSTSEC-2026-0543).
+jiff = { version = "1.0.3", default-features = false, features = ["std"] }
 thiserror = "2.0.21"
 # Backups are only ever written with Deflate, so only Deflate is compiled in:
 # the default features would pull in zstd, bzip2, lzma and xz for nothing.
