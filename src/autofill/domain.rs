@@ -195,9 +195,9 @@ pub const SSO_LABELS: &[&str] = &["accounts", "auth", "id", "identity", "login",
 /// - the name is at least [`MIN_SITE_NAME_LEN`] characters long, is not all
 ///   digits and is not in [`GENERIC_NAME_LABELS`].
 pub fn site_name(host: &str) -> Option<String> {
-    if host.is_empty() || is_ip_literal(host) {
-        return None;
-    }
+    // No separate guard for empty hosts or IP literals: neither has an ICANN
+    // suffix (an IPv4 address ends in a number, an IPv6 literal has no dot),
+    // so both are refused below. The tests pin that.
     let domain = psl::domain(host.as_bytes())?;
     if domain.suffix().typ() != Some(psl::Type::Icann) {
         return None;
