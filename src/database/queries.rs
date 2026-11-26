@@ -1375,6 +1375,16 @@ mod tests {
         assert!(parse_timestamp("2023-13-01 00:00:00").is_none());
     }
 
+    /// A quarantined record is stamped with the time it was quarantined, in
+    /// the database format.
+    #[test]
+    fn quarantine_stamps_the_current_time() {
+        let before = crate::time::now().as_second();
+        let stamped = parse_timestamp(&quarantine_now()).unwrap().as_second();
+        let after = crate::time::now().as_second();
+        assert!((before..=after).contains(&stamped), "{before} <= {stamped} <= {after}");
+    }
+
     #[test]
     fn test_now_timestamp() {
         let ts = now_timestamp();

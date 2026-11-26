@@ -204,6 +204,27 @@ mod tests {
         Timestamp::new(secs, nanos).unwrap()
     }
 
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    struct Opt {
+        #[serde(default, with = "super::serde_rfc3339::option")]
+        at: Option<Timestamp>,
+    }
+
+    /// `Option<DateTime<Utc>>` as chrono's serde wrote and read it: the
+    /// RFC 3339 string, `null` for none, a missing member as none.
+    #[test]
+    fn optional_timestamps_serialize_like_chrono() {
+        let some = Opt { at: Some(ts(1_702_636_245, 500_000_000)) };
+        assert_eq!(serde_json::to_string(&some).unwrap(), r#"{"at":"2023-12-15T10:30:45.500Z"}"#);
+        assert_eq!(serde_json::to_string(&Opt { at: None }).unwrap(), r#"{"at":null}"#);
+        assert_eq!(serde_json::from_str::<Opt>(r#"{"at":"2023-12-15T10:30:45.5Z"}"#).unwrap(), some);
+        assert_eq!(serde_json::from_str::<Opt>(r#"{"at":null}"#).unwrap(), Opt { at: None });
+        assert_eq!(serde_json::from_str::<Opt>("{}").unwrap(), Opt { at: None });
+        let err = serde_json::from_str::<Opt>(r#"{"at":"yesterday"}"#).unwrap_err().to_string();
+        assert!(err.contains("not an RFC 3339 time: yesterday"), "{err}");
+        assert!(serde_json::from_str::<Opt>(r#"{"at":5}"#).is_err());
+    }
+
     #[test]
     fn rfc3339_prints_like_chrono() {
         // Recorded from chrono 0.4.45 (`to_rfc3339` and serde).
