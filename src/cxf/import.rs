@@ -174,7 +174,7 @@ struct Plan {
 }
 
 /// The export's date (`YYYY-MM-DD`, UTC) for the import folder name; today
-/// when the export carries none (0) or one no calendar holds. Before 0.7.2 a
+/// when the export carries none (0) or one no calendar holds. Before 0.8.0 a
 /// value past `i64::MAX` wrapped to a date in 1969; it now reads as today.
 fn import_date(timestamp: u64) -> String {
     let at = i64::try_from(timestamp)
