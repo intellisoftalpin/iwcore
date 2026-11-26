@@ -248,7 +248,7 @@ fn unpct(s: &str) -> String {
 
 /// Last day of a `YYYY-MM` month as the vault's `YYYYMMDD` date; `None` for
 /// anything else, including a month outside 1–12 or a year outside the
-/// calendar (-9999..=9999; chrono, used before 0.7.2, also held years past
+/// calendar (-9999..=9999; chrono, used before 0.8.0, also held years past
 /// 9999).
 pub(crate) fn year_month_to_last_day(ym: &str) -> Option<String> {
     let (y, m) = ym.trim().split_once('-')?;

@@ -1,6 +1,6 @@
 //! Every date and time operation of iwcore, in one place.
 //!
-//! Backed by `jiff` since 0.7.2 (chrono became unmaintained,
+//! Backed by `jiff` since 0.8.0 (chrono became unmaintained,
 //! RUSTSEC-2026-0543). The functions here reproduce what the chrono code did,
 //! byte for byte where a value is stored or exported, and
 //! `tests/time_compat.rs` holds the recorded chrono results they must keep
