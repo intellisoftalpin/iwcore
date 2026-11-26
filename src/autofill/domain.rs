@@ -187,7 +187,7 @@ pub const SSO_LABELS: &[&str] = &["accounts", "auth", "id", "identity", "login",
 /// It is what lets `oxisoft.net` and `oxisoft.io` be recognised as the same
 /// name under different registrable domains. That is a weak signal, anyone
 /// can register `oxisoft.xyz`, so callers must keep such matches apart from
-/// real domain matches (see [`super::suggest`]). To keep it as narrow as it
+/// real domain matches (see [`super::suggest`](mod@super::suggest)). To keep it as narrow as it
 /// can be, `None` is returned unless:
 ///
 /// - the public suffix is from the ICANN section of the list (a private

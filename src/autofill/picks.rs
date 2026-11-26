@@ -1,5 +1,5 @@
 //! Which login the user picked on which host, so the next fill there offers
-//! it first (see [`super::suggest`]).
+//! it first (see [`super::suggest`](mod@super::suggest)).
 //!
 //! The provider keeps this small file itself, next to the index, and seals it
 //! under the **index key**: it can only be read where the index can, and a
