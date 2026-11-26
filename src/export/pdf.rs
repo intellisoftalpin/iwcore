@@ -108,7 +108,7 @@ pub(crate) fn bands(cards: &[Card]) -> Vec<Band> {
 /// their fields, sorted alphabetically.
 pub fn generate_pdf(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
     let cards = layout(items, fields);
-    let date = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
+    let date = crate::time::format_utc(&crate::time::now(), "%Y-%m-%d %H:%M UTC");
     render(&cards, &date)
 }
 
@@ -504,7 +504,6 @@ fn draw_band(pages: &mut Pages, fonts: &Fonts, columns: &[(f32, f32, Vec<Piece>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
     fn item(id: &str, name: &str, parent: Option<&str>, folder: bool, deleted: bool) -> IWItem {
         IWItem {
@@ -513,8 +512,8 @@ mod tests {
             name: name.into(),
             icon: "icon".into(),
             folder,
-            create_timestamp: Utc::now(),
-            change_timestamp: Utc::now(),
+            create_timestamp: crate::time::now(),
+            change_timestamp: crate::time::now(),
             deleted,
         }
     }
@@ -529,7 +528,7 @@ mod tests {
             icon: "icon".into(),
             value_type: "text".into(),
             sort_weight: w,
-            change_timestamp: Utc::now(),
+            change_timestamp: crate::time::now(),
             deleted,
             expired: false,
             expiring: false,

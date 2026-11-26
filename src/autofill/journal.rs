@@ -113,6 +113,13 @@ pub enum PendingOp {
     /// A passkey created in the provider. The record is read with
     /// [`PendingRecord::staged_passkey`]; the password field is empty.
     CreatePasskey,
+    /// Add the site in `url` as a `LINK` to the existing item `item_id`,
+    /// after the user picked that login on a site it did not name yet and
+    /// agreed to remember it (see [`PendingRecord::new_add_link`]). Never
+    /// creates an item and never touches a password. The provider must only
+    /// write it for a site whose identity it verified: a `create_only` record
+    /// of this kind is refused by the drain.
+    AddLink,
 }
 
 /// One staged login.
@@ -434,6 +441,20 @@ impl PendingRecord {
         record.op = PendingOp::CreatePasskey;
         record.passkey = Some(passkey.to_field_value()?);
         Ok(record)
+    }
+
+    /// A request to add the site at `url` to the existing item `item_id`
+    /// ([`PendingOp::AddLink`]). Title, identity and password stay empty.
+    pub fn new_add_link(
+        record_id: impl Into<String>,
+        item_id: impl Into<String>,
+        url: impl Into<String>,
+        created_at: i64,
+    ) -> Self {
+        let mut record = Self::new_login(record_id, String::new(), url, String::new(), String::new(), created_at);
+        record.op = PendingOp::AddLink;
+        record.item_id = Some(item_id.into());
+        record
     }
 
     /// The staged passkey, parsed and validated. `None` when the record carries
@@ -851,6 +872,17 @@ mod tests {
     /// The drain path with no legacy keys: what the app applies.
     fn open_app(journal: &[u8], secret: &[u8; 32], auth: &[u8; KEY_LEN]) -> Vec<PendingRecord> {
         open_for_drain(journal, &DrainKeys { journal_secret: secret, auth_key: auth, legacy_wrap_keys: &[] }).records
+    }
+
+    #[test]
+    fn an_add_link_record_round_trips_and_a_provider_may_send_one_as_json() {
+        let r = PendingRecord::new_add_link("a1", "item-9", "https://auth.example.com", 5);
+        assert_eq!((r.op, r.item_id.as_deref(), r.url.as_str(), r.created_at), (PendingOp::AddLink, Some("item-9"), "https://auth.example.com", 5));
+        assert!(r.title.is_empty() && r.identity_value.is_empty() && r.password.is_empty() && r.passkey.is_none());
+        assert_eq!(decode(&encode(&r).unwrap()).unwrap(), r);
+        let json = r#"{"record_id":"a2","op":"AddLink","item_id":"item-9","title":"","url":"auth.example.com","identity_value":"","password":"","created_at":6}"#;
+        let parsed = PendingRecord::from_login_json(json).unwrap();
+        assert_eq!((parsed.op, parsed.item_id.as_deref()), (PendingOp::AddLink, Some("item-9")));
     }
 
     #[test]

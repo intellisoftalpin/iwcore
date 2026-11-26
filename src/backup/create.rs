@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::{Read, Write};
-use chrono::Utc;
+
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 use crate::error::{Result, WalletError};
@@ -26,12 +26,12 @@ pub fn create_backup(backup_folder: &Path, db: &Database, manual: bool) -> Resul
     private_fs::create_dir_all(backup_folder)?;
 
     // Generate backup filename
-    let now = Utc::now();
+    let now = crate::time::now();
     let type_str = if manual { BACKUP_MANUAL } else { BACKUP_AUTO };
     let filename = format!(
         "{}-{}-{}.zip",
         BACKUP_PREFIX,
-        now.format(BACKUP_DATE_FORMAT),
+        crate::time::format_utc(&now, BACKUP_DATE_FORMAT),
         type_str
     );
     let backup_path = backup_folder.join(&filename);
@@ -81,12 +81,12 @@ pub fn create_backup_from_path(backup_folder: &Path, db_path: &Path, manual: boo
     private_fs::create_dir_all(backup_folder)?;
 
     // Generate backup filename
-    let now = Utc::now();
+    let now = crate::time::now();
     let type_str = if manual { BACKUP_MANUAL } else { BACKUP_AUTO };
     let filename = format!(
         "{}-{}-{}.zip",
         BACKUP_PREFIX,
-        now.format(BACKUP_DATE_FORMAT),
+        crate::time::format_utc(&now, BACKUP_DATE_FORMAT),
         type_str
     );
     let backup_path = backup_folder.join(&filename);

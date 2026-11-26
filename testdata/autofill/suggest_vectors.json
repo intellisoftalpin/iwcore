@@ -1,0 +1,86 @@
+{
+  "about": "Shared test vectors for AutoFill suggestions (iwcore autofill::suggest). The iOS extension ranks in Swift and must produce exactly these lists; iwcore's own test reads this file too. Each expected row is [item_id, section, reason].",
+  "entries": [
+    {"item_id": "analytics", "title": "Analytics", "username": "bkv", "links": ["https://analytics.oxisoft.net"]},
+    {"item_id": "chat", "title": "Chat", "username": "bkv", "links": ["chat.oxisoft.net"]},
+    {"item_id": "gitea", "title": "Gitea", "username": "bkv", "links": ["https://g.oxisoft.io/user/login"]},
+    {"item_id": "pilot", "title": "Pilot", "username": "bkv", "links": ["pilot.oxisoft.net"]},
+    {"item_id": "root", "title": "OxiSoft site", "username": "admin", "links": ["https://oxisoft.net"]},
+    {"item_id": "sso", "title": "Zz SSO", "username": "bkv", "links": ["https://auth.oxisoft.net/login"]},
+    {"item_id": "notes", "title": "OxiSoft notes", "username": "bkv", "links": []},
+    {"item_id": "other", "title": "Bank", "username": "bkv", "links": ["mybank.com"]},
+    {"item_id": "alice", "title": "Alice pages", "username": "alice", "links": ["alice.github.io"]},
+    {"item_id": "shop", "title": "Web Shop", "username": "bkv", "links": ["www2.example.com"]},
+    {"item_id": "deep", "title": "Deep", "username": "bkv", "links": ["x.eu.example.com"]},
+    {"item_id": "mail", "title": "Mail", "username": "bkv", "links": ["mail.example.com"]}
+  ],
+  "cases": [
+    {
+      "query": "https://auth.oxisoft.net/realms/x",
+      "picked": null,
+      "expect": [
+        ["sso", "ForSite", "ExactHost"],
+        ["root", "ForSite", "ParentHost"],
+        ["analytics", "ForSite", "SignOn"],
+        ["chat", "ForSite", "SignOn"],
+        ["pilot", "ForSite", "SignOn"],
+        ["gitea", "SameName", "SameName"],
+        ["notes", "SameName", "TitleName"]
+      ]
+    },
+    {
+      "query": "chat.oxisoft.net",
+      "picked": null,
+      "expect": [
+        ["chat", "ForSite", "ExactHost"],
+        ["root", "ForSite", "ParentHost"],
+        ["sso", "SameSite", "SignOn"],
+        ["analytics", "SameSite", "Sibling"],
+        ["pilot", "SameSite", "Sibling"],
+        ["gitea", "SameName", "SameName"],
+        ["notes", "SameName", "TitleName"]
+      ]
+    },
+    {
+      "query": "oxisoft.com",
+      "picked": null,
+      "expect": [
+        ["analytics", "SameName", "SameName"],
+        ["chat", "SameName", "SameName"],
+        ["gitea", "SameName", "SameName"],
+        ["root", "SameName", "SameName"],
+        ["pilot", "SameName", "SameName"],
+        ["sso", "SameName", "SameName"],
+        ["notes", "SameName", "TitleName"]
+      ]
+    },
+    {
+      "query": "auth.oxisoft.net",
+      "picked": "other",
+      "expect": [
+        ["other", "ForSite", "Picked"],
+        ["sso", "ForSite", "ExactHost"],
+        ["root", "ForSite", "ParentHost"],
+        ["analytics", "ForSite", "SignOn"],
+        ["chat", "ForSite", "SignOn"],
+        ["pilot", "ForSite", "SignOn"],
+        ["gitea", "SameName", "SameName"],
+        ["notes", "SameName", "TitleName"]
+      ]
+    },
+    {
+      "query": "shop.eu.example.com",
+      "picked": null,
+      "expect": [
+        ["shop", "SameSite", "Sibling"],
+        ["deep", "SameSite", "Sibling"],
+        ["mail", "SameSite", "Sibling"]
+      ]
+    },
+    {"query": "mybank.com", "picked": null, "expect": [["other", "ForSite", "ExactHost"]]},
+    {"query": "mallory.github.io", "picked": null, "expect": []},
+    {"query": "alice.com", "picked": null, "expect": []},
+    {"query": "oxisoft-login.com", "picked": null, "expect": []},
+    {"query": "", "picked": "chat", "expect": [["chat", "ForSite", "Picked"]]}
+  ]
+}

@@ -3,7 +3,6 @@
 //! This module provides label management operations for the Wallet.
 
 use std::collections::HashMap;
-use chrono::Utc;
 use crate::error::{WalletError, Result};
 use crate::database::{IWLabel, queries};
 use crate::database::queries::parse_timestamp;
@@ -96,7 +95,7 @@ impl Wallet {
                 change_timestamp: raw.change_timestamp
                     .as_ref()
                     .and_then(|s| parse_timestamp(s))
-                    .unwrap_or_else(Utc::now),
+                    .unwrap_or_else(crate::time::now),
                 deleted: raw.deleted,
                 usage: raw.usage as u32,
             });

@@ -88,7 +88,7 @@ impl Wallet {
             }],
             exporter_display_name: EXPORTER_NAME,
             exporter_rp_id: EXPORTER_RP_ID,
-            timestamp: chrono::Utc::now().timestamp().max(0),
+            timestamp: crate::time::now().as_second().max(0),
             version: VersionView { major: CXF_MAJOR, minor: CXF_MINOR },
         };
         to_zeroizing_json(&doc)
@@ -457,10 +457,10 @@ fn item_view<'a>(item: &'a IWItem, fields: &[&'a IWField], records: &'a HashMap<
     }
 
     ItemView {
-        creation_at: item.create_timestamp.timestamp().max(0),
+        creation_at: item.create_timestamp.as_second().max(0),
         credentials,
         id: b64::encode(item.item_id.as_bytes()),
-        modified_at: item.change_timestamp.timestamp().max(0),
+        modified_at: item.change_timestamp.as_second().max(0),
         scope: (!urls.is_empty()).then_some(ScopeView { android_apps: [], urls }),
         title: &item.name,
     }

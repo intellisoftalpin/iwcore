@@ -43,9 +43,15 @@ pub mod error;
 pub mod export;
 pub mod passkey;
 pub mod cxf;
+mod time;
 
 // Re-export main types
 pub use error::{WalletError, Result};
+/// The date and time library of iwcore's public types (`IWItem` timestamps,
+/// backup dates). Re-exported so callers use the same version.
+pub use jiff;
+/// A UTC instant, as every timestamp in iwcore's API is.
+pub use jiff::Timestamp;
 pub use database::models::{IWItem, IWField, IWLabel, IWProperties, SearchResult, SearchMatchType, FieldValueUsage};
 pub use business::{MigrationSummary, RecoveryResult, Wallet};
 pub use backup::{BackupManager, BackupType};

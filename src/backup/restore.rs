@@ -332,7 +332,7 @@ pub struct BackupInspection {
     /// The database version string (`"6"` for current vaults).
     pub db_version: String,
     /// When the backup was made, from its file name, if it follows the naming.
-    pub created: Option<chrono::DateTime<chrono::Utc>>,
+    pub created: Option<jiff::Timestamp>,
     /// Live entries (not folders, not in the trash).
     pub item_count: u32,
     /// Live passkeys on live entries.

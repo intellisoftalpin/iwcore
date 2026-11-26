@@ -65,7 +65,7 @@ pub fn generate_csv(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
                     out.push(',');
                     out.push_str(&f.sort_weight.to_string());
                     out.push(',');
-                    out.push_str(&csv_escape(&f.change_timestamp.to_rfc3339()));
+                    out.push_str(&csv_escape(&crate::time::rfc3339(&f.change_timestamp, false)));
                     out.push('\n');
                 }
             }
@@ -91,7 +91,6 @@ fn csv_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
     fn make_item(id: &str, name: &str, parent_id: Option<&str>, folder: bool, deleted: bool) -> IWItem {
         IWItem {
@@ -100,8 +99,8 @@ mod tests {
             name: name.to_string(),
             icon: "icon".to_string(),
             folder,
-            create_timestamp: Utc::now(),
-            change_timestamp: Utc::now(),
+            create_timestamp: crate::time::now(),
+            change_timestamp: crate::time::now(),
             deleted,
         }
     }
@@ -116,7 +115,7 @@ mod tests {
             icon: "icon".to_string(),
             value_type: "text".to_string(),
             sort_weight,
-            change_timestamp: Utc::now(),
+            change_timestamp: crate::time::now(),
             deleted,
             expired: false,
             expiring: false,

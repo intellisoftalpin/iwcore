@@ -173,12 +173,20 @@ struct Plan {
     skipped: SkipList,
 }
 
+/// The export's date (`YYYY-MM-DD`, UTC) for the import folder name; today
+/// when the export carries none (0) or one no calendar holds. Before 0.8.0 a
+/// value past `i64::MAX` wrapped to a date in 1969; it now reads as today.
+fn import_date(timestamp: u64) -> String {
+    let at = i64::try_from(timestamp)
+        .ok()
+        .filter(|&t| t > 0)
+        .and_then(|t| jiff::Timestamp::from_second(t).ok())
+        .unwrap_or_else(crate::time::now);
+    crate::time::format_utc(&at, "%Y-%m-%d")
+}
+
 fn plan(header: &Header<'_>) -> Result<Plan> {
-    let date = chrono::DateTime::from_timestamp(header.timestamp as i64, 0)
-        .filter(|_| header.timestamp > 0)
-        .unwrap_or_else(chrono::Utc::now)
-        .format("%Y-%m-%d")
-        .to_string();
+    let date = import_date(header.timestamp);
     let mut p = Plan {
         exporter: header.exporter_display_name.clone(),
         folders: Vec::new(),
@@ -892,6 +900,16 @@ pub fn options(backup_folder: &Path) -> ImportOptions {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_import_date_is_the_exports_utc_day_or_today() {
+        let today = crate::time::format_utc(&crate::time::now(), "%Y-%m-%d");
+        assert_eq!(import_date(1_702_636_245), "2023-12-15");
+        assert_eq!(import_date(1), "1970-01-01");
+        assert_eq!(import_date(0), today);
+        assert_eq!(import_date(u64::MAX), today);
+        assert_eq!(import_date(1_000_000_000_000), today);
+    }
+
     use super::*;
 
     fn doc(items: &str) -> String {

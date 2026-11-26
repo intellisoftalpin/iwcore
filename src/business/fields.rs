@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 
-use chrono::Utc;
 use crate::error::{WalletError, Result};
 use crate::database::{IWField, FieldValueUsage, queries};
 use crate::database::queries::parse_timestamp;
@@ -125,7 +124,7 @@ impl Wallet {
                 change_timestamp: raw.change_timestamp
                     .as_ref()
                     .and_then(|s| parse_timestamp(s))
-                    .unwrap_or_else(Utc::now),
+                    .unwrap_or_else(crate::time::now),
                 deleted: raw.deleted,
                 expired,
                 expiring,
@@ -273,7 +272,7 @@ impl Wallet {
                 change_timestamp: raw.change_timestamp
                     .as_ref()
                     .and_then(|s| parse_timestamp(s))
-                    .unwrap_or_else(Utc::now),
+                    .unwrap_or_else(crate::time::now),
                 deleted: raw.deleted,
                 expired,
                 expiring,
@@ -337,13 +336,12 @@ fn refuse_passkey(field_type: &str) -> Result<()> {
 /// legacy / hand-typed values still resolve. Unparseable input
 /// returns `(false, false)`.
 pub(crate) fn check_expiry(date_str: &str) -> (bool, bool) {
-    let date = chrono::NaiveDate::parse_from_str(date_str.trim(), "%Y%m%d")
-        .or_else(|_| chrono::NaiveDate::parse_from_str(date_str.trim(), "%Y-%m-%d"));
+    let date = crate::time::parse_date(date_str.trim(), "%Y%m%d")
+        .or_else(|| crate::time::parse_date(date_str.trim(), "%Y-%m-%d"));
 
-    let Ok(date) = date else { return (false, false); };
+    let Some(date) = date else { return (false, false); };
 
-    let today = Utc::now().date_naive();
-    let days_until = (date - today).num_days();
+    let days_until = crate::time::days_between(crate::time::today_utc(), date);
 
     let expired = days_until < 0;
     let expiring = (0..=30).contains(&days_until);
@@ -476,9 +474,29 @@ mod tests {
     // separate test asserts the legacy ISO `YYYY-MM-DD` is still
     // tolerated for backward compatibility.
 
+    /// Today plus `offset` days, in UTC, as `format`.
+    fn day(offset: i64, format: &str) -> String {
+        crate::time::format_utc(&crate::time::add_days(crate::time::now(), offset).unwrap(), format)
+    }
+
+    /// The window is today through 30 days ahead; yesterday is expired. Kept
+    /// identical through the chrono -> jiff move.
+    #[test]
+    fn test_check_expiry_window_edges() {
+        assert_eq!(check_expiry(&day(-1, "%Y%m%d")), (true, false));
+        assert_eq!(check_expiry(&day(-400, "%Y%m%d")), (true, false));
+        assert_eq!(check_expiry(&day(0, "%Y%m%d")), (false, true));
+        assert_eq!(check_expiry(&day(30, "%Y%m%d")), (false, true));
+        assert_eq!(check_expiry(&day(31, "%Y%m%d")), (false, false));
+        assert_eq!(check_expiry(&format!(" {} ", day(30, "%Y-%m-%d"))), (false, true));
+        assert_eq!(check_expiry(&format!("+{}", day(5, "%Y%m%d"))), (false, false));
+        assert_eq!(check_expiry("99991231"), (false, false));
+        assert_eq!(check_expiry("00010101"), (true, false));
+    }
+
     #[test]
     fn test_check_expiry_expired_compact() {
-        let yesterday = (Utc::now() - chrono::Duration::days(1)).format("%Y%m%d").to_string();
+        let yesterday = day(-1, "%Y%m%d");
         let (expired, expiring) = check_expiry(&yesterday);
         assert!(expired, "yesterday should be expired");
         assert!(!expiring, "yesterday is past, not expiring");
@@ -486,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_check_expiry_expiring_soon_compact() {
-        let in_15_days = (Utc::now() + chrono::Duration::days(15)).format("%Y%m%d").to_string();
+        let in_15_days = day(15, "%Y%m%d");
         let (expired, expiring) = check_expiry(&in_15_days);
         assert!(!expired);
         assert!(expiring, "15 days out should fall in the 0..=30 expiring window");
@@ -494,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_check_expiry_today_compact() {
-        let today = Utc::now().format("%Y%m%d").to_string();
+        let today = day(0, "%Y%m%d");
         let (expired, expiring) = check_expiry(&today);
         assert!(!expired, "today is not yet expired");
         assert!(expiring, "today (0 days remaining) is expiring");
@@ -502,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_check_expiry_future_compact() {
-        let in_60_days = (Utc::now() + chrono::Duration::days(60)).format("%Y%m%d").to_string();
+        let in_60_days = day(60, "%Y%m%d");
         let (expired, expiring) = check_expiry(&in_60_days);
         assert!(!expired);
         assert!(!expiring, "60 days is well outside the 30-day window");
@@ -512,7 +530,7 @@ mod tests {
     fn test_check_expiry_legacy_iso_still_tolerated() {
         // Pre-fix data may exist in `YYYY-MM-DD` form; confirm the
         // function still resolves it.
-        let yesterday = (Utc::now() - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+        let yesterday = day(-1, "%Y-%m-%d");
         let (expired, expiring) = check_expiry(&yesterday);
         assert!(expired);
         assert!(!expiring);
@@ -539,7 +557,7 @@ mod tests {
         // storage-format assumption upstream of `check_expiry`.
         let (mut wallet, _temp) = create_test_wallet();
         let item_id = wallet.add_item("Card", "card", false, None).unwrap();
-        let yesterday = (Utc::now() - chrono::Duration::days(1)).format("%Y%m%d").to_string();
+        let yesterday = day(-1, "%Y%m%d");
         wallet.add_field(&item_id, "EXPD", &yesterday, None).unwrap();
 
         let fields = wallet.get_fields_by_item(&item_id).unwrap();

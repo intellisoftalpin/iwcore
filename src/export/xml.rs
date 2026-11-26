@@ -29,7 +29,7 @@ pub fn generate_xml(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
     out.push_str(&format!(
         "<intelliwallet version=\"{}\" exported_at=\"{}\">\n",
         VERSION,
-        xml_escape_attr(&chrono::Utc::now().to_rfc3339()),
+        xml_escape_attr(&crate::time::rfc3339(&crate::time::now(), false)),
     ));
     out.push_str("  <items>\n");
 
@@ -45,7 +45,7 @@ pub fn generate_xml(items: &[IWItem], fields: &[IWField]) -> Result<Vec<u8>> {
             xml_escape_attr(parent_attr),
             item.folder,
             xml_escape_attr(&item.icon),
-            xml_escape_attr(&item.change_timestamp.to_rfc3339()),
+            xml_escape_attr(&crate::time::rfc3339(&item.change_timestamp, false)),
         ));
         if let Some(item_fields) = fields_by_item.get(item.item_id.as_str()) {
             for f in item_fields {
@@ -85,7 +85,6 @@ fn xml_escape_attr(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
     fn make_item(id: &str, name: &str, parent_id: Option<&str>, folder: bool, deleted: bool) -> IWItem {
         IWItem {
@@ -94,8 +93,8 @@ mod tests {
             name: name.to_string(),
             icon: "icon".to_string(),
             folder,
-            create_timestamp: Utc::now(),
-            change_timestamp: Utc::now(),
+            create_timestamp: crate::time::now(),
+            change_timestamp: crate::time::now(),
             deleted,
         }
     }
@@ -110,7 +109,7 @@ mod tests {
             icon: "icon".to_string(),
             value_type: "text".to_string(),
             sort_weight: 0,
-            change_timestamp: Utc::now(),
+            change_timestamp: crate::time::now(),
             deleted,
             expired: false,
             expiring: false,

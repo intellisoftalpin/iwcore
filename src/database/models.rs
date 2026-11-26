@@ -1,6 +1,6 @@
 //! Data models for IntelliWallet database entities
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// Database properties and metadata
@@ -15,9 +15,11 @@ pub struct IWProperties {
     /// Encryption iteration count (stored in 'email' field for legacy reasons)
     pub encryption_count: u32,
     /// Last sync timestamp
-    pub sync_timestamp: Option<DateTime<Utc>>,
+    #[serde(default, with = "crate::time::serde_rfc3339::option")]
+    pub sync_timestamp: Option<Timestamp>,
     /// Last update timestamp
-    pub update_timestamp: Option<DateTime<Utc>>,
+    #[serde(default, with = "crate::time::serde_rfc3339::option")]
+    pub update_timestamp: Option<Timestamp>,
 }
 
 impl Default for IWProperties {
@@ -49,9 +51,11 @@ pub struct IWItem {
     /// True if this is a folder, false if it's an entry
     pub folder: bool,
     /// Creation timestamp
-    pub create_timestamp: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_rfc3339")]
+    pub create_timestamp: Timestamp,
     /// Last modification timestamp
-    pub change_timestamp: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_rfc3339")]
+    pub change_timestamp: Timestamp,
     /// Soft delete flag
     pub deleted: bool,
 }
@@ -101,7 +105,8 @@ pub struct IWField {
     /// Sort order weight
     pub sort_weight: i32,
     /// Last modification timestamp
-    pub change_timestamp: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_rfc3339")]
+    pub change_timestamp: Timestamp,
     /// Soft delete flag
     pub deleted: bool,
     /// True if this field has expired (for expiry date fields)
@@ -161,7 +166,8 @@ pub struct IWLabel {
     /// True if this is a system-defined label
     pub system: bool,
     /// Last modification timestamp
-    pub change_timestamp: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_rfc3339")]
+    pub change_timestamp: Timestamp,
     /// Soft delete flag
     pub deleted: bool,
     /// Usage count (how many fields use this label)
@@ -264,8 +270,8 @@ mod tests {
             name: "My secret bank".into(),
             icon: "bank".into(),
             folder: false,
-            create_timestamp: Utc::now(),
-            change_timestamp: Utc::now(),
+            create_timestamp: crate::time::now(),
+            change_timestamp: crate::time::now(),
             deleted: false,
         };
         for text in [format!("{item:?}"), format!("{item:#?}")] {
@@ -283,8 +289,8 @@ mod tests {
             name: "Root".to_string(),
             icon: "folder".to_string(),
             folder: true,
-            create_timestamp: Utc::now(),
-            change_timestamp: Utc::now(),
+            create_timestamp: crate::time::now(),
+            change_timestamp: crate::time::now(),
             deleted: false,
         };
         assert!(root_item.is_root());
@@ -295,8 +301,8 @@ mod tests {
             name: "Test".to_string(),
             icon: "document".to_string(),
             folder: false,
-            create_timestamp: Utc::now(),
-            change_timestamp: Utc::now(),
+            create_timestamp: crate::time::now(),
+            change_timestamp: crate::time::now(),
             deleted: false,
         };
         assert!(!regular_item.is_root());
