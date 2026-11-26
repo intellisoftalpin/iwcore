@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.8.0
+
+### Added
+
+- **`autofill::suggest`**: which logins to offer for a site, in which order
+  and under which heading. Three sections: `ForSite` (exact host, then a
+  parent, then a child host; on a sign-on host such as `auth.` or `sso.`
+  every login of the registrable domain), `SameSite` (siblings on the same
+  registrable domain, closest first: a sign-on host, deeper shared labels,
+  the host's own labels named in title or account) and `SameName` (another
+  registrable domain with the same site name, `oxisoft.io` on `oxisoft.net`,
+  and link-less logins whose title names the site). Each login appears once,
+  under its strongest reason. The login picked last on the exact host leads.
+  `testdata/autofill/suggest_vectors.json` holds shared vectors for
+  providers that rank on their own (the iOS extension).
+- **`autofill::picks`**: the provider's memory of which login was picked on
+  which host. Sealed under the index key, bound to the vault's database id,
+  padded, capped at 256 hosts; anything unreadable opens empty.
+- **`PendingOp::AddLink`** and `PendingRecord::new_add_link`: the provider
+  asks the app to add a site to an existing login after the user picked it
+  there. The drain adds the host as a `LINK` once (`DrainSummary::linked`),
+  never creates an item, never touches a password, and refuses a
+  `create_only` record.
+- `domain::site_name`, `domain::is_usable_site_name`, `domain::is_sso_host`,
+  `GENERIC_NAME_LABELS`, `MIN_SITE_NAME_LEN`, `SSO_LABELS`;
+  `index::derived_keys`; `IndexEntry::names` (precomputed site names).
+
+### Breaking changes
+
+- **Full Public Suffix List for logins.** `registrable_domain` and
+  `is_public_suffix` use the full list (ICANN and private sections), as
+  passkeys already did; the curated subset is gone. Two customers of a hosting
+  suffix (`a.onrender.com`, `b.onrender.com`) no longer match each other, and
+  `is_public_suffix("com")` is now true.
+- **`MatchTier` order.** A parent or child host (`HostSuffix`) now outranks a
+  sibling (`RegistrableDomain`), and `match_tier` returns `HostSuffix` for it
+  (it returned `RegistrableDomain` before).
+- `IndexEntry` gains `names`; `DrainSummary` gains `linked`; `PendingOp` gains
+  `AddLink`. The index format is unchanged (2): `names` is an optional member,
+  and `index::open` rederives `registrable` and `names` from `hosts`, so an
+  index written by 0.7 reads with current values.
+
 ## 0.7.1
 
 ### Added

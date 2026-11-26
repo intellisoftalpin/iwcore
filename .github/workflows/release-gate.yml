@@ -83,7 +83,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        target: [cxf_preview, passkey_request, passkey_record, assetlinks, journal, restore_inspect, autofill_index, legacy_decrypt, origin_check, cxf_import_apply]
+        target: [cxf_preview, passkey_request, passkey_record, assetlinks, journal, restore_inspect, autofill_index, legacy_decrypt, origin_check, cxf_import_apply, autofill_suggest]
         # libFuzzer caps inputs at 4 KiB by default; CXF payloads get room to
         # reach the per-value and per-item limits (64 KiB values, 1 MiB notes,
         # 64 credentials and 256 custom fields per item, 200 new labels).

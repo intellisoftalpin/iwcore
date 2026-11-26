@@ -11,26 +11,31 @@
 //! Matching on the bare last two labels is wrong for multi-label suffixes:
 //! `login.example.co.uk` and `evil.co.uk` would both reduce to `co.uk` and
 //! appear to match each other. For a password manager that is not a cosmetic
-//! bug, so the registrable domain (eTLD+1) is computed against a suffix list
-//! and a candidate that is itself a public suffix is rejected outright.
+//! bug, so the registrable domain (eTLD+1) is computed against the full Mozilla
+//! Public Suffix List (ICANN and private sections, the `psl` crate), and a
+//! candidate that is itself a public suffix is rejected outright. Hosting
+//! suffixes such as `onrender.com` or `github.io` are in the private section,
+//! so two customers of the same host never match each other.
 //!
-//! # Limitation, stated plainly
-//!
-//! `PUBLIC_SUFFIXES` is a **curated subset** of the Mozilla Public Suffix
-//! List, not the full list, chosen to keep a published library free of a large
-//! generated data table. Hosts under a multi-label suffix that is not listed
-//! fall back to last-two-labels, which can be too permissive. Exact-host
-//! matching is unaffected and always correct, and no automatic filling ever
-//! happens without an explicit user tap, so the blast radius of a missing
-//! suffix is a suggestion ranked higher than it deserves, not a silent leak.
+//! Until 0.8 this module carried a curated subset of the list for logins and
+//! used the full list only for passkeys. The subset let `a.onrender.com` and
+//! `b.onrender.com` count as one site; both now use the same full list.
 
 /// Match strength between a stored entry and the site being filled.
+///
+/// Ordered weakest first, so `max` picks the best host of a multi-link entry.
+/// Since 0.8 a parent or child host outranks a mere sibling: a login stored
+/// for `oxisoft.net` belongs to `auth.oxisoft.net` more surely than one
+/// stored for `chat.oxisoft.net` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MatchTier {
-    /// The stored host is a subdomain of the query host, or vice versa.
-    HostSuffix,
-    /// Both resolve to the same registrable domain (eTLD+1).
+    /// Both resolve to the same registrable domain (eTLD+1) and neither host
+    /// sits under the other: siblings such as `chat.example.com` and
+    /// `auth.example.com`.
     RegistrableDomain,
+    /// One host sits under the other at a label boundary, inside the same
+    /// registrable domain: `example.com` and `auth.example.com`.
+    HostSuffix,
     /// Byte-for-byte identical hosts.
     ExactHost,
 }
@@ -41,38 +46,11 @@ const REJECTED_SCHEMES: [&str; 8] = [
     "mailto", "javascript", "data", "tel", "sms", "file", "about", "blob",
 ];
 
-/// Curated subset of the Mozilla Public Suffix List. MUST stay sorted:
-/// lookups are a binary search. See the module docs for why this is a subset.
-const PUBLIC_SUFFIXES: &[&str] = &[
-    "ac.at", "ac.cn", "ac.il", "ac.in", "ac.jp", "ac.kr", "ac.nz", "ac.th",
-    "ac.uk", "ac.za", "ad.jp", "appspot.com", "azurewebsites.net", "blogspot.com",
-    "cloudfront.net", "co.id", "co.il", "co.in", "co.jp", "co.ke", "co.kr",
-    "co.nz", "co.th", "co.tz", "co.ug", "co.uk", "co.za", "com.ar", "com.au",
-    "com.bo", "com.br", "com.cn", "com.co", "com.cy", "com.ec", "com.eg",
-    "com.es", "com.gh", "com.gr", "com.hk", "com.kw", "com.mt", "com.mx",
-    "com.my", "com.ng", "com.pe", "com.ph", "com.pk", "com.pl", "com.pt",
-    "com.py", "com.qa", "com.sa", "com.sg", "com.tr", "com.tw", "com.ua",
-    "com.uy", "com.ve", "com.vn", "ed.jp", "edu.au", "edu.br", "edu.cn",
-    "edu.es", "edu.hk", "edu.in", "edu.my", "edu.pl", "edu.pt", "edu.sg",
-    "edu.tr", "edu.tw", "edu.vn", "firebaseapp.com", "firm.in", "gen.in",
-    "github.dev", "github.io", "gitlab.io", "glitch.me", "go.jp", "go.kr",
-    "go.th", "gob.es", "gov.au", "gov.br", "gov.cn", "gov.hk", "gov.il",
-    "gov.in", "gov.my", "gov.pl", "gov.pt", "gov.sg", "gov.tr", "gov.tw",
-    "gov.ua", "gov.uk", "govt.nz", "gr.jp", "gv.at", "herokuapp.com", "id.au",
-    "in.th", "in.ua", "ind.in", "kiev.ua", "lg.jp", "ltd.uk", "me.uk", "my.id",
-    "myshopify.com", "ne.jp", "ne.kr", "net.au", "net.br", "net.cn", "net.gr",
-    "net.hk", "net.in", "net.my", "net.nz", "net.pk", "net.pl", "net.sg",
-    "net.tr", "net.tw", "net.ua", "net.uk", "net.vn", "netlify.app", "nom.es",
-    "or.at", "or.id", "or.jp", "or.kr", "org.au", "org.br", "org.cn", "org.es",
-    "org.gr", "org.hk", "org.il", "org.in", "org.nz", "org.pk", "org.pl",
-    "org.pt", "org.sg", "org.tw", "org.ua", "org.uk", "org.za", "pages.dev",
-    "re.kr", "sch.uk", "vercel.app", "web.app", "web.id", "wordpress.com",
-    "workers.dev",
-];
-
-/// True if `candidate` is a known multi-label public suffix.
+/// True if `candidate` is itself a public suffix under the full Public Suffix
+/// List (`com`, `co.uk`, `github.io`, `onrender.com`), so it can never be a
+/// matching key.
 pub fn is_public_suffix(candidate: &str) -> bool {
-    PUBLIC_SUFFIXES.binary_search(&candidate).is_ok()
+    !candidate.is_empty() && psl::suffix_str(candidate) == Some(candidate)
 }
 
 /// Normalize a raw `LINK` value into a comparable host.
@@ -145,39 +123,18 @@ pub fn normalize_host(raw: &str) -> Option<String> {
     is_plausible_host(stripped).then(|| stripped.to_string())
 }
 
-/// Compute the registrable domain (eTLD+1) of an already-normalized host.
+/// Compute the registrable domain (eTLD+1) of an already-normalized host,
+/// under the full Public Suffix List.
 ///
 /// Returns `None` for IP literals, single-label hosts, and any host that is
 /// itself a public suffix, because none of those may be used as a matching key:
 /// treating `co.uk` as a registrable domain would match every British site
 /// against every other.
 pub fn registrable_domain(host: &str) -> Option<String> {
-    if host.is_empty() || is_ip_literal(host) {
+    if !host.contains('.') {
         return None;
     }
-    let labels: Vec<&str> = host.split('.').collect();
-    if labels.len() < 2 {
-        return None;
-    }
-
-    // Longest matching public suffix wins, so `s3.amazonaws.com`-style
-    // three-label suffixes beat any two-label prefix of themselves.
-    let best_suffix_labels = (0..labels.len())
-        .find(|&start| labels.get(start..).is_some_and(|tail| is_public_suffix(&tail.join("."))))
-        .map_or(0, |start| labels.len().saturating_sub(start));
-
-    let take = if best_suffix_labels > 0 {
-        best_suffix_labels.checked_add(1)?
-    } else {
-        2
-    };
-    let first = labels.len().checked_sub(take)?;
-    let candidate = labels.get(first..)?.join(".");
-    // Belt and braces for suffixes missing from the curated list.
-    if is_public_suffix(&candidate) {
-        return None;
-    }
-    Some(candidate)
+    psl_registrable_domain(host).map(str::to_string)
 }
 
 /// Strength of the match between a stored host and the host being filled.
@@ -190,26 +147,89 @@ pub fn match_tier(stored_host: &str, query_host: &str) -> Option<MatchTier> {
     if stored_host == query_host {
         return Some(MatchTier::ExactHost);
     }
-    let stored_reg = registrable_domain(stored_host);
-    let query_reg = registrable_domain(query_host);
-    if let (Some(a), Some(b)) = (&stored_reg, &query_reg)
-        && a == b
-    {
-        return Some(MatchTier::RegistrableDomain);
+    let (Some(stored_reg), Some(query_reg)) = (registrable_domain(stored_host), registrable_domain(query_host)) else {
+        return None;
+    };
+    if stored_reg != query_reg {
+        return None;
     }
     // A label-aligned suffix relationship, so `example.com` cannot match
-    // `notexample.com`. Only meaningful when a registrable domain exists;
-    // without one we would be comparing bare suffixes again.
-    if stored_reg.is_some()
-        && query_reg.is_some()
-        && (is_subdomain_of(stored_host, query_host) || is_subdomain_of(query_host, stored_host))
-    {
+    // `notexample.com`; both sit inside one registrable domain here.
+    if is_subdomain_of(stored_host, query_host) || is_subdomain_of(query_host, stored_host) {
         return Some(MatchTier::HostSuffix);
     }
-    None
+    Some(MatchTier::RegistrableDomain)
 }
 
-fn is_subdomain_of(child: &str, parent: &str) -> bool {
+/// Labels too generic to name a site: a login for `auth.de` says nothing
+/// about `auth.com`. A site name equal to one of these is never used for
+/// matching across registrable domains. Sorted, so lookups are a binary
+/// search (a test keeps it sorted).
+pub const GENERIC_NAME_LABELS: &[&str] = &[
+    "account", "accounts", "admin", "auth", "cloud", "demo", "email", "example",
+    "home", "identity", "internal", "intranet", "local", "localhost", "login",
+    "mail", "online", "portal", "secure", "server", "service", "services",
+    "shop", "signin", "site", "store", "test", "webmail",
+];
+
+/// Shortest site name used for matching across registrable domains. Shorter
+/// names (`my`, `go`, `abc`) collide between unrelated owners far too often.
+pub const MIN_SITE_NAME_LEN: usize = 4;
+
+/// First labels that mark a single sign-on or identity host (`auth.example.com`,
+/// `sso.example.com`). A login on such a host is typically the account for
+/// every service of that registrable domain.
+pub const SSO_LABELS: &[&str] = &["accounts", "auth", "id", "identity", "login", "sso"];
+
+/// The site name of a normalized host: the label left of its public suffix
+/// (`oxisoft` for `auth.oxisoft.net`, `example` for `login.example.co.uk`).
+///
+/// It is what lets `oxisoft.net` and `oxisoft.io` be recognised as the same
+/// name under different registrable domains. That is a weak signal, anyone
+/// can register `oxisoft.xyz`, so callers must keep such matches apart from
+/// real domain matches (see [`super::suggest`]). To keep it as narrow as it
+/// can be, `None` is returned unless:
+///
+/// - the public suffix is from the ICANN section of the list (a private
+///   hosting suffix, `alice.github.io`, names a customer, not a brand);
+/// - the name is at least [`MIN_SITE_NAME_LEN`] characters long, is not all
+///   digits and is not in [`GENERIC_NAME_LABELS`].
+pub fn site_name(host: &str) -> Option<String> {
+    if host.is_empty() || is_ip_literal(host) {
+        return None;
+    }
+    let domain = psl::domain(host.as_bytes())?;
+    if domain.suffix().typ() != Some(psl::Type::Icann) {
+        return None;
+    }
+    let registrable = std::str::from_utf8(domain.as_bytes()).ok()?;
+    let name = registrable.split('.').next()?;
+    is_usable_site_name(name).then(|| name.to_string())
+}
+
+/// Whether a word may serve as a site name: long enough, not a number and not
+/// a generic label. Shared with title matching, so a title word is held to
+/// exactly the same bar as a domain label.
+pub fn is_usable_site_name(name: &str) -> bool {
+    name.chars().count() >= MIN_SITE_NAME_LEN
+        && !name.bytes().all(|b| b.is_ascii_digit())
+        && GENERIC_NAME_LABELS.binary_search(&name).is_err()
+}
+
+/// True when the first label of a normalized host marks a sign-on host
+/// ([`SSO_LABELS`]) and the host has a registrable domain below it.
+pub fn is_sso_host(host: &str) -> bool {
+    let Some(registrable) = registrable_domain(host) else {
+        return false;
+    };
+    if registrable == host {
+        return false;
+    }
+    host.split('.').next().is_some_and(|first| SSO_LABELS.contains(&first))
+}
+
+/// True when `child` sits under `parent` at a label boundary.
+pub(crate) fn is_subdomain_of(child: &str, parent: &str) -> bool {
     child
         .strip_suffix(parent)
         .is_some_and(|head| head.ends_with('.'))
@@ -422,20 +442,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_suffix_list_is_sorted_for_binary_search() {
-        let mut sorted = PUBLIC_SUFFIXES.to_vec();
+    fn generic_name_labels_are_sorted_for_binary_search() {
+        let mut sorted = GENERIC_NAME_LABELS.to_vec();
         sorted.sort_unstable();
-        assert_eq!(
-            PUBLIC_SUFFIXES, sorted.as_slice(),
-            "PUBLIC_SUFFIXES must stay sorted, binary_search depends on it"
-        );
+        sorted.dedup();
+        assert_eq!(GENERIC_NAME_LABELS, sorted.as_slice());
     }
 
     #[test]
-    fn public_suffix_list_has_no_duplicates() {
-        let mut seen = PUBLIC_SUFFIXES.to_vec();
-        seen.dedup();
-        assert_eq!(seen.len(), PUBLIC_SUFFIXES.len());
+    fn public_suffixes_come_from_the_full_list() {
+        for s in ["com", "co.uk", "com.ua", "github.io", "onrender.com", "blogspot.com"] {
+            assert!(is_public_suffix(s), "{s}");
+        }
+        for d in ["example.com", "example.co.uk", "alice.github.io", ""] {
+            assert!(!is_public_suffix(d), "{d}");
+        }
+    }
+
+    #[test]
+    fn site_names_are_the_label_left_of_an_icann_suffix() {
+        assert_eq!(site_name("auth.oxisoft.net").as_deref(), Some("oxisoft"));
+        assert_eq!(site_name("oxisoft.io").as_deref(), Some("oxisoft"));
+        // `example` is a generic label: the reserved documentation domain.
+        assert_eq!(site_name("login.example.co.uk"), None);
+        assert_eq!(site_name("login.acmecorp.co.uk").as_deref(), Some("acmecorp"));
+        assert_eq!(site_name("shop.mybank.com.ua").as_deref(), Some("mybank"));
+    }
+
+    #[test]
+    fn site_names_refuse_private_suffixes_short_generic_numeric_and_ip() {
+        for host in [
+            "alice.github.io",
+            "ours.onrender.com",
+            "my.com",
+            "abc.com",
+            "auth.de",
+            "login.com",
+            "12345.com",
+            "192.168.1.1",
+            "::1",
+            "localhost",
+            "com",
+            "",
+        ] {
+            assert_eq!(site_name(host), None, "{host}");
+        }
+    }
+
+    #[test]
+    fn usable_site_names_need_four_characters_counted_as_characters() {
+        assert!(is_usable_site_name("abcd"));
+        assert!(!is_usable_site_name("abc"));
+        assert!(!is_usable_site_name("щит"));
+        assert!(is_usable_site_name("щита"));
+        assert!(!is_usable_site_name("2026"));
+        assert!(is_usable_site_name("2026a"));
+        assert!(!is_usable_site_name("portal"));
+    }
+
+    #[test]
+    fn sso_hosts_are_sign_on_labels_under_a_registrable_domain() {
+        for host in ["auth.oxisoft.net", "sso.example.co.uk", "id.example.com", "accounts.google.com"] {
+            assert!(is_sso_host(host), "{host}");
+        }
+        for host in ["oxisoft.net", "auth.de", "chat.oxisoft.net", "authx.example.com", "auth", "auth.github.io", ""] {
+            assert!(!is_sso_host(host), "{host}");
+        }
     }
 
     #[test]
@@ -616,16 +688,12 @@ mod tests {
     #[test]
     fn match_tiers_rank_as_documented() {
         assert_eq!(match_tier("example.com", "example.com"), Some(MatchTier::ExactHost));
-        assert_eq!(
-            match_tier("example.com", "login.example.com"),
-            Some(MatchTier::RegistrableDomain)
-        );
-        assert_eq!(
-            match_tier("example.co.uk", "login.example.co.uk"),
-            Some(MatchTier::RegistrableDomain)
-        );
-        assert!(MatchTier::ExactHost > MatchTier::RegistrableDomain);
-        assert!(MatchTier::RegistrableDomain > MatchTier::HostSuffix);
+        assert_eq!(match_tier("example.com", "login.example.com"), Some(MatchTier::HostSuffix));
+        assert_eq!(match_tier("login.example.com", "example.com"), Some(MatchTier::HostSuffix));
+        assert_eq!(match_tier("example.co.uk", "login.example.co.uk"), Some(MatchTier::HostSuffix));
+        assert_eq!(match_tier("chat.example.com", "auth.example.com"), Some(MatchTier::RegistrableDomain));
+        assert!(MatchTier::ExactHost > MatchTier::HostSuffix);
+        assert!(MatchTier::HostSuffix > MatchTier::RegistrableDomain);
     }
 
     #[test]
@@ -634,6 +702,9 @@ mod tests {
         assert_eq!(match_tier("example.co.uk", "evil.co.uk"), None);
         assert_eq!(match_tier("mybank.com.ua", "phisher.com.ua"), None);
         assert_eq!(match_tier("alice.github.io", "mallory.github.io"), None);
+        // Hosting suffixes the old curated list lacked separate owners too.
+        assert_eq!(match_tier("theirs.onrender.com", "ours.onrender.com"), None);
+        assert_eq!(match_tier("onrender.com", "ours.onrender.com"), None);
         // And no accidental substring matching.
         assert_eq!(match_tier("example.com", "notexample.com"), None);
         assert_eq!(match_tier("example.com", "example.com.evil.net"), None);
@@ -648,7 +719,6 @@ mod tests {
         assert!(passkey_matches_host("example.com", "login.example.com"));
         assert!(passkey_matches_host("app.example.co.uk", "example.co.uk"));
         // Hosting suffixes the curated list does not carry still separate owners.
-        assert!(!is_public_suffix("onrender.com"), "the curated list lacks it; the full list is what matters");
         assert!(!passkey_matches_host("theirs.onrender.com", "ours.onrender.com"));
         assert!(!passkey_matches_host("alice.github.io", "mallory.github.io"));
         assert!(!passkey_matches_host("example.co.uk", "other.co.uk"));

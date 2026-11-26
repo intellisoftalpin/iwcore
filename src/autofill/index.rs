@@ -69,6 +69,11 @@ pub struct IndexEntry {
     /// Precomputed registrable domains, so the provider needs no public suffix
     /// list of its own and does plain string comparison.
     pub registrable: Vec<String>,
+    /// Precomputed site names of `hosts` ([`domain::site_name`]): `oxisoft`
+    /// for `auth.oxisoft.net`. Absent from indexes written before 0.8, which
+    /// [`open`] fills in on read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
 }
 
 impl std::fmt::Debug for IndexEntry {
@@ -82,6 +87,7 @@ impl std::fmt::Debug for IndexEntry {
             .field("totp_secret", &self.totp_secret.as_ref().map(|_| crate::utils::REDACTED))
             .field("hosts", &self.hosts)
             .field("registrable", &self.registrable)
+            .field("names", &self.names)
             .finish()
     }
 }
@@ -330,6 +336,13 @@ pub fn open_all(bytes: &[u8], index_key: &[u8; KEY_LEN]) -> Result<(IndexHeader,
             .collect();
         IndexContents { logins: body.logins, passkeys }
     };
+    let mut contents = contents;
+    // Rederived on every read rather than trusted: an index written by an
+    // older iwcore carries registrable domains from its curated suffix list
+    // and no site names at all, and both are pure functions of `hosts`.
+    for entry in &mut contents.logins {
+        (entry.registrable, entry.names) = derived_keys(&entry.hosts);
+    }
     Ok((header, contents))
 }
 
@@ -437,14 +450,7 @@ pub fn entries_from_vault(
                 hosts.push(host);
             }
         }
-        let mut registrable: Vec<String> = Vec::new();
-        for host in &hosts {
-            if let Some(reg) = domain::registrable_domain(host)
-                && !registrable.contains(&reg)
-            {
-                registrable.push(reg);
-            }
-        }
+        let (registrable, names) = derived_keys(&hosts);
 
         let totp_secret = options
             .include_totp
@@ -464,10 +470,32 @@ pub fn entries_from_vault(
             totp_secret,
             hosts,
             registrable,
+            names,
         });
     }
 
     out
+}
+
+/// The registrable domains and site names of a list of normalized hosts,
+/// each deduplicated in first-seen order. These are what the index carries
+/// precomputed for every entry.
+pub fn derived_keys(hosts: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut registrable: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for host in hosts {
+        if let Some(reg) = domain::registrable_domain(host)
+            && !registrable.contains(&reg)
+        {
+            registrable.push(reg);
+        }
+        if let Some(name) = domain::site_name(host)
+            && !names.contains(&name)
+        {
+            names.push(name);
+        }
+    }
+    (registrable, names)
 }
 
 /// Rank an entry against the site being filled. `None` means the entry must not
@@ -512,6 +540,7 @@ mod tests {
             totp_secret: None,
             hosts: vec![host.into()],
             registrable: domain::registrable_domain(host).into_iter().collect(),
+            names: domain::site_name(host).into_iter().collect(),
         }
     }
 
@@ -676,6 +705,31 @@ mod tests {
         let mut out = header_bytes.clone();
         out.extend_from_slice(&crypto::seal(key, body, &header_bytes).unwrap());
         out
+    }
+
+    #[test]
+    fn an_index_from_an_older_iwcore_gets_current_registrable_domains_and_names_on_read() {
+        let keys = generate_keys().unwrap();
+        // As 0.7 wrote it: curated-list registrable domains, no names.
+        let body = br#"{"logins":[{"item_id":"i","title":"t","identity_type":"USER","username":"u","password":"p","hosts":["ours.onrender.com","auth.oxisoft.net"],"registrable":["onrender.com","oxisoft.net"]}],"passkeys":[]}"#;
+        let mut padded = u32::try_from(body.len()).unwrap().to_le_bytes().to_vec();
+        padded.extend_from_slice(body);
+        let (_, entries) = open(&seal_raw_body(&keys.index_key, &padded), &keys.index_key).unwrap();
+        assert_eq!(entries[0].registrable, ["ours.onrender.com", "oxisoft.net"]);
+        assert_eq!(entries[0].names, ["oxisoft"]);
+        assert!(format!("{:?}", entries[0]).contains("names: [\"oxisoft\"]"));
+    }
+
+    #[test]
+    fn entries_with_and_without_names_round_trip() {
+        let keys = generate_keys().unwrap();
+        let mut bare = entry("i1", "192.168.1.1");
+        bare.names.clear();
+        let named = entry("i2", "oxisoft.net");
+        assert_eq!(named.names, ["oxisoft"]);
+        let sealed = build_with_passkeys(&[bare.clone(), named.clone()], &[], &keys.index_key, &header()).unwrap();
+        let (_, entries) = open(&sealed, &keys.index_key).unwrap();
+        assert_eq!(entries, vec![bare, named]);
     }
 
     #[test]
@@ -953,8 +1007,10 @@ mod tests {
         assert_eq!(rank(&e, "example.com"), Some(domain::MatchTier::ExactHost));
         assert_eq!(
             rank(&e, "checkout.example.com"),
-            Some(domain::MatchTier::RegistrableDomain)
+            Some(domain::MatchTier::HostSuffix),
+            "a stored parent outranks the sibling login.example.com"
         );
+        assert_eq!(rank(&e, "a.login.example.com"), Some(domain::MatchTier::HostSuffix));
         assert_eq!(rank(&e, "unrelated.org"), None);
     }
 

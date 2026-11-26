@@ -49,6 +49,8 @@ pub struct DrainSummary {
     /// a crash between a drain and deleting the journal, or when old journal
     /// bytes come back.
     pub already_applied: usize,
+    /// Items that received a new `LINK` from a [`PendingOp::AddLink`] record.
+    pub linked: Vec<String>,
     /// Bytes at the end of the journal the drain could not read as records
     /// (see [`journal::DrainRead::unparsed_bytes`]). Nonzero means records
     /// may have been lost to this drain: keep the journal instead of deleting
@@ -74,6 +76,16 @@ enum PasskeyOutcome {
     NeedsConfirmation(Box<PasskeyReplacement>),
     AttachedTo(String),
     Created(String),
+    Invalid,
+}
+
+/// What became of one [`PendingOp::AddLink`] record.
+enum LinkOutcome {
+    Linked(String),
+    /// The item already links to that host.
+    AlreadyThere,
+    /// No such live item, no usable host, or a record the drain must not
+    /// trust with a link (`create_only`).
     Invalid,
 }
 
@@ -277,6 +289,7 @@ impl Wallet {
             pending_replacements: Vec::new(),
             unauthenticated: 0,
             already_applied: 0,
+            linked: Vec::new(),
             unparsed_bytes: 0,
         };
 
@@ -303,13 +316,21 @@ impl Wallet {
                 summary.already_applied = summary.already_applied.saturating_add(1);
                 continue;
             }
+            if record.op == PendingOp::AddLink {
+                match self.apply_add_link(&record, &mut known)? {
+                    LinkOutcome::Linked(item_id) => summary.linked.push(item_id),
+                    LinkOutcome::AlreadyThere => summary.unchanged = summary.unchanged.saturating_add(1),
+                    LinkOutcome::Invalid => summary.skipped = summary.skipped.saturating_add(1),
+                }
+                continue;
+            }
 
             // An explicit update wins outright: the provider named an item, so
             // there is nothing to reconcile. A create-only record never
             // replaces anything: an exact duplicate is skipped, everything else
             // becomes a new entry, whatever item it names.
             let mut target = match (record.op, record.create_only) {
-                (PendingOp::CreatePasskey, _) => unreachable!("handled above"),
+                (PendingOp::CreatePasskey | PendingOp::AddLink, _) => unreachable!("handled above"),
                 (PendingOp::UpdatePassword, false) => record.item_id.clone(),
                 (PendingOp::Create, _) | (PendingOp::UpdatePassword, true) => {
                     match Self::reconcile(&known, &record) {
@@ -359,8 +380,7 @@ impl Wallet {
     ///    enough to drop a working passkey. The staged one is stored on the
     ///    same item, straight into the trash, and reported for confirmation;
     /// 3. a live login whose `LINK` is the rpId's host, or shares its
-    ///    registrable domain under the full Public Suffix List (not the
-    ///    curated list login ranking uses), **and** whose identity equals the
+    ///    registrable domain under the full Public Suffix List, **and** whose identity equals the
     ///    user name (ignoring ASCII case): the passkey is added to that item;
     /// 4. otherwise a new item in the `AutoFill` folder.
     ///
@@ -433,6 +453,41 @@ impl Wallet {
         Ok(PasskeyOutcome::Created(item_id))
     }
 
+    /// Add the record's host as a `LINK` to the item it names. Refuses a
+    /// `create_only` record: a site the provider could not verify must not
+    /// become a stored site of a login, or the next fill there would offer it
+    /// as an exact match.
+    fn apply_add_link(&mut self, record: &PendingRecord, known: &mut [index::IndexEntry]) -> Result<LinkOutcome> {
+        if record.create_only {
+            return Ok(LinkOutcome::Invalid);
+        }
+        let (Some(item_id), Some(host)) = (record.item_id.as_deref(), super::domain::normalize_host(&record.url)) else {
+            return Ok(LinkOutcome::Invalid);
+        };
+        let live = self
+            .get_items()?
+            .iter()
+            .any(|i| i.item_id == item_id && !i.deleted && !i.folder && !i.is_root());
+        if !live {
+            return Ok(LinkOutcome::Invalid);
+        }
+        let linked = self.get_fields()?.iter().any(|f| {
+            f.item_id == item_id
+                && !f.deleted
+                && f.field_type == FIELD_LINK
+                && super::domain::normalize_host(&f.value).as_deref() == Some(host.as_str())
+        });
+        if linked {
+            return Ok(LinkOutcome::AlreadyThere);
+        }
+        self.add_field_unchecked(item_id, FIELD_LINK, &format!("https://{host}"), None)?;
+        if let Some(entry) = known.iter_mut().find(|e| e.item_id == item_id) {
+            entry.hosts.push(host);
+            (entry.registrable, entry.names) = index::derived_keys(&entry.hosts);
+        }
+        Ok(LinkOutcome::Linked(item_id.to_string()))
+    }
+
     /// Decide what an unattributed create record actually means against the
     /// logins the vault already holds.
     fn reconcile(known: &[index::IndexEntry], record: &PendingRecord) -> Option<Match> {
@@ -446,9 +501,7 @@ impl Wallet {
             .iter()
             .filter(|entry| entry.username.trim().eq_ignore_ascii_case(identity))
             .filter_map(|entry| {
-                index::rank(entry, &host)
-                    .filter(|tier| *tier >= super::domain::MatchTier::RegistrableDomain)
-                    .map(|tier| (tier, entry))
+                index::rank(entry, &host).map(|tier| (tier, entry))
             })
             .max_by_key(|(tier, _)| *tier)
             .map(|(_, entry)| entry)?;
@@ -474,10 +527,7 @@ impl Wallet {
         let hosts: Vec<String> = super::domain::normalize_host(&record.url)
             .into_iter()
             .collect();
-        let registrable = hosts
-            .iter()
-            .filter_map(|h| super::domain::registrable_domain(h))
-            .collect();
+        let (registrable, names) = index::derived_keys(&hosts);
         index::IndexEntry {
             item_id: item_id.to_string(),
             title: record.title.clone(),
@@ -487,6 +537,7 @@ impl Wallet {
             totp_secret: None,
             hosts,
             registrable,
+            names,
         }
     }
 
@@ -1786,5 +1837,89 @@ mod tests {
             Some("JBSWY3DPEHPK3PXP")
         );
         assert_eq!(password_of(&mut w, &summary.created[1], FIELD_TOTP), None);
+    }
+
+    fn links_of(w: &mut Wallet, item_id: &str) -> Vec<String> {
+        w.get_fields_by_item(item_id)
+            .unwrap()
+            .iter()
+            .filter(|f| !f.deleted && f.field_type == FIELD_LINK)
+            .map(|f| f.value.clone())
+            .collect()
+    }
+
+    #[test]
+    fn an_add_link_record_adds_the_host_to_the_named_item_once() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let item = login(&mut w, "OxiSoft SSO", "https://pilot.oxisoft.net", "bkv", "pw");
+        let journal = seal_all(
+            &[
+                PendingRecord::new_add_link("r1", item.clone(), "https://Auth.OxiSoft.net/login?x=1", 1),
+                PendingRecord::new_add_link("r2", item.clone(), "auth.oxisoft.net", 2),
+            ],
+            &keys,
+        );
+        let summary = w.drain_autofill_journal(&journal, &dk(&keys), None).unwrap();
+        assert_eq!(summary.linked, vec![item.clone()]);
+        assert_eq!(summary.unchanged, 1);
+        assert!(summary.created.is_empty() && summary.updated.is_empty());
+        assert_eq!(links_of(&mut w, &item), ["https://pilot.oxisoft.net", "https://auth.oxisoft.net"]);
+        assert_eq!(password_of(&mut w, &item, FIELD_PASSWORD).as_deref(), Some("pw"));
+
+        // Applied once: the same journal again changes nothing.
+        let again = w.drain_autofill_journal(&journal, &dk(&keys), None).unwrap();
+        assert_eq!((again.linked.len(), again.already_applied), (0, 2));
+    }
+
+    #[test]
+    fn an_add_link_record_never_creates_and_refuses_what_it_cannot_trust() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let item = login(&mut w, "Bank", "https://mybank.com", "bkv", "pw");
+        let deleted = login(&mut w, "Old", "https://old.com", "bkv", "pw");
+        w.delete_item(&deleted).unwrap();
+        let folder = w.add_item("Folder", "", true, Some(crate::ROOT_ID)).unwrap();
+        let mut unverified = PendingRecord::new_add_link("r1", item.clone(), "https://mybank-login.com", 1);
+        unverified.create_only = true;
+        let mut no_item = PendingRecord::new_add_link("r2", "x", "https://a.com", 2);
+        no_item.item_id = None;
+        let journal = seal_all(
+            &[
+                unverified,
+                no_item,
+                PendingRecord::new_add_link("r3", "missing", "https://a.com", 3),
+                PendingRecord::new_add_link("r4", deleted, "https://a.com", 4),
+                PendingRecord::new_add_link("r5", folder, "https://a.com", 5),
+                PendingRecord::new_add_link("r6", item.clone(), "javascript:alert(1)", 6),
+            ],
+            &keys,
+        );
+        let summary = w.drain_autofill_journal(&journal, &dk(&keys), None).unwrap();
+        assert_eq!(summary.skipped, 6);
+        assert!(summary.linked.is_empty() && summary.created.is_empty());
+        assert_eq!(links_of(&mut w, &item), ["https://mybank.com"]);
+    }
+
+    #[test]
+    fn a_link_added_in_a_drain_counts_for_later_records_of_the_same_drain() {
+        let (mut w, _dir) = wallet();
+        let keys = generate_keys().unwrap();
+        let item = login(&mut w, "SSO", "https://pilot.oxisoft.net", "bkv", "pw");
+        let journal = seal_all(
+            &[
+                PendingRecord::new_add_link("r1", item.clone(), "https://auth.oxisoft.io", 1),
+                capture("r2", "https://auth.oxisoft.io", "bkv", "pw2"),
+            ],
+            &keys,
+        );
+        let summary = w.drain_autofill_journal(&journal, &dk(&keys), None).unwrap();
+        assert_eq!(summary.linked, vec![item.clone()]);
+        assert_eq!(summary.updated, vec![item.clone()], "the capture reconciles against the new link");
+        let index = w.build_autofill_index(&keys.index_key, 1, 1, IndexOptions::default()).unwrap();
+        let (_, entries) = index::open(&index, &keys.index_key).unwrap();
+        let e = entries.iter().find(|e| e.item_id == item).unwrap();
+        assert_eq!(e.names, ["oxisoft"]);
+        assert_eq!(e.registrable, ["oxisoft.net", "oxisoft.io"]);
     }
 }
